@@ -7,8 +7,7 @@ The goal is an open-source native desktop app (Linux first, Windows/macOS later)
 web interface — same views, same keyboard shortcuts, same features — but shows all of a user's Google
 accounts (e.g. personal + work) in one calendar. It must be fast and light on memory.
 
-The repo is empty (no commits; only an untracked `INITIAL_PROMPT.md`). Rust is not installed.
-Machine: Ubuntu 26.04, GNOME, Wayland.
+Rust is not installed. Machine: Ubuntu 26.04, GNOME, Wayland.
 
 ## Decisions
 
