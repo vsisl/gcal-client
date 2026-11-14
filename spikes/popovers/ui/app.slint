@@ -1,0 +1,217 @@
+// Spike: popovers and an autocomplete dropdown close to the window edge.
+//
+// Questions:
+//  1. Can a popover be kept fully inside the window when its anchor is near an edge?
+//  2. Does typing keep working in a text field while its suggestion list is open,
+//     (A) with Slint's PopupWindow, and (B) with a plain overlay drawn in the window?
+
+import { LineEdit, Button } from "std-widgets.slint";
+
+component SuggestionList inherits Rectangle {
+    in property <[string]> items;
+    in property <int> current;
+    callback picked(string);
+    background: white;
+    border-radius: 8px;
+    drop-shadow-blur: 12px;
+    drop-shadow-color: #00000050;
+    height: Math.max(1, items.length) * 36px + 8px;
+    for item[i] in items: Rectangle {
+        x: 4px;
+        y: 4px + i * 36px;
+        width: parent.width - 8px;
+        height: 36px;
+        border-radius: 4px;
+        background: i == current || ta.has-hover ? #e8f0fe : transparent;
+        Text {
+            x: 12px;
+            text: item;
+            vertical-alignment: center;
+            color: #3c4043;
+        }
+        ta := TouchArea {
+            clicked => {
+                root.picked(item);
+            }
+        }
+    }
+    if items.length == 0: Text {
+        text: "No matches";
+        color: #70757a;
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "Popover spike";
+    preferred-width: 900px;
+    preferred-height: 600px;
+    background: #f8f9fa;
+
+    in property <[string]> suggestions;
+    callback query-changed(string);
+    property <int> current: 0;
+    property <string> picked-text: "(nothing picked yet)";
+    property <bool> overlay-open: false;
+    property <length> list-w: 280px;
+    property <length> list-h: Math.max(1, suggestions.length) * 36px + 8px;
+
+    Text {
+        x: 16px;
+        y: 16px;
+        width: parent.width - 32px;
+        wrap: word-wrap;
+        color: #3c4043;
+        text: "Type a name (try 'a' or 'jo') in each field at the bottom right. Check: typing continues while the list is open, Up/Down/Enter pick, the list stays inside the window. Then click the button on the right edge. Resize the window small and repeat.\n\nLast picked: \{picked-text}";
+    }
+
+    // Anchor near the right edge for the event-detail style popover.
+    detail-btn := Button {
+        x: parent.width - self.width - 6px;
+        y: parent.height / 2;
+        text: "Event";
+        clicked => {
+            detail.show();
+        }
+    }
+    detail := PopupWindow {
+        property <length> w: 360px;
+        property <length> h: 220px;
+        // Prefer opening to the right of and below the anchor; shift back inside the window.
+        x: Math.max(8px, Math.min(detail-btn.x, root.width - self.w - 8px));
+        y: detail-btn.y + detail-btn.height + self.h + 8px > root.height ? Math.max(8px, detail-btn.y - self.h - 4px) : detail-btn.y + detail-btn.height + 4px;
+        width: self.w;
+        height: self.h;
+        Rectangle {
+            background: white;
+            border-radius: 12px;
+            drop-shadow-blur: 16px;
+            drop-shadow-color: #00000050;
+            Text {
+                x: 20px;
+                y: 20px;
+                text: "Team sync";
+                font-size: 20px;
+                color: #3c4043;
+            }
+            Text {
+                x: 20px;
+                y: 56px;
+                text: "Monday, 16 November · 10:00 – 11:00\nClick outside to close.";
+                color: #70757a;
+            }
+        }
+    }
+
+    // A: suggestion list in a PopupWindow.
+    Text {
+        x: field-a.x;
+        y: field-a.y - 20px;
+        text: "A: PopupWindow";
+        color: #70757a;
+    }
+    field-a := LineEdit {
+        x: parent.width - self.width - 12px;
+        y: parent.height - 120px;
+        width: 240px;
+        placeholder-text: "Add guests";
+        edited(text) => {
+            root.current = 0;
+            root.query-changed(text);
+            if (text != "") {
+                popup-a.show();
+            } else {
+                popup-a.close();
+            }
+        }
+        key-pressed(e) => {
+            if (e.text == Key.DownArrow) {
+                root.current = Math.min(root.current + 1, suggestions.length - 1);
+                return accept;
+            }
+            if (e.text == Key.UpArrow) {
+                root.current = Math.max(root.current - 1, 0);
+                return accept;
+            }
+            if (e.text == Key.Return && suggestions.length > 0) {
+                root.picked-text = "A: " + suggestions[root.current];
+                self.text = "";
+                popup-a.close();
+                return accept;
+            }
+            if (e.text == Key.Escape) {
+                popup-a.close();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    popup-a := PopupWindow {
+        close-policy: no-auto-close;
+        x: Math.max(8px, Math.min(field-a.x, root.width - list-w - 8px));
+        // Open upwards when there is no room below.
+        y: field-a.y + field-a.height + list-h + 8px > root.height ? field-a.y - list-h - 4px : field-a.y + field-a.height + 4px;
+        width: list-w;
+        height: list-h;
+        SuggestionList {
+            items: suggestions;
+            current: root.current;
+            picked(s) => {
+                root.picked-text = "A: " + s;
+                field-a.text = "";
+                popup-a.close();
+            }
+        }
+    }
+
+    // B: suggestion list as an ordinary element drawn on top, inside the window.
+    Text {
+        x: field-b.x;
+        y: field-b.y - 20px;
+        text: "B: in-window overlay";
+        color: #70757a;
+    }
+    field-b := LineEdit {
+        x: parent.width - self.width - 12px;
+        y: parent.height - 50px;
+        width: 240px;
+        placeholder-text: "Add guests";
+        edited(text) => {
+            root.current = 0;
+            root.query-changed(text);
+            root.overlay-open = text != "";
+        }
+        key-pressed(e) => {
+            if (e.text == Key.DownArrow) {
+                root.current = Math.min(root.current + 1, suggestions.length - 1);
+                return accept;
+            }
+            if (e.text == Key.UpArrow) {
+                root.current = Math.max(root.current - 1, 0);
+                return accept;
+            }
+            if (e.text == Key.Return && suggestions.length > 0) {
+                root.picked-text = "B: " + suggestions[root.current];
+                self.text = "";
+                root.overlay-open = false;
+                return accept;
+            }
+            if (e.text == Key.Escape) {
+                root.overlay-open = false;
+                return accept;
+            }
+            return reject;
+        }
+    }
+    if overlay-open: SuggestionList {
+        x: Math.max(8px, Math.min(field-b.x, root.width - list-w - 8px));
+        y: field-b.y + field-b.height + list-h + 8px > root.height ? field-b.y - list-h - 4px : field-b.y + field-b.height + 4px;
+        width: list-w;
+        items: suggestions;
+        current: root.current;
+        picked(s) => {
+            root.picked-text = "B: " + s;
+            field-b.text = "";
+            root.overlay-open = false;
+        }
+    }
+}
