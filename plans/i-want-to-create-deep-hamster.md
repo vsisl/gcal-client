@@ -151,3 +151,22 @@ packaging and Flathub submission, release CI injecting the official key, accessi
 - End of each milestone: `cargo fmt --check && cargo clippy -- -D warnings && cargo test`, then run
   the app against the user's real accounts and walk through that milestone's features.
 - M0 gate: spike results (frame smoothness with 300 events, popup behaviour) reported with numbers.
+
+## M0 findings (2026-11-14)
+
+Both Slint spikes passed; Slint stays the toolkit. Rules the real app must follow:
+
+- **Never replace a list model wholesale.** Resetting the model of 300 events gave 12-15 fps
+  because Slint rebuilds every element; patching only changed rows gives ~90-100 fps (OpenGL)
+  and ~45-55 fps (CPU renderer). View-models diff and patch rows.
+- **Autocomplete lists are in-window overlay elements, not `PopupWindow`.** A `PopupWindow` takes
+  keyboard focus, so typing and arrow keys stop reaching the text field (confirmed by hand and by
+  the automated driver). `PopupWindow` is fine for click-to-open popovers such as event details.
+- **Popover placement is computed by us**: shift left / flip above the anchor to stay inside the
+  window (works in the spike; same behaviour as the web app, where popovers never leave the page).
+- **Memory:** ~110 MB peak with the OpenGL renderer, ~54 MB with the CPU renderer, for the
+  300-event week. Renderer choice is open; revisit with the real app in M2.
+- **Automated UI driving:** building with `slint = { features = ["mcp"] }` and
+  `SLINT_EMIT_DEBUG_INFO=1`, then running with `SLINT_MCP_PORT=<port>`, starts Slint's embedded
+  MCP server (HTTP JSON-RPC at `/mcp`): element tree, click, drag, type, screenshots. Use it to
+  verify UI work from M1 on; the feature must be off in release builds.
