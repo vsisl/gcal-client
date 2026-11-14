@@ -1,0 +1,169 @@
+// Spike: can Slint draw a dense week grid from plain elements and keep
+// drag-to-create, drag-to-move and drag-to-resize smooth?
+
+export struct EventItem {
+    id: int,
+    title: string,
+    day: int,
+    start-min: int,
+    end-min: int,
+    // Position among overlapping events: column `col` of `cols`.
+    col: int,
+    cols: int,
+    color: color,
+}
+
+export component AppWindow inherits Window {
+    title: "Week grid spike";
+    preferred-width: 1200px;
+    preferred-height: 800px;
+    background: white;
+
+    in property <[EventItem]> events;
+    in-out property <length> scroll-y <=> fl.viewport-y;
+    callback event-changed(int, int, int, int); // id, day, start-min, end-min
+    callback event-created(int, int, int); // day, start-min, end-min
+
+    property <length> hour-h: 48px;
+    property <length> gutter: 56px;
+    property <length> day-w: (fl.width - gutter) / 7;
+
+    fl := Flickable {
+        // Wheel/touchpad scrolling only, so pointer drags are free for events.
+        interactive: false;
+        viewport-width: self.width;
+        viewport-height: hour-h * 24;
+
+        for h in 24: Rectangle {
+            x: gutter;
+            y: h * hour-h;
+            width: fl.width - gutter;
+            height: 1px;
+            background: #dadce0;
+        }
+        for h in 24: Text {
+            x: 0;
+            y: h * hour-h - 6px;
+            width: gutter - 8px;
+            horizontal-alignment: right;
+            text: h == 0 ? "" : "\{h}:00";
+            font-size: 10px;
+            color: #70757a;
+        }
+        for d in 7: Rectangle {
+            x: gutter + d * day-w;
+            y: 0;
+            width: 1px;
+            height: hour-h * 24;
+            background: #dadce0;
+        }
+
+        // Drag on empty space to create an event.
+        create := TouchArea {
+            x: gutter;
+            y: 0;
+            width: fl.width - gutter;
+            height: hour-h * 24;
+            property <int> day: Math.min(6, Math.max(0, Math.floor(self.pressed-x / day-w)));
+            property <length> top: Math.min(self.pressed-y, self.mouse-y);
+            property <length> bottom: Math.max(self.pressed-y, self.mouse-y);
+            property <int> start-min: Math.floor(self.top / hour-h * 4) * 15;
+            property <int> end-min: Math.max(self.start-min + 15, Math.ceil(self.bottom / hour-h * 4) * 15);
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
+                    root.event-created(self.day, self.start-min, self.end-min);
+                }
+            }
+        }
+        if create.pressed: Rectangle {
+            x: gutter + create.day * day-w + 1px;
+            y: create.start-min / 60.0 * hour-h;
+            width: day-w - 10px;
+            height: (create.end-min - create.start-min) / 60.0 * hour-h;
+            border-radius: 4px;
+            background: #039be5;
+            opacity: 0.8;
+        }
+
+        for ev in events: Rectangle {
+            // Pointer travel since the drag started (zero when idle).
+            property <length> off-x;
+            property <length> off-y;
+            property <length> off-h;
+            property <bool> moving: off-x != 0 || off-y != 0;
+            property <length> slot-w: (day-w - 10px) / ev.cols;
+            property <length> base-x: gutter + ev.day * day-w + 1px + ev.col * slot-w;
+            property <length> base-y: ev.start-min / 60.0 * hour-h;
+            property <length> base-h: (ev.end-min - ev.start-min) / 60.0 * hour-h;
+            property <int> cur-day: Math.min(6, Math.max(0, Math.round(ev.day + off-x / day-w)));
+            property <int> cur-start: Math.round((base-y + off-y) / hour-h * 4) * 15;
+            property <int> cur-len: Math.max(15, Math.round((base-h + off-h) / hour-h * 4) * 15);
+
+            x: moving ? gutter + cur-day * day-w + 1px : base-x;
+            y: cur-start / 60.0 * hour-h;
+            width: moving ? day-w - 10px : slot-w - 1px;
+            height: cur-len / 60.0 * hour-h - 1px;
+            z: moving || off-h != 0 ? 10 : 0;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: white;
+            background: ev.color;
+            clip: true;
+            drop-shadow-blur: moving ? 8px : 0px;
+            drop-shadow-color: #00000060;
+
+            Text {
+                x: 6px;
+                y: 3px;
+                width: parent.width - 8px;
+                text: ev.title;
+                font-size: 12px;
+                font-weight: 500;
+                color: white;
+                overflow: elide;
+            }
+            if parent.height > 34px: Text {
+                x: 6px;
+                y: 18px;
+                width: parent.width - 8px;
+                text: "\{Math.floor(cur-start / 60)}:\{Math.mod(cur-start, 60) < 10 ? "0" : ""}\{Math.mod(cur-start, 60)}";
+                font-size: 11px;
+                color: white;
+                overflow: elide;
+            }
+
+            // Drag the body to move.
+            TouchArea {
+                mouse-cursor: self.pressed ? grabbing : pointer;
+                moved => {
+                    // The element itself moves (in 15-minute snaps) under the pointer, so
+                    // add its own displacement back to get the true pointer travel.
+                    parent.off-x = self.mouse-x - self.pressed-x + parent.x - parent.base-x;
+                    parent.off-y = self.mouse-y - self.pressed-y + parent.y - parent.base-y;
+                }
+                pointer-event(e) => {
+                    if (e.kind == PointerEventKind.up && parent.moving) {
+                        root.event-changed(ev.id, parent.cur-day, parent.cur-start, parent.cur-start + parent.cur-len);
+                        parent.off-x = 0;
+                        parent.off-y = 0;
+                    }
+                }
+            }
+            // Drag the bottom edge to resize.
+            TouchArea {
+                y: parent.height - 7px;
+                height: 7px;
+                mouse-cursor: ns-resize;
+                moved => {
+                    parent.off-h = self.mouse-y - self.pressed-y + parent.height + 1px - parent.base-h;
+                }
+                pointer-event(e) => {
+                    if (e.kind == PointerEventKind.up && parent.off-h != 0) {
+                        root.event-changed(ev.id, ev.day, ev.start-min, ev.start-min + parent.cur-len);
+                        parent.off-h = 0;
+                    }
+                }
+            }
+        }
+    }
+}
