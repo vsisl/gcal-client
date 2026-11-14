@@ -21,30 +21,51 @@ Decided by the user:
 - Sign-in: the user's own Google Cloud key now (read from local config, never committed);
   Google's app review is a late milestone before public release; bring-your-own key stays supported.
 - Claude builds; the user reviews milestones and handles steps only they can do (Google Cloud Console, domain).
+- **Toolkit: Slint 1.18** with its official Material 3 component set, **licence GPLv3**.
+  (Only stable-API candidate; pickers, menus, dialogs, tray, key bindings, screen-reader support.)
+- **Look: as close to the web app as legally possible** — same layout, spacing, fonts, colours and
+  icon shapes using open Material assets; only logo, name and Google product icons differ.
+  Light/dark/system theme like the web.
+- **New events** default to the calendar the previous event was created in (remembered across
+  restarts; initially the first account's main calendar); quick-create and the editor always show
+  a calendar picker grouped by account.
+- **Settings are app-wide**, seeded once from the first account added, then local. Reminder defaults
+  stay per calendar as Google stores them.
+- **Closing the window** keeps the app running (sync + reminders) by default; configurable in
+  settings (quit on close), with optional start-at-login. Tray icon where the desktop supports one;
+  Ctrl+Q quits.
+- **Offline is view-only**, like the web: no queued edits, so no conflict resolution UI.
+- **Descriptions:** shown formatted; edited as lightly marked-up text with the web's toolbar buttons
+  and Ctrl+B/I/U, plus a formatted preview; saved in Google's HTML subset.
+- **Features without a public API** keep their menu entries/buttons, marked "opens in browser", and
+  open the matching Google Calendar page for the right account.
+- **Repo:** private on GitHub from M0 (for CI); made public at the end of M3. Pushes only after asking.
+- **Packaging: Flatpak only** (Flathub). Token storage and background mode are designed for the
+  sandbox from the start (`oo7` / Secret portal, Background portal).
+- **Languages:** English, with every interface string marked for translation from day one (`@tr`);
+  dates, times and week start follow settings/locale.
+- **Privacy:** the app talks only to Google. No statistics, crash reporting or update checks;
+  a "copy diagnostics" button supports GitHub bug reports.
+- **Roadmap order** as listed below, unchanged.
 
 My calls (change any of these on review):
 
-- **Toolkit: Slint 1.18** with its official Material 3 component set. Only stable-API candidate; has
-  date/time pickers, menus, dialogs, tray icon, key bindings, screen-reader support. Fallback: iced.
-- **Licence: GPLv3** — the simplest way to satisfy Slint's licensing.
+- **Fallback toolkit:** iced, only if the M0 spikes show Slint cannot do the week grid or popovers.
 - **Name:** working name `gcal-client` (crate, binary, repo). "GCal" is not an official Google product
   name, but Google's reviewers may still judge it too close; I could not verify either way. The display
   name lives in one constant and is settled in the release milestone, before Google's review.
-- **Look:** Material 3 layout matching Google Calendar's structure and behaviour, with our own icon and
-  no Google logos or product icons (Google's branding rules). Tagline: "Works with Google Calendar".
+- **Tagline:** "Works with Google Calendar" (wording Google's branding rules allow).
 - **Google API access:** a small hand-written client (`reqwest` + `serde`), not the generated
   `google-calendar3` crate (maintenance mode, missing newer fields).
 - **Storage/sync:** local SQLite cache (`rusqlite`), incremental sync with sync tokens, polling
-  (push needs a public HTTPS server), offline edits queued and replayed with ETag conflict checks.
+  (push needs a public HTTPS server); online writes use ETag checks and re-fetch on conflict.
 - **Time:** `chrono` + `chrono-tz` (what the `rrule` recurrence crate uses).
 - **Shortcuts:** the 21 on Google's current help page plus the long-standing `k`/`p`, `y`, `q`;
   verified against the web app's `?` dialog during M2.
-- **Event descriptions:** displayed with formatting; edited through a simple formatting toolbar over
-  markdown-style text converted to Google's HTML subset (no Rust toolkit has a rich-text editor).
 
 ## Known parity gaps (no public Google API)
 
-Cannot be built by any third-party app; the app will say so where relevant:
+Cannot be built by any third-party app; each is handed off to the browser where a web page exists:
 
 - Appointment schedules / booking pages (bookings still appear as normal events).
 - "Propose a new time".
@@ -66,8 +87,8 @@ database work, and they talk over channels (`slint::invoke_from_event_loop` for 
 |---|---|
 | `crates/core` | Pure logic, no I/O: event/calendar model, recurrence expansion (`rrule`), overlapping-event layout, date-range maths per view, shortcut table, "this / following / all" series splitting. Heavily unit-tested. |
 | `crates/google` | OAuth (system browser, loopback redirect, PKCE via `oauth2`), token storage (`keyring`/`oo7`), typed clients for Calendar v3, Tasks, People. |
-| `crates/store` | SQLite schema + migrations: accounts, calendars, events, sync tokens, outbox of pending writes, local settings. |
-| `crates/sync` | Per-account sync engine: full + incremental sync, 410 reset, polling and sync-on-focus, backoff on rate limits, outbox replay with `If-Match`. |
+| `crates/store` | SQLite schema + migrations: accounts, calendars, events, sync tokens, local settings. |
+| `crates/sync` | Per-account sync engine: full + incremental sync, 410 reset, polling and sync-on-focus, backoff on rate limits. |
 | `crates/app` | The binary: `.slint` UI files, view-models, notifications (`notify-rust`), tray, opening the browser (`open`). |
 
 Every row in the store carries its account ID, so the merged view is a query across accounts and
@@ -83,7 +104,8 @@ when it starts; M0 and M1 are detailed here.
 1. Install Rust via `rustup` plus Slint's Linux build dependencies; add `rust-toolchain.toml`.
 2. Initial commit on `main`: workspace skeleton, GPLv3 `LICENSE`, `README.md`, `.gitignore`,
    this design saved as `docs/design.md`; then work on branches.
-3. GitHub Actions: `cargo fmt --check`, `clippy -D warnings`, `cargo test`.
+3. Private GitHub repo (created and pushed only after asking); GitHub Actions: `cargo fmt --check`,
+   `clippy -D warnings`, `cargo test`.
 4. Throwaway spikes under `spikes/` to test Slint's two weak points:
    - week grid with ~300 events: scrolling, drag to create/move/resize, on Wayland and X11;
    - popover + autocomplete dropdown near the window edge.
@@ -101,12 +123,14 @@ grouped by account with toggles), navigation, all keyboard shortcuts and the `?`
 expansion, time zones, incremental sync with polling, event detail popover.
 
 **M3 — Editing**: quick-create popover, full editor, drag move/resize, delete, undo, recurring edits
-(this / this and following / all), colours, reminders, visibility, conflict handling.
+(this / this and following / all), colours, reminders, visibility, conflict handling, description
+editor. Editing is disabled with a clear banner while offline. Repo goes public at the end of M3.
 
 **M4 — People**: guests, RSVP, guest permissions, contact autocomplete, "find a time" from free/busy,
 Meet links, rooms, attachment links.
 
-**M5 — Desktop integration**: reminder notifications, tray icon, run in background, offline edits.
+**M5 — Desktop integration**: reminder notifications, tray icon, run in background (configurable
+close behaviour, start-at-login).
 
 **M6 — Other entry types**: Tasks, out of office, focus time, working location, birthdays, working hours.
 
@@ -115,7 +139,7 @@ import/export and URL subscriptions, search, settings, recently deleted, seconda
 clock, print.
 
 **M8 — Public release**: final name, homepage + privacy policy on a domain, Google review, Flatpak
-and AppImage packaging, release CI injecting the official key, accessibility pass.
+packaging and Flathub submission, release CI injecting the official key, accessibility pass.
 
 **M9 — Windows and macOS** builds, keychains, installers.
 
