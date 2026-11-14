@@ -473,7 +473,6 @@ dependencies = [
 name = "gcal-sync"
 version = "0.1.0"
 dependencies = [
- "gcal-core",
  "gcal-google",
  "gcal-store",
  "serde_json",
