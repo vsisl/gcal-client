@@ -99,7 +99,15 @@ fn main() -> Result<(), slint::PlatformError> {
         move || {
             let started = Instant::now();
             layout(&mut events.borrow_mut());
-            model.set_vec(events.borrow().clone());
+            // Touch only rows that changed: resetting the whole model makes Slint rebuild
+            // every event element, which measured at ~15 frames per second.
+            for (i, ev) in events.borrow().iter().enumerate() {
+                match model.row_data(i) {
+                    Some(old) if old == *ev => {}
+                    Some(_) => model.set_row_data(i, ev.clone()),
+                    None => model.push(ev.clone()),
+                }
+            }
             started.elapsed()
         }
     };
@@ -139,7 +147,9 @@ fn main() -> Result<(), slint::PlatformError> {
     // Self-driving benchmark: every tick scroll a little and move one event (forcing a
     // full re-layout and model reset, the worst case), then report and quit.
     let bench_timer = Timer::default();
-    if std::env::var_os("SPIKE_BENCH").is_some() {
+    let bench = std::env::var("SPIKE_BENCH").ok();
+    let scroll_only = bench.as_deref() == Some("scroll");
+    if bench.is_some() {
         let weak = ui.as_weak();
         let began = Instant::now();
         let mut ticks = 0u32;
@@ -157,7 +167,7 @@ fn main() -> Result<(), slint::PlatformError> {
             let phase = (ticks % 400) as f32 / 400.0;
             let tri = if phase < 0.5 { phase * 2.0 } else { 2.0 - phase * 2.0 };
             ui.set_scroll_y(-tri * 500.0);
-            {
+            if !scroll_only {
                 let mut evs = events.borrow_mut();
                 let n = evs.len();
                 let ev = &mut evs[(ticks as usize / 20) % n];
@@ -165,7 +175,9 @@ fn main() -> Result<(), slint::PlatformError> {
                 ev.start_min = (ev.start_min + 15) % (24 * 60 - len);
                 ev.end_min = ev.start_min + len;
             }
-            relayout += refresh();
+            if !scroll_only {
+                relayout += refresh();
+            }
             if began.elapsed() >= Duration::from_secs(6) {
                 let secs = began.elapsed().as_secs_f64();
                 println!(

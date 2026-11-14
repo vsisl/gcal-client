@@ -20,7 +20,7 @@ export component AppWindow inherits Window {
     background: white;
 
     in property <[EventItem]> events;
-    in-out property <length> scroll-y <=> fl.viewport-y;
+    in-out property <length> scroll-y <=> fl.content-y;
     callback event-changed(int, int, int, int); // id, day, start-min, end-min
     callback event-created(int, int, int); // day, start-min, end-min
 
@@ -31,8 +31,8 @@ export component AppWindow inherits Window {
     fl := Flickable {
         // Wheel/touchpad scrolling only, so pointer drags are free for events.
         interactive: false;
-        viewport-width: self.width;
-        viewport-height: hour-h * 24;
+        content-width: self.width;
+        content-height: hour-h * 24;
 
         for h in 24: Rectangle {
             x: gutter;
