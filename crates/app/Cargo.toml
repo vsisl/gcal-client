@@ -7,3 +7,13 @@ publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+dirs = "7.0.0"
+gcal-google = { version = "0.1.0", path = "../google" }
+gcal-store = { version = "0.1.0", path = "../store" }
+gcal-sync = { version = "0.1.0", path = "../sync" }
+oo7 = "0.7.1"
+open = "5.4.5"
+tokio = { version = "1.54.1", features = ["rt", "macros"] }
