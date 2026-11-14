@@ -96,10 +96,16 @@ async fn sync() -> Result<()> {
         );
         match gcal_sync::sync_account(&client, &mut store, account.id).await {
             Ok(report) => print_report(&account.email, &report),
-            Err(error) => println!("{}: {error}", account.email),
+            Err(error) => println!("{}: {}", account.email, printable(&error.to_string())),
         }
     }
     Ok(())
+}
+
+/// Text that came from Google (calendar names, error bodies) with control characters
+/// removed, so a crafted name on a shared calendar cannot send escape codes to the terminal.
+fn printable(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
 }
 
 fn print_report(email: &str, report: &gcal_sync::SyncReport) {
@@ -108,7 +114,11 @@ fn print_report(email: &str, report: &gcal_sync::SyncReport) {
         report.calendars_synced, report.events_changed
     );
     for (calendar, reason) in &report.failed_calendars {
-        println!("  could not sync {calendar}: {reason}");
+        println!(
+            "  could not sync {}: {}",
+            printable(calendar),
+            printable(reason)
+        );
     }
 }
 
@@ -127,7 +137,7 @@ fn accounts() -> Result<()> {
             } else {
                 "hidden"
             };
-            println!("  {} [{shown}]", calendar.entry.display_name());
+            println!("  {} [{shown}]", printable(calendar.entry.display_name()));
         }
     }
     Ok(())
@@ -157,5 +167,16 @@ async fn main() -> Result<()> {
             eprintln!("{USAGE}");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn printable_drops_escape_sequences_but_keeps_text() {
+        assert_eq!(printable("Team\u{1b}[2J calendar\n"), "Team[2J calendar");
+        assert_eq!(printable("Čeština ✓"), "Čeština ✓");
     }
 }
