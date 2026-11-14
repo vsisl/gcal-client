@@ -52,6 +52,9 @@ struct TokenErrorResponse {
     error: String,
 }
 
+/// How long a connection to the loopback port may take to send its request.
+const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// A sign-in waiting for the user to finish in their browser.
 pub struct PendingLogin {
     listener: TcpListener,
@@ -133,12 +136,17 @@ impl PendingLogin {
             let (mut stream, _) = self.listener.accept().await.map_err(AuthError::Listen)?;
             let mut buf = vec![0u8; 8192];
             let mut len = 0;
-            while len < buf.len() && !buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
-                match stream.read(&mut buf[len..]).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => len += n,
+            // Any local program can connect to the port. One that connects and then sends
+            // nothing must not hold up the sign-in, so each connection gets a short deadline.
+            let _ = tokio::time::timeout(HEADER_READ_TIMEOUT, async {
+                while len < buf.len() && !buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf[len..]).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => len += n,
+                    }
                 }
-            }
+            })
+            .await;
             let request = String::from_utf8_lossy(&buf[..len]);
             let outcome = request
                 .lines()
@@ -311,6 +319,36 @@ mod tests {
         assert_eq!(tokens.access_token, "access-1");
         assert_eq!(tokens.refresh_token.as_deref(), Some("refresh-1"));
         assert!(tokens.expires_at > Utc::now() + Duration::minutes(50));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_that_sends_nothing_does_not_block_the_sign_in() {
+        let config = config();
+        let endpoints = Endpoints {
+            auth: "http://unused/auth".into(),
+            token: "http://unused/token".into(),
+            calendar_api: "http://unused".into(),
+        };
+        let pending = begin_login(&config, &endpoints, &["s"]).await.unwrap();
+        let port = pending.listener.local_addr().unwrap().port();
+        let state = pending.state.clone();
+
+        let stalled = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let mut real = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let request = format!("GET /?state={state}&code=the-code HTTP/1.1\r\n\r\n");
+            real.write_all(request.as_bytes()).await.unwrap();
+            let mut reply = Vec::new();
+            let _ = real.read_to_end(&mut reply).await;
+        });
+
+        // With time paused, the runtime jumps over the stalled connection's deadline.
+        assert_eq!(pending.wait_for_code().await.unwrap(), "the-code");
+        drop(stalled);
     }
 
     #[tokio::test]
