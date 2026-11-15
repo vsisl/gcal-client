@@ -50,9 +50,17 @@ The rest of M2 is parked in `plans/m2-remaining.md`.
    colour, reminders, visibility, busy/free. Needs the Material component set for
    pickers and menus.
 8. **Offline banner** and disabling of all editing controls when Google cannot be reached.
-9. **Testing against Google without the user**: so far only the user can try writes,
-   since the test copy of the app has no sign-in. Proposed: a calendar made for this
-   ("gcal-client test") in one account, and the user's go-ahead for a scripted run
-   that signs in as usual but creates, changes and deletes only in that calendar.
+9. **Testing against Google without the user**: done with a test account the user
+   added; see the end of this file.
 10. End of milestone: checks, walk-through on real accounts, pull request, Codex review,
    then make the repository public (ask first).
+
+## Found while testing against Google (2026-11-15)
+
+- `tools/e2e/e2e.py` runs create / delete / undo for a plain and a repeating event against
+  the test account (see its header); all steps pass. Extend it with every new write.
+- Open: after a series is deleted, the next sync brings its cancelled occurrences back
+  as stubs, and the store keeps them (a cancelled occurrence is kept for its series).
+  They show nowhere but pile up; drop occurrences whose series is not in the cache.
+- Open: the new-event card and details only reach events on screen; `c` late in the
+  evening creates an event below the visible hours without scrolling to it.
