@@ -172,18 +172,20 @@ write access.
 # the account can reach: read that list. Go on only if this succeeds (&&).
 python3 tools/e2e/make_test_cache.py <test account> <data folder> &&
 export XDG_DATA_HOME=<data folder> &&
-# The test build can create an event from a JSON file (a repeating one, say):
-<scratch folder>/gcal-uitest insert <test account> <test account> tools/e2e/series.json
+# The event a script starts from, dated in the current week, and created with the
+# test build's `insert` (account, calendar, file):
+python3 tools/e2e/fixture.py series <scratch folder>/fixture.json
+<scratch folder>/gcal-uitest insert <test account> <test account> <scratch folder>/fixture.json
 SLINT_MCP_PORT=8766 timeout 300 <scratch folder>/gcal-uitest &
 python3 tools/e2e/e2e.py <screenshot folder> <data folder>/gcal-client/cache.db
 ```
 
 | Script | Covers | Needs first |
 |---|---|---|
-| `e2e.py` | create, delete, undo; a series: this / following / all | `series.json` inserted |
-| `drag.py` | move by dragging, undo | `plain.json` inserted |
-| `sdrag.py` | dragging occurrences: this / all / following | `series.json` inserted |
-| `ed.py` | the editor, also on a series | `series.json` inserted |
+| `e2e.py` | create, delete, undo; a series: this / following / all | the `series` fixture |
+| `drag.py` | move by dragging, undo | the `plain` fixture |
+| `sdrag.py` | dragging occurrences: this / all / following | the `series` fixture |
+| `ed.py` | the editor, also on a series | the `series` fixture |
 | `quick.py` | quick create and its undo | — |
 | `zoom.py` | zoom through the settings | — |
 
@@ -192,9 +194,10 @@ each. `ed.py … clean` deletes what the scripts left behind: every event on the
 screen whose title starts with "AT " (so the owner must not keep events named like that
 in the test calendar); it does not look at other months.
 
-The fixtures and the checks are written for the week of 2026-11-09, and the scripts
-expect that week on screen, where the app only opens during that week. Until that is
-fixed (issue 11), the scripts need adapting before they can be run again.
+The fixtures and the checks are for the week with today in it (`MONDAY` in
+`common.py`), which is the week the app opens on. `common.py` holds what the scripts
+share. Known limits: `ed.py` types an end time of 23:30 for an event created "now", so
+it fails late in the evening; a run across midnight on Sunday mixes two weeks.
 
 Rules for these runs:
 - Always with `XDG_DATA_HOME` on the one-account folder, never on the real one.

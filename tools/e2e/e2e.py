@@ -3,73 +3,17 @@ event and for a repeating one (this / this and following / all).
 
 It changes a real calendar, so it must only ever see a test account:
 
-1. Build the test copy of the app (it has Slint's test server and the `insert` command):
-     SLINT_EMIT_DEBUG_INFO=1 cargo build --features ui-testing -p gcal-client --target-dir target/uitest
-2. Make a data folder whose cache.db holds the test account alone, and point
-   XDG_DATA_HOME at it for every command below. The app can then reach no other account:
-     python3 tools/e2e/make_test_cache.py <email> <data folder>
-3. Seed the repeating event:
-     gcal-client insert <email> <calendar> tools/e2e/series.json
-4. Start the app with SLINT_MCP_PORT=8766, then:
-     python3 tools/e2e/e2e.py <screenshot-dir> <data folder>/gcal-client/cache.db
-   A third argument "reset" instead deletes what an interrupted run left behind.
+How to run it, and the rules for doing so safely, are in AGENTS.md ("End to end").
+In short: a data folder made by make_test_cache.py, a fresh fixture from fixture.py,
+the test build of the app running with SLINT_MCP_PORT=8766, then
+    python3 tools/e2e/e2e.py <screenshot folder> <data folder>/gcal-client/cache.db
+A third argument "reset" instead deletes the series an interrupted run left behind.
 
 Each step prints PASS or FAIL; what Google holds is read from the cache after the app's
-own sync. Run it with the week of the seeded series (2026-11-09) on screen.
+own sync.
 """
-import base64, json, sqlite3, sys, time, urllib.request
-PORT = 8766
-W = {"index": "1", "generation": "1"}
-out, dbpath = sys.argv[1], sys.argv[2]
-def call(tool, **args):
-    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                       "params": {"name": tool, "arguments": args}}).encode()
-    req = urllib.request.Request(f"http://127.0.0.1:{PORT}/mcp", data=body,
-                                 headers={"Content-Type": "application/json"})
-    return json.load(urllib.request.urlopen(req))["result"]
-def shot(name):
-    for part in call("take_screenshot", windowHandle=W)["content"]:
-        if part["type"] == "image":
-            open(f"{out}/{name}.png", "wb").write(base64.b64decode(part["data"]))
-def key(text):
-    call("dispatch_key_event", windowHandle=W, text=text); time.sleep(0.3)
-def find(role):
-    r = call("query_element_descendants", elementHandle=W, findAll=True,
-             queryStack=[{"matchDescendants": True}, {"matchElementAccessibleRole": role}])
-    h = json.loads(r["content"][0]["text"])
-    h = h.get("elementHandles", h) if isinstance(h, dict) else h
-    # The query lists an element once per path to it.
-    seen, unique = set(), []
-    for handle in h:
-        k = json.dumps(handle, sort_keys=True)
-        if k not in seen:
-            seen.add(k); unique.append(handle)
-    return unique
-def label(h):
-    return json.loads(call("get_element_properties", elementHandle=h)["content"][0]["text"]).get("accessibleLabel", "")
-def items(prefix):
-    return [h for h in find("ListItem") if label(h).startswith(prefix)]
-def events():
-    c = sqlite3.connect(f"file:{dbpath}?mode=ro", uri=True)
-    rows = [json.loads(r[0]) for r in c.execute("select json from events")]
-    c.close()
-    return rows
-def named(name):
-    return [e for e in events() if e.get("summary") == name]
-def wait(what, cond, timeout=25):
-    end = time.time() + timeout
-    while time.time() < end:
-        try:
-            if cond():
-                print("PASS", what); return True
-        except Exception as e:
-            pass
-        time.sleep(0.5)
-    print("FAIL", what); shot("fail-" + what.replace(" ", "-")[:40]); return False
-DEL, DOWN, ENTER, ESC = "\u007f", "\uf701", "\n", "\u001b"
-def notice():
-    return "OK" in [label(b) for b in find("Button")]
-DEL, DOWN, ENTER, ESC = "\u007f", "", "\n", "\u001b"
+import json, sys, time
+from common import *
 
 time.sleep(4)
 shot("e2e-start")
