@@ -13,10 +13,10 @@ Not affiliated with or endorsed by Google. Google Calendar is a trademark of Goo
 | Works | Not yet |
 |---|---|
 | Several accounts merged in one view, calendars ticked on and off | Guests: inviting, answering, editing events that have guests |
-| Day, week, 4 days, month and schedule views; small month in the sidebar | Year view, go to date, search |
+| Day, week, a few days, month, year and schedule views; go to date | Search |
 | Create, edit, move, resize and delete events, with undo (two exceptions, see below) | Date and time pickers (dates and times are typed), custom repeat rules |
 | Repeating events: "this / this and following / all" | Reminders on the desktop, tray icon, running in the background |
-| Light and dark theme, zoom of the day columns | Tasks, birthdays, out of office and other special entries |
+| Settings: theme, first day of the week, 12/24-hour clock, zoom | Tasks, birthdays, out of office and other special entries |
 | Works offline for viewing; syncs every five minutes | Packaging (Flatpak), Windows and macOS |
 
 There is no installer yet: you build it yourself, and you need your own Google sign-in key
@@ -66,7 +66,8 @@ account's calendars appear once you have agreed. Repeat for further accounts. Th
 of a large account can take a few minutes; a bar under the top bar and a count show that it
 is alive.
 
-- **Look around:** the buttons at the top switch views; the small month jumps to a day.
+- **Look around:** the button at the top right lists the views; the small month, or
+  `g` and a date, jumps to a day.
 - **Create:** click an empty time (or drag one out), click the strip above the hours or a
   day in the month for an all-day event, or press `c`. "More options" opens the editor.
 - **Change:** drag an event to move it, drag its lower edge to resize it, or open it and
@@ -88,7 +89,8 @@ shows what it fetched last and lets you change nothing until the connection is b
 |---|---|
 | `t` | Today |
 | `j` or `n` / `k` or `p` | Next / previous period |
-| `d` `w` `m` `x` `a` (or `1`–`5`) | Day, week, month, 4 days, schedule |
+| `d` `w` `m` `x` `a` `y` (or `1`–`6`) | Day, week, month, a few days, schedule, year |
+| `g` | Go to a date |
 | `c` | Create an event |
 | `e` | Edit the open event |
 | `Delete` | Delete the open event |
