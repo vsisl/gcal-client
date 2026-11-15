@@ -136,6 +136,8 @@ struct View {
     loaded: RefCell<Loaded>,
     zone: Tz,
     week_start: Cell<NaiveDate>,
+    /// The date the day headers were last drawn for, to notice midnight passing.
+    drawn_today: Cell<Option<NaiveDate>>,
     days: Rc<VecModel<DayHeader>>,
     timed: Rc<VecModel<TimedItem>>,
     all_day: Rc<VecModel<AllDayItem>>,
@@ -183,6 +185,7 @@ impl View {
     fn try_refresh(&self, ui: &AppWindow) -> Result<()> {
         let week_start = self.week_start.get();
         let today = self.today();
+        self.drawn_today.set(Some(today));
         ui.set_period_title(period_title(week_start).into());
         patch(
             &self.days,
@@ -341,6 +344,7 @@ pub fn run() -> Result<()> {
         loaded: RefCell::default(),
         zone,
         week_start: Cell::new(week_start_of(Utc::now().with_timezone(&zone).date_naive())),
+        drawn_today: Cell::new(None),
         days: Rc::default(),
         timed: Rc::default(),
         all_day: Rc::default(),
@@ -393,7 +397,10 @@ pub fn run() -> Result<()> {
     clock_timer.start(TimerMode::Repeated, StdDuration::from_secs(30), {
         let view = view.clone();
         move || {
-            if let Some(ui) = view.ui.upgrade() {
+            if view.drawn_today.get() != Some(view.today()) {
+                // Midnight passed: the "today" highlight has to move too.
+                view.refresh();
+            } else if let Some(ui) = view.ui.upgrade() {
                 view.update_now(&ui);
             }
         }
