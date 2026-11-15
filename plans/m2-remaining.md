@@ -27,8 +27,8 @@ still asks for, to pick up later. Each item is one or a few commits; none depend
 
 ## Settings (local, app-wide)
 
-- A settings table in `crates/store` (new migration), seeded once from the first account's
-  Google settings (`settings.list`), then local.
+- The settings table and a first settings card (theme only) exist since the M3 branch.
+  Still open: seeding once from the first account's Google settings (`settings.list`).
 - **Week start** (Monday is hard-coded in `week_start_of`), **12/24-hour clock** (`clock`
   in `gui.rs` is 24-hour only), custom view length, remembered last view.
 
@@ -42,8 +42,8 @@ still asks for, to pick up later. Each item is one or a few commits; none depend
 
 - **Google's current calendar colours**: the API returns the classic palette
   (`backgroundColor`); the web maps those to its modern palette. Add the mapping table.
-- **Dark theme** and follow-the-system: all colours already come from `Theme` in
-  `crates/app/ui/app.slint`.
+- **Dark theme**: done on the M3 branch, with a desktop / light / dark choice in the
+  settings card. Still open: event colours tuned for dark.
 - **Hour labels**: the label of the first visible hour is clipped by the all-day strip's
   line.
 - **Strings from Rust** ("All day", "Until …", month and weekday names) are not yet marked

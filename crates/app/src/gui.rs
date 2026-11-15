@@ -1,15 +1,18 @@
 //! The window: turns the cache into what the week view shows and wires up its controls.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::time::Duration as StdDuration;
 
 use anyhow::Result;
-use chrono::{DateTime, Datelike, Duration, Months, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, Months, NaiveDate, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use gcal_core::month::{MonthLayout, layout_month};
-use gcal_core::recurrence::{Series, single_instance};
+use gcal_core::recurrence::{
+    Series, end_series_before, occurrences_before, remaining_series, shift_weekdays,
+    single_instance, split_dates,
+};
 use gcal_core::schedule::{DayPart, schedule};
 use gcal_core::text::plain_text;
 use gcal_core::week::{WeekLayout, layout_days, local_day_start};
@@ -17,14 +20,27 @@ use gcal_core::{CalendarListEntry, Event, EventTime};
 use gcal_store::{Account, AccountId, Store, StoredCalendar};
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
+use crate::editor::{self, Form, Kept};
 use crate::open_store;
-use crate::worker::{self, Command};
+use crate::worker::{self, Command, Deletion, Edit};
+use tokio::sync::mpsc::UnboundedSender;
 
 slint::include_modules!();
 
 /// How often changes are fetched from Google while the window is open. (Google can only
 /// push changes to a public web server, so a desktop app has to ask.)
 const SYNC_INTERVAL: StdDuration = StdDuration::from_secs(5 * 60);
+/// The setting that remembers which calendar the previous new event went to.
+/// How often to look for Google again while it cannot be reached.
+const OFFLINE_RETRY: StdDuration = StdDuration::from_secs(30);
+const NEW_EVENT_CALENDAR: &str = "new_event_calendar";
+/// Setting: light or dark, as the number the window uses (0 as the desktop, 1 light,
+/// 2 dark).
+const THEME: &str = "theme";
+/// Setting: the height of an hour in the day columns, in pixels (the zoom).
+const HOUR_HEIGHT: &str = "hour_height";
+/// How long "Undo" stays on offer after a deletion.
+const UNDO_PERIOD: StdDuration = StdDuration::from_secs(10);
 /// The sidebar's small month always shows six weeks.
 const MINI_MONTH_DAYS: i64 = 42;
 /// How many days ahead the schedule view lists.
@@ -262,6 +278,582 @@ impl Loaded {
     }
 }
 
+/// A stored event an instance on screen belongs to.
+#[derive(Clone)]
+struct Target {
+    account: AccountId,
+    calendar_id: String,
+    event_id: String,
+    etag: Option<String>,
+    /// Set when the instance is one occurrence of a series.
+    occurrence: Option<Occurrence>,
+    /// Whether it can be dragged to another time.
+    movable: bool,
+    /// When this instance starts and ends.
+    start: EventTime,
+    end: EventTime,
+}
+
+/// A drag of a repeating event, waiting for the answer to "this, following or all?".
+#[derive(Clone, Copy)]
+struct Drag {
+    instance: usize,
+    days: i64,
+    minutes: i64,
+    /// Whether only the lower edge was dragged.
+    resize: bool,
+}
+
+impl Drag {
+    /// The times an event has after this drag, given the ones it had.
+    fn apply(self, start: EventTime, end: EventTime, zone: Tz) -> Option<(EventTime, EventTime)> {
+        if self.resize {
+            Some((start, resized_end(start, end, self.minutes, zone)?))
+        } else {
+            Some(moved_times(start, end, self.days, self.minutes, zone))
+        }
+    }
+}
+
+/// What to send for a drag of `target` and how to take it back, if it can be. `own` and
+/// `series` are the cached resources of the event and of the series it belongs to.
+fn plan_drag(
+    target: &Target,
+    scope: Scope,
+    drag: Drag,
+    own: Option<serde_json::Value>,
+    series: Option<serde_json::Value>,
+    zone: Tz,
+) -> Option<(Edit, Option<UndoKind>)> {
+    let times = |resource: &serde_json::Value| serde_json::json!({ "start": resource["start"], "end": resource["end"] });
+    let Some(occurrence) = &target.occurrence else {
+        let own = own?;
+        let event: Event = serde_json::from_value(own.clone()).ok()?;
+        let (start, end) = drag.apply(event.start_time()?, event.end_time()?, zone)?;
+        return Some((
+            Edit::Event {
+                event_id: target.event_id.clone(),
+                etag: target.etag.clone(),
+                changes: time_changes(&own, start, end),
+            },
+            Some(UndoKind::Patch {
+                event_id: target.event_id.clone(),
+                changes: times(&own),
+            }),
+        ));
+    };
+    let (start, end) = drag.apply(target.start, target.end, zone)?;
+    if scope == Scope::This {
+        // A changed occurrence is an event of its own; an unchanged one takes its
+        // time zone from the series.
+        let resource = if occurrence.changed { own? } else { series? };
+        return Some((
+            Edit::Occurrence {
+                series_id: occurrence.series_id.clone(),
+                original_start: occurrence.original_start,
+                known_id: occurrence.changed.then(|| target.event_id.clone()),
+                etag: target.etag.clone().filter(|_| occurrence.changed),
+                changes: time_changes(&resource, start, end),
+            },
+            Some(UndoKind::Occurrence(time_changes(
+                &resource,
+                target.start,
+                target.end,
+            ))),
+        ));
+    }
+    let resource = series?;
+    let master: Event = serde_json::from_value(resource.clone()).ok()?;
+    if scope == Scope::Following && master.start_time() != Some(occurrence.original_start) {
+        // The series is split: it ends before this occurrence, and a copy of it starts
+        // at the occurrence's new time with what was left of its rule.
+        let earlier = occurrences_before(&master, occurrence.original_start);
+        let left = split_dates(
+            &remaining_series(&master.recurrence, earlier),
+            occurrence.original_start,
+            true,
+        );
+        let rules = shift_weekdays(&left, drag.days);
+        let mut copy = resource.clone();
+        let new_times = time_changes(&resource, start, end);
+        copy["start"] = new_times["start"].clone();
+        copy["end"] = new_times["end"].clone();
+        copy["recurrence"] = serde_json::json!(rules);
+        return Some((
+            Edit::Following {
+                series_id: master.id.clone(),
+                etag: master.etag.clone(),
+                recurrence: end_series_before(&master.recurrence, occurrence.original_start),
+                old_recurrence: master.recurrence.clone(),
+                resource: copy,
+            },
+            // Taking this back would mean deleting the new series and restoring the
+            // old one's rule; not offered yet.
+            None,
+        ));
+    }
+    // All: the series itself moves by as much as the occurrence was dragged.
+    let (start, end) = drag.apply(master.start_time()?, master.end_time()?, zone)?;
+    let mut changes = time_changes(&resource, start, end);
+    changes["recurrence"] = serde_json::json!(shift_weekdays(&master.recurrence, drag.days));
+    let mut before = times(&resource);
+    before["recurrence"] = serde_json::json!(master.recurrence);
+    Some((
+        Edit::Event {
+            event_id: master.id.clone(),
+            etag: master.etag,
+            changes,
+        },
+        Some(UndoKind::Patch {
+            event_id: master.id,
+            changes: before,
+        }),
+    ))
+}
+
+/// Whether the event can be moved and resized by dragging. Not yet: events with guests
+/// (who would have to be told); never the special kinds of entry (birthdays, ...).
+fn can_move(event: &Event, calendar: &CalendarListEntry) -> bool {
+    calendar.is_writable()
+        && matches!(event.event_type.as_deref(), None | Some("default"))
+        && event.attendees.is_empty()
+}
+
+/// An instant moved by whole days and minutes on the local clock, so that a move across
+/// a change of the clocks keeps the time of day.
+fn shift(instant: DateTime<Utc>, days: i64, minutes: i64, zone: Tz) -> DateTime<Utc> {
+    let by = Duration::days(days) + Duration::minutes(minutes);
+    let local = instant.with_timezone(&zone).naive_local() + by;
+    zone.from_local_datetime(&local)
+        .earliest()
+        .map(|moved| moved.with_timezone(&Utc))
+        // A local time the clocks skip: the same distance in real time instead.
+        .unwrap_or(instant + by)
+}
+
+/// Start and end of an event dragged by `days` and `minutes`; its length stays.
+fn moved_times(
+    start: EventTime,
+    end: EventTime,
+    days: i64,
+    minutes: i64,
+    zone: Tz,
+) -> (EventTime, EventTime) {
+    match (start, end) {
+        (EventTime::AllDay(first), EventTime::AllDay(last)) => (
+            EventTime::AllDay(first + Duration::days(days)),
+            EventTime::AllDay(last + Duration::days(days)),
+        ),
+        (EventTime::Timed(from), EventTime::Timed(to)) => {
+            let moved = shift(from, days, minutes, zone);
+            (
+                EventTime::Timed(moved),
+                EventTime::Timed(moved + (to - from)),
+            )
+        }
+        unchanged => unchanged,
+    }
+}
+
+/// The end of a timed event whose lower edge was dragged by `minutes`; never less than
+/// a quarter of an hour after the start. `None` for all-day events.
+fn resized_end(start: EventTime, end: EventTime, minutes: i64, zone: Tz) -> Option<EventTime> {
+    let (EventTime::Timed(from), EventTime::Timed(to)) = (start, end) else {
+        return None;
+    };
+    let dragged = shift(to, 0, minutes, zone);
+    Some(EventTime::Timed(dragged.max(from + Duration::minutes(15))))
+}
+
+/// The fields to send for new times of an event, keeping the time zone each end had.
+fn time_changes(
+    resource: &serde_json::Value,
+    start: EventTime,
+    end: EventTime,
+) -> serde_json::Value {
+    let field = |name: &str, time: EventTime| match time {
+        EventTime::AllDay(day) => serde_json::json!({ "date": day.to_string() }),
+        EventTime::Timed(instant) => {
+            let mut field = serde_json::json!({
+                "dateTime": instant.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            });
+            if let Some(zone) = resource[name]["timeZone"].as_str() {
+                field["timeZone"] = zone.into();
+            }
+            field
+        }
+    };
+    serde_json::json!({ "start": field("start", start), "end": field("end", end) })
+}
+
+/// Which occurrence of which series an instance on screen is.
+#[derive(Clone)]
+struct Occurrence {
+    series_id: String,
+    /// When it would start had it not been changed; this is what tells occurrences apart.
+    original_start: EventTime,
+    /// Whether it is a changed occurrence, stored as an event of its own.
+    changed: bool,
+}
+
+fn occurrence_of(event: &Event, start: EventTime) -> Option<Occurrence> {
+    if event.is_recurring_master() {
+        return Some(Occurrence {
+            series_id: event.id.clone(),
+            original_start: start,
+            changed: false,
+        });
+    }
+    Some(Occurrence {
+        series_id: event.recurring_event_id.clone()?,
+        original_start: event
+            .original_start_time
+            .as_ref()
+            .and_then(|original| original.time())
+            .unwrap_or(start),
+        changed: true,
+    })
+}
+
+/// How much of a series a deletion takes, as asked in the window.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Scope {
+    This,
+    Following,
+    All,
+}
+
+/// What to send to delete `target` and how to take that back; `series` is the cached
+/// resource of the series the target belongs to, if it belongs to one.
+fn plan_deletion(
+    target: &Target,
+    scope: Scope,
+    own: Option<serde_json::Value>,
+    series: Option<serde_json::Value>,
+) -> Option<(Deletion, UndoKind)> {
+    let Some(occurrence) = &target.occurrence else {
+        return Some((
+            Deletion::Event {
+                event_id: target.event_id.clone(),
+                etag: target.etag.clone(),
+            },
+            UndoKind::Recreate(own?),
+        ));
+    };
+    if scope == Scope::This {
+        return Some((
+            Deletion::Occurrence {
+                series_id: occurrence.series_id.clone(),
+                original_start: occurrence.original_start,
+                known_id: occurrence.changed.then(|| target.event_id.clone()),
+                etag: target.etag.clone().filter(|_| occurrence.changed),
+            },
+            // Google keeps a deleted occurrence as a cancelled event.
+            UndoKind::Occurrence(serde_json::json!({ "status": "confirmed" })),
+        ));
+    }
+    let resource = series?;
+    let master: Event = serde_json::from_value(resource.clone()).ok()?;
+    // "This and following" from the first occurrence on is the whole series.
+    if scope == Scope::Following && master.start_time() != Some(occurrence.original_start) {
+        return Some((
+            Deletion::Following {
+                series_id: master.id.clone(),
+                recurrence: end_series_before(&master.recurrence, occurrence.original_start),
+                etag: master.etag.clone(),
+            },
+            UndoKind::Patch {
+                event_id: master.id,
+                changes: serde_json::json!({ "recurrence": master.recurrence }),
+            },
+        ));
+    }
+    Some((
+        Deletion::Event {
+            event_id: master.id,
+            etag: master.etag,
+        },
+        UndoKind::Recreate(resource),
+    ))
+}
+
+/// A change to a repeating event that waits for "this, following or all?".
+enum Asked {
+    Drag(Drag),
+    Form(Box<Saved>),
+}
+
+/// The editor while it is open: the event it is for (`None` for a new one), and the
+/// form as it was opened, to tell what the user changed.
+#[derive(Clone)]
+struct Editing {
+    target: Option<Target>,
+    opened: Form,
+    kept: Kept,
+    /// The event, and the series it belongs to, as they were when the editor opened.
+    /// What is saved is a change to these versions: should a sync bring newer ones
+    /// while the editor is open, Google refuses the change rather than have it
+    /// overwrite something the user never saw.
+    own: Option<serde_json::Value>,
+    series: Option<serde_json::Value>,
+}
+
+/// What the editor was closed with.
+struct Saved {
+    target: Target,
+    form: Form,
+    opened: Form,
+    kept: Kept,
+    /// The fields the user changed, with their new values.
+    changes: serde_json::Value,
+    /// All fields as the form was opened, and as it was saved.
+    before: serde_json::Value,
+    after: serde_json::Value,
+    /// The event and its series as they were when the editor opened.
+    own: Option<serde_json::Value>,
+    series: Option<serde_json::Value>,
+}
+
+fn to_window(form: &Form) -> EditorForm {
+    EditorForm {
+        title: form.title.as_str().into(),
+        all_day: form.all_day,
+        start_date: form.start_date.as_str().into(),
+        end_date: form.end_date.as_str().into(),
+        start_time: form.start_time.as_str().into(),
+        end_time: form.end_time.as_str().into(),
+        repeat: form.repeat as i32,
+        location: form.location.as_str().into(),
+        description: form.description.as_str().into(),
+        color: form.color as i32,
+        reminder: form.reminder as i32,
+        visibility: form.visibility as i32,
+        busy: form.busy,
+    }
+}
+
+fn from_window(form: &EditorForm) -> Form {
+    Form {
+        title: form.title.to_string(),
+        all_day: form.all_day,
+        start_date: form.start_date.to_string(),
+        end_date: form.end_date.to_string(),
+        start_time: form.start_time.to_string(),
+        end_time: form.end_time.to_string(),
+        repeat: form.repeat.max(0) as usize,
+        location: form.location.to_string(),
+        description: form.description.to_string(),
+        color: form.color.max(0) as usize,
+        reminder: form.reminder.max(0) as usize,
+        visibility: form.visibility.max(0) as usize,
+        busy: form.busy,
+    }
+}
+
+/// What to send for the editor's changes to `saved.target` and how to take them back,
+/// if that is offered. `Ok(None)` when there is nothing to send.
+fn plan_form(
+    saved: &Saved,
+    scope: Scope,
+    own: Option<serde_json::Value>,
+    series: Option<serde_json::Value>,
+    zone: Tz,
+) -> Result<Option<(Edit, Option<UndoKind>)>, String> {
+    let target = &saved.target;
+    let Some(occurrence) = &target.occurrence else {
+        let Some(own) = own else { return Ok(None) };
+        return Ok(Some((
+            Edit::Event {
+                event_id: target.event_id.clone(),
+                etag: target.etag.clone(),
+                changes: saved.changes.clone(),
+            },
+            Some(UndoKind::Patch {
+                event_id: target.event_id.clone(),
+                changes: editor::inverse(&saved.changes, &own),
+            }),
+        )));
+    };
+    if scope == Scope::This {
+        // One occurrence cannot repeat differently from its series.
+        let mut changes = saved.changes.clone();
+        if let Some(changes) = changes.as_object_mut() {
+            changes.remove("recurrence");
+            if changes.is_empty() {
+                return Ok(None);
+            }
+        }
+        let Some(resource) = (if occurrence.changed { own } else { series }) else {
+            return Ok(None);
+        };
+        // What it had comes from the event, except its times, which are its own.
+        let mut was = editor::inverse(&changes, &resource);
+        for time in ["start", "end"] {
+            if changes.get(time).is_some() {
+                was[time] = saved.before[time].clone();
+            }
+        }
+        return Ok(Some((
+            Edit::Occurrence {
+                series_id: occurrence.series_id.clone(),
+                original_start: occurrence.original_start,
+                known_id: occurrence.changed.then(|| target.event_id.clone()),
+                etag: target.etag.clone().filter(|_| occurrence.changed),
+                changes,
+            },
+            Some(UndoKind::Occurrence(was)),
+        )));
+    }
+    let Some(resource) = series else {
+        return Ok(None);
+    };
+    let Ok(master) = serde_json::from_value::<Event>(resource.clone()) else {
+        return Ok(None);
+    };
+    // The rule the form keeps is the series' own, also when a changed occurrence
+    // (which has none) was opened.
+    let kept = Kept {
+        recurrence: master.recurrence.clone(),
+        ..saved.kept.clone()
+    };
+    if scope == Scope::Following && master.start_time() != Some(occurrence.original_start) {
+        let earlier = occurrences_before(&master, occurrence.original_start);
+        let days = (editor::start_day(&saved.form)? - editor::start_day(&saved.opened)?).num_days();
+        return Ok(Some((
+            Edit::Following {
+                series_id: master.id.clone(),
+                etag: master.etag.clone(),
+                recurrence: end_series_before(&master.recurrence, occurrence.original_start),
+                old_recurrence: master.recurrence.clone(),
+                resource: editor::following_series(
+                    &resource,
+                    &saved.changes,
+                    &saved.after,
+                    earlier,
+                    days,
+                    occurrence.original_start,
+                ),
+            },
+            None,
+        )));
+    }
+    let changes = editor::for_series(
+        &saved.changes,
+        &saved.before,
+        &saved.after,
+        &kept,
+        &master,
+        zone,
+    )?;
+    Ok(Some((
+        Edit::Event {
+            event_id: master.id.clone(),
+            etag: master.etag,
+            changes: changes.clone(),
+        },
+        Some(UndoKind::Patch {
+            event_id: master.id,
+            changes: editor::inverse(&changes, &resource),
+        }),
+    )))
+}
+
+/// What undoing a change needs.
+struct Undo {
+    account: AccountId,
+    calendar_id: String,
+    kind: UndoKind,
+    /// The version the change left the event in, once the worker has said. The undo
+    /// is then made only if nothing else changed the event since.
+    etag: Option<String>,
+}
+
+/// A change sent to the worker and not answered yet. The worker makes changes one at
+/// a time in the order they were sent, so its answers match these in order.
+struct Pending {
+    undo: Option<Undo>,
+    /// For a new event: what to show again should it not be created.
+    retry: Option<Retry>,
+}
+
+/// A new event as it was sent, to give back what was typed if creating it fails.
+struct Retry {
+    form: Form,
+    calendar: usize,
+    draft: Draft,
+}
+
+#[derive(Debug, PartialEq)]
+enum UndoKind {
+    /// Create the event again from the resource it had. For a series this brings back
+    /// the series, not the changes that had been made to single occurrences.
+    Recreate(serde_json::Value),
+    /// Delete an event that was just created.
+    Delete(String),
+    /// Give an event some of its fields back.
+    Patch {
+        event_id: String,
+        changes: serde_json::Value,
+    },
+    /// Give one occurrence of a series these fields back; which event that is, the
+    /// worker tells once it has changed or deleted it.
+    Occurrence(serde_json::Value),
+}
+
+/// A new event being typed in.
+#[derive(Clone)]
+struct Draft {
+    start: EventTime,
+    end: EventTime,
+    /// The calendars on offer, in the order shown: account, calendar, and the text under
+    /// which the choice is remembered.
+    calendars: Vec<(AccountId, String, String)>,
+}
+
+/// When a new event starts and ends: `length` minutes from the time clicked, or the
+/// whole day.
+fn draft_times(
+    day: NaiveDate,
+    minute: i32,
+    all_day: bool,
+    length: i32,
+    zone: Tz,
+) -> (EventTime, EventTime) {
+    if all_day {
+        return (
+            EventTime::AllDay(day),
+            EventTime::AllDay(day + Duration::days(1)),
+        );
+    }
+    let local = day.and_time(chrono::NaiveTime::MIN) + Duration::minutes(i64::from(minute));
+    // A time skipped by the clocks going forward starts at the day's first valid instant.
+    let start = zone
+        .from_local_datetime(&local)
+        .earliest()
+        .map(|start| start.with_timezone(&Utc))
+        .unwrap_or_else(|| local_day_start(day, zone));
+    (
+        EventTime::Timed(start),
+        EventTime::Timed(start + Duration::minutes(i64::from(length))),
+    )
+}
+
+/// The resource Google creates an event from.
+fn event_resource(title: &str, start: EventTime, end: EventTime, zone: Tz) -> serde_json::Value {
+    let time = |time: EventTime| match time {
+        EventTime::AllDay(day) => serde_json::json!({ "date": day.to_string() }),
+        EventTime::Timed(instant) => serde_json::json!({
+            "dateTime": instant.with_timezone(&zone).to_rfc3339(),
+            "timeZone": zone.name(),
+        }),
+    };
+    serde_json::json!({
+        "summary": title.trim(),
+        "start": time(start),
+        "end": time(end),
+    })
+}
+
 struct View {
     ui: slint::Weak<AppWindow>,
     store: Store,
@@ -280,6 +872,26 @@ struct View {
     timed: Rc<VecModel<TimedItem>>,
     /// Details of every instance now on screen, by the index its block or bar carries.
     details: RefCell<Vec<EventDetail>>,
+    /// Which stored event each of those instances is, for acting on it.
+    targets: RefCell<Vec<Target>>,
+    /// The new event being typed in, if its card is open.
+    draft: RefCell<Option<Draft>>,
+    /// The event deleted last, while its deletion can still be undone.
+    undo: RefCell<Option<Undo>>,
+    /// A change to a repeating event while the window asks how much of the series it is
+    /// meant for.
+    asked: RefCell<Option<Asked>>,
+    /// Changes the worker has not answered yet, oldest first.
+    pending: RefCell<VecDeque<Pending>>,
+    /// Counts the redraws from the cache. The window notes it when a drag starts and
+    /// drops the drag if it has changed by the end: the dragged block may by then stand
+    /// for another event.
+    generation: Cell<i32>,
+    /// The event the editor is open for.
+    editing: RefCell<Option<Editing>>,
+    /// Hides the message about the last change after a while.
+    toast_timer: Timer,
+    commands: UnboundedSender<Command>,
     all_day: Rc<VecModel<AllDayItem>>,
     month_cells: Rc<VecModel<MonthCell>>,
     month_chips: Rc<VecModel<MonthChip>>,
@@ -438,6 +1050,15 @@ impl View {
             MonthLayout::default()
         };
 
+        let movable = |index: usize| {
+            let instance = &instances[index];
+            can_move(instance.event, &calendars[instance.key].entry)
+        };
+        // An event drawn as several blocks (it crosses midnight) is not resized by one.
+        let mut blocks: HashMap<usize, u32> = HashMap::new();
+        for block in &layout.timed {
+            *blocks.entry(block.index).or_default() += 1;
+        }
         let title = |index: usize| -> SharedString {
             instances[index]
                 .event
@@ -509,6 +1130,8 @@ impl View {
                         end_min: block.end_min,
                         col: block.col,
                         cols: block.cols,
+                        movable: movable(block.index),
+                        resizable: movable(block.index) && blocks[&block.index] == 1,
                         color,
                         text_color: text_color_on(color),
                     }
@@ -528,6 +1151,7 @@ impl View {
                         first_day: bar.first_day,
                         last_day: bar.last_day,
                         row: bar.row,
+                        movable: movable(bar.index),
                         color,
                         text_color: text_color_on(color),
                     }
@@ -605,12 +1229,46 @@ impl View {
                     account: email.into(),
                     color: color(index),
                     link: web_link(event, email).into(),
+                    // Anything in a calendar this account may write to. Should Google
+                    // refuse a particular entry, it says why.
+                    can_delete: calendar.entry.is_writable(),
+                    can_edit: can_move(event, &calendar.entry),
+                    repeating: event.is_recurring_master() || event.recurring_event_id.is_some(),
+                    notify_guests: event.has_guests_to_notify(),
                 }
             })
             .collect();
         self.details.replace(details);
-        // What it described may have moved or gone.
+        let targets = instances
+            .iter()
+            .map(|instance| {
+                let calendar = &calendars[instance.key];
+                Target {
+                    account: calendar.account_id,
+                    calendar_id: calendar.entry.id.clone(),
+                    event_id: instance.event.id.clone(),
+                    etag: instance.event.etag.clone(),
+                    occurrence: occurrence_of(instance.event, instance.start),
+                    movable: can_move(instance.event, &calendar.entry),
+                    start: instance.start,
+                    end: instance.end,
+                }
+            })
+            .collect();
+        self.targets.replace(targets);
+        self.generation.set(self.generation.get().wrapping_add(1));
+        ui.set_generation(self.generation.get());
+        // What they described may have moved or gone. The question about a change from
+        // the editor stays: that change carries its event with it.
         ui.set_detail_visible(false);
+        if !matches!(*self.asked.borrow(), Some(Asked::Form(_))) {
+            ui.set_delete_ask_visible(false);
+        }
+        // A drag refers to an instance on screen, which may now be another one. An
+        // edit from the editor carries its event with it and stays.
+        if matches!(*self.asked.borrow(), Some(Asked::Drag(_))) {
+            self.asked.take();
+        }
         Ok(())
     }
 
@@ -701,6 +1359,637 @@ impl View {
         self.show(self.span.get().step(self.anchor.get(), direction));
     }
 
+    /// Deletes the event behind an instance on screen. The copy kept for undoing is taken
+    /// from the cache before anything is sent.
+    fn delete_event(&self, instance: usize, scope: Scope, notify: bool) {
+        let Some(target) = self.targets.borrow().get(instance).cloned() else {
+            return;
+        };
+        let cached = |id: &str| {
+            self.store
+                .event_json(target.account, &target.calendar_id, id)
+        };
+        let resources = cached(&target.event_id).and_then(|own| {
+            let series = match &target.occurrence {
+                Some(occurrence) => cached(&occurrence.series_id)?,
+                None => None,
+            };
+            Ok((own, series))
+        });
+        let (own, series) = match resources {
+            Ok(resources) => resources,
+            Err(error) => return self.show_error(&error.into()),
+        };
+        // Nothing to send if it is gone from the cache: a sync has removed it meanwhile.
+        let Some((deletion, kind)) = plan_deletion(&target, scope, own, series) else {
+            return;
+        };
+        // A whole series is brought back from its own resource, which does not hold
+        // what was changed or deleted in single occurrences. With such occurrences the
+        // undo would bring back another schedule than the one deleted; none is offered.
+        let incomplete = matches!(kind, UndoKind::Recreate(_))
+            && target.occurrence.as_ref().is_some_and(|occurrence| {
+                self.store
+                    .has_occurrences(target.account, &target.calendar_id, &occurrence.series_id)
+                    .unwrap_or(true)
+            });
+        self.pending.borrow_mut().push_back(Pending {
+            undo: (!incomplete).then(|| Undo {
+                account: target.account,
+                calendar_id: target.calendar_id.clone(),
+                kind,
+                etag: None,
+            }),
+            retry: None,
+        });
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_detail_visible(false);
+            ui.set_delete_ask_visible(false);
+            ui.set_toast(SharedString::new());
+        }
+        let _ = self.commands.send(Command::DeleteEvent {
+            account: target.account,
+            calendar_id: target.calendar_id,
+            deletion,
+            notify,
+        });
+    }
+
+    /// An event was dragged. A repeating one first asks how much of the series is meant.
+    fn drag_event(&self, drag: Drag) {
+        let Some(target) = self.targets.borrow().get(drag.instance).cloned() else {
+            return;
+        };
+        if !target.movable {
+            return;
+        }
+        if target.occurrence.is_some() {
+            self.asked.replace(Some(Asked::Drag(drag)));
+            if let Some(ui) = self.ui.upgrade() {
+                ui.invoke_ask_edit_scope();
+            }
+        } else {
+            self.send_drag(drag, Scope::This);
+        }
+    }
+
+    /// Sends a drag to Google. The undo is prepared from the cache before anything is
+    /// sent.
+    fn send_drag(&self, drag: Drag, scope: Scope) {
+        let Some(target) = self.targets.borrow().get(drag.instance).cloned() else {
+            return;
+        };
+        let cached = |id: &str| {
+            self.store
+                .event_json(target.account, &target.calendar_id, id)
+        };
+        let resources = cached(&target.event_id).and_then(|own| {
+            let series = match &target.occurrence {
+                Some(occurrence) => cached(&occurrence.series_id)?,
+                None => None,
+            };
+            Ok((own, series))
+        });
+        let (own, series) = match resources {
+            Ok(resources) => resources,
+            Err(error) => return self.show_error(&error.into()),
+        };
+        let Some((edit, undo)) = plan_drag(&target, scope, drag, own, series, self.zone) else {
+            return;
+        };
+        self.send_edit(&target, edit, undo);
+        if scope == Scope::This {
+            self.draw_drag(drag);
+        }
+    }
+
+    /// Sends a change to Google and remembers how to take it back.
+    fn send_edit(&self, target: &Target, edit: Edit, undo: Option<UndoKind>) {
+        self.pending.borrow_mut().push_back(Pending {
+            undo: undo.map(|kind| Undo {
+                account: target.account,
+                calendar_id: target.calendar_id.clone(),
+                kind,
+                etag: None,
+            }),
+            retry: None,
+        });
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_toast(SharedString::new());
+        }
+        let _ = self.commands.send(Command::EditEvent {
+            account: target.account,
+            calendar_id: target.calendar_id.clone(),
+            edit,
+        });
+    }
+
+    /// The cached resources of an event and of the series it belongs to, if any.
+    fn resources(
+        &self,
+        target: &Target,
+    ) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>)> {
+        let cached = |id: &str| {
+            self.store
+                .event_json(target.account, &target.calendar_id, id)
+        };
+        let own = cached(&target.event_id)?;
+        let series = match &target.occurrence {
+            Some(occurrence) => cached(&occurrence.series_id)?,
+            None => None,
+        };
+        Ok((own, series))
+    }
+
+    /// Opens the editor for the event behind an instance on screen.
+    fn open_editor(&self, instance: usize) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let Some(target) = self.targets.borrow().get(instance).cloned() else {
+            return;
+        };
+        if !target.movable {
+            return;
+        }
+        let (own, series) = match self.resources(&target) {
+            Ok(resources) => resources,
+            Err(error) => return self.show_error(&error),
+        };
+        // An unchanged occurrence is described by its series.
+        let changed = target.occurrence.as_ref().is_none_or(|o| o.changed);
+        let Some(resource) = (if changed { own.clone() } else { series.clone() }) else {
+            return;
+        };
+        let (mut form, mut kept) = editor::form_of(&resource, target.start, target.end, self.zone);
+        if let (true, Some(series)) = (target.occurrence.is_some() && changed, &series) {
+            editor::adopt_series_rule(&mut form, &mut kept, series, self.zone);
+        }
+        let detail = self.details.borrow().get(instance).cloned();
+        let calendar_color = {
+            let loaded = self.loaded.borrow();
+            loaded
+                .calendars
+                .iter()
+                .find(|c| c.account_id == target.account && c.entry.id == target.calendar_id)
+                .and_then(|c| c.entry.background_color.as_deref().and_then(parse_color))
+                .unwrap_or(FALLBACK_COLOR)
+        };
+        ui.set_editor_new(false);
+        ui.set_editor_calendar_name(detail.map(|d| d.calendar).unwrap_or_default());
+        self.show_editor(&ui, form, kept, Some(target), calendar_color);
+        if let Some(editing) = self.editing.borrow_mut().as_mut() {
+            editing.own = own;
+            editing.series = series;
+        }
+    }
+
+    /// Opens the editor for the new event of the quick card, with what was typed there.
+    fn open_editor_for_draft(&self, title: &str, calendar: usize) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let Some((start, end)) = self.draft.borrow().as_ref().map(|d| (d.start, d.end)) else {
+            return;
+        };
+        let mut form = editor::new_form(start, end, self.zone);
+        form.title = title.to_owned();
+        let color = ui
+            .get_draft_calendars()
+            .row_data(calendar)
+            .map_or(FALLBACK_COLOR, |c| c.color);
+        ui.set_editor_new(true);
+        ui.set_draft_calendar(calendar as i32);
+        ui.set_draft_visible(false);
+        self.show_editor(&ui, form, Kept::default(), None, color);
+    }
+
+    fn show_editor(
+        &self,
+        ui: &AppWindow,
+        form: Form,
+        kept: Kept,
+        target: Option<Target>,
+        calendar_color: Color,
+    ) {
+        let colors: Vec<Color> = std::iter::once(calendar_color)
+            .chain(EVENT_COLORS.iter().map(|(_, value)| rgb(*value)))
+            .collect();
+        ui.set_editor_colors(ModelRc::from(Rc::new(VecModel::from(colors))));
+        ui.set_editor_custom_repeat(form.repeat == editor::REPEAT_CUSTOM);
+        ui.set_editor_custom_reminder(form.reminder == editor::REMINDER_CUSTOM);
+        ui.set_editor_error(SharedString::new());
+        ui.set_editor(to_window(&form));
+        self.editing.replace(Some(Editing {
+            target,
+            opened: form,
+            kept,
+            own: None,
+            series: None,
+        }));
+        ui.set_detail_visible(false);
+        ui.set_editor_visible(true);
+    }
+
+    /// "Save" in the editor: checks the form and sends what changed. For a repeating
+    /// event it first asks how much of the series is meant.
+    fn save_editor(&self, form: Form, calendar: usize) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let Some(editing) = self.editing.borrow().clone() else {
+            return;
+        };
+        let after = match editor::fields(&form, &editing.kept, self.zone) {
+            Ok(after) => after,
+            Err(problem) => return ui.set_editor_error(problem.into()),
+        };
+        let Some(target) = editing.target.clone() else {
+            // A new event.
+            let Some((account, calendar_id, key)) = self
+                .draft
+                .borrow()
+                .as_ref()
+                .and_then(|draft| draft.calendars.get(calendar).cloned())
+            else {
+                return;
+            };
+            let _ = self.store.set_setting(NEW_EVENT_CALENDAR, &key);
+            let Some(draft) = self.draft.take() else {
+                return;
+            };
+            self.creating(account, &calendar_id, form, calendar, draft);
+            let _ = self.commands.send(Command::CreateEvent {
+                account,
+                calendar_id,
+                resource: editor::creation(after),
+            });
+            return self.close_editor(&ui);
+        };
+        let before = match editor::fields(&editing.opened, &editing.kept, self.zone) {
+            Ok(before) => before,
+            Err(problem) => return ui.set_editor_error(problem.into()),
+        };
+        let changes = editor::diff(&before, &after);
+        self.close_editor(&ui);
+        if changes.as_object().is_none_or(|changes| changes.is_empty()) {
+            return;
+        }
+        let saved = Saved {
+            target,
+            form,
+            opened: editing.opened,
+            kept: editing.kept,
+            changes,
+            before,
+            after,
+            own: editing.own,
+            series: editing.series,
+        };
+        if saved.target.occurrence.is_some() {
+            self.asked.replace(Some(Asked::Form(Box::new(saved))));
+            ui.invoke_ask_edit_scope();
+        } else {
+            self.send_form(saved, Scope::This);
+        }
+    }
+
+    fn close_editor(&self, ui: &AppWindow) {
+        self.editing.take();
+        ui.set_editor_visible(false);
+    }
+
+    /// Sends what the editor changed, for as much of a series as was chosen.
+    fn send_form(&self, saved: Saved, scope: Scope) {
+        match plan_form(
+            &saved,
+            scope,
+            saved.own.clone(),
+            saved.series.clone(),
+            self.zone,
+        ) {
+            Ok(Some((edit, undo))) => self.send_edit(&saved.target, edit, undo),
+            Ok(None) => {}
+            Err(problem) => {
+                if let Some(ui) = self.ui.upgrade() {
+                    ui.set_notice(problem.into());
+                }
+            }
+        }
+    }
+
+    /// Draws a dragged event at its new place at once, where that is simple, rather than
+    /// letting it jump back until Google has answered.
+    fn draw_drag(&self, drag: Drag) {
+        let instance = drag.instance as i32;
+        let (days, minutes) = (drag.days as i32, drag.minutes as i32);
+        let shown_days = self.range().1 as i32;
+        let on_screen = |day: i32| (0..shown_days).contains(&day);
+        let blocks: Vec<usize> = (0..self.timed.row_count())
+            .filter(|row| {
+                self.timed
+                    .row_data(*row)
+                    .is_some_and(|b| b.instance == instance)
+            })
+            .collect();
+        if let [row] = blocks[..]
+            && let Some(mut block) = self.timed.row_data(row)
+        {
+            let start = if drag.resize {
+                block.start_min
+            } else {
+                block.start_min + minutes
+            };
+            let end = (block.end_min + minutes).max(start + 15);
+            if start >= 0 && end <= 24 * 60 && on_screen(block.day + days) {
+                block.day += days;
+                block.start_min = start;
+                block.end_min = end;
+                self.timed.set_row_data(row, block);
+            }
+        }
+        for row in 0..self.all_day.row_count() {
+            if let Some(mut bar) = self.all_day.row_data(row)
+                && bar.instance == instance
+                && on_screen(bar.first_day + days)
+                && on_screen(bar.last_day + days)
+            {
+                bar.first_day += days;
+                bar.last_day += days;
+                self.all_day.set_row_data(row, bar);
+            }
+        }
+    }
+
+    /// Notes a new event as sent: how to take it back once it exists, and what to show
+    /// again should it not come into being.
+    fn creating(
+        &self,
+        account: AccountId,
+        calendar_id: &str,
+        form: Form,
+        calendar: usize,
+        draft: Draft,
+    ) {
+        self.pending.borrow_mut().push_back(Pending {
+            undo: Some(Undo {
+                account,
+                calendar_id: calendar_id.to_owned(),
+                // Which event, the worker says when it has created it.
+                kind: UndoKind::Delete(String::new()),
+                etag: None,
+            }),
+            retry: Some(Retry {
+                form,
+                calendar,
+                draft,
+            }),
+        });
+    }
+
+    /// The worker has answered the oldest change still waiting. Makes its undo the one
+    /// on offer, completed with the event `id` and version `etag` the worker names,
+    /// and says whether there is one; hands back what a failed creation was made from.
+    fn answered(&self, ok: bool, id: &str, etag: &str) -> (bool, Option<Retry>) {
+        let Some(Pending { undo, retry }) = self.pending.borrow_mut().pop_front() else {
+            return (false, None);
+        };
+        if !ok {
+            return (false, retry);
+        }
+        let undo = undo.and_then(|mut undo| {
+            undo.etag = (!etag.is_empty()).then(|| etag.to_owned());
+            undo.kind = match undo.kind {
+                // These wait to learn which event it is; without that, no undo.
+                UndoKind::Occurrence(_) | UndoKind::Delete(_) if id.is_empty() => return None,
+                UndoKind::Occurrence(changes) => UndoKind::Patch {
+                    event_id: id.to_owned(),
+                    changes,
+                },
+                UndoKind::Delete(_) => UndoKind::Delete(id.to_owned()),
+                complete => complete,
+            };
+            Some(undo)
+        });
+        let can_undo = undo.is_some();
+        self.undo.replace(undo);
+        (can_undo, None)
+    }
+
+    /// The worker has answered the creation of an event: say so and offer to take it
+    /// back, or give back what was typed.
+    fn event_created(&self, created: bool, id: &str, etag: &str) {
+        let (can_undo, retry) = self.answered(created, id, etag);
+        if created {
+            return self.show_toast("Event saved", can_undo);
+        }
+        // A dialog says why. The editor comes back with everything that was entered.
+        let (Some(retry), Some(ui)) = (retry, self.ui.upgrade()) else {
+            return;
+        };
+        let color = ui
+            .get_draft_calendars()
+            .row_data(retry.calendar)
+            .map_or(FALLBACK_COLOR, |c| c.color);
+        self.draft.replace(Some(retry.draft));
+        ui.set_editor_new(true);
+        ui.set_draft_calendar(retry.calendar as i32);
+        self.show_editor(&ui, retry.form, Kept::default(), None, color);
+    }
+
+    /// The worker has answered a change. `occurrence` is the event it was made to, if
+    /// that was one occurrence of a series, and `etag` the version the event now has.
+    fn change_finished(&self, changed: bool, occurrence: &str, etag: &str) {
+        let (can_undo, _) = self.answered(changed, occurrence, etag);
+        if changed {
+            self.show_toast("Event saved", can_undo);
+        } else {
+            // A dialog says why. Put the event back where it is.
+            self.refresh();
+        }
+    }
+
+    /// The worker has answered a deletion: offer to undo it, for a while. `occurrence`
+    /// is the event that was removed, if it was one occurrence of a series.
+    fn delete_finished(&self, deleted: bool, occurrence: &str) {
+        let (can_undo, _) = self.answered(deleted, occurrence, "");
+        if deleted {
+            self.show_toast("Event deleted", can_undo);
+        }
+    }
+
+    /// Says what just happened, for a while; with "Undo" if it can be taken back.
+    fn show_toast(&self, text: &str, undo: bool) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        ui.set_toast(text.into());
+        ui.set_toast_undo(undo);
+        let ui = self.ui.clone();
+        self.toast_timer
+            .start(TimerMode::SingleShot, UNDO_PERIOD, move || {
+                if let Some(ui) = ui.upgrade() {
+                    ui.set_toast(SharedString::new());
+                }
+            });
+    }
+
+    /// Opens the card for a new event. `day` counts from the first day shown; a negative
+    /// one means "about now" (the `c` key).
+    fn open_draft(&self, day: i32, minute: i32, all_day: bool, length: i32) {
+        let length = if length > 0 { length } else { 60 };
+        let Some(ui) = self.ui.upgrade() else { return };
+        let (first, days) = self.range();
+        let has_columns = !matches!(self.span.get(), Span::Month | Span::Schedule);
+        let (day, minute) = if day < 0 {
+            // The next half hour, today if today is on screen.
+            let now = Utc::now().with_timezone(&self.zone);
+            let offset = (now.date_naive() - first).num_days();
+            let offset = if (0..days).contains(&offset) {
+                offset
+            } else {
+                0
+            };
+            let minute = ((now.hour() * 60 + now.minute()) / 30 + 1) * 30;
+            (offset, (minute as i32).min(23 * 60))
+        } else {
+            (i64::from(day), minute)
+        };
+        let (start, end) = draft_times(
+            first + Duration::days(day),
+            minute,
+            all_day,
+            length,
+            self.zone,
+        );
+
+        let loaded = self.loaded.borrow();
+        let emails: HashMap<AccountId, &str> = loaded
+            .accounts
+            .iter()
+            .map(|a| (a.id, a.email.as_str()))
+            .collect();
+        let writable: Vec<&StoredCalendar> = loaded
+            .calendars
+            .iter()
+            .filter(|c| c.entry.is_writable())
+            .collect();
+        if writable.is_empty() {
+            return self.show_error(&anyhow::anyhow!(
+                "there is no calendar this app may add events to"
+            ));
+        }
+        // The calendar the previous event was created in, else the first account's own.
+        let remembered = self.store.setting(NEW_EVENT_CALENDAR).ok().flatten();
+        let key = |c: &StoredCalendar| {
+            let email = emails.get(&c.account_id).copied().unwrap_or("");
+            format!("{email}\t{}", c.entry.id)
+        };
+        let chosen = writable
+            .iter()
+            .position(|c| Some(key(c)) == remembered)
+            .or_else(|| writable.iter().position(|c| c.entry.primary))
+            .unwrap_or(0);
+
+        let rows: Vec<DraftCalendar> = writable
+            .iter()
+            .map(|c| DraftCalendar {
+                name: c.entry.display_name().into(),
+                account: emails.get(&c.account_id).copied().unwrap_or("").into(),
+                color: c
+                    .entry
+                    .background_color
+                    .as_deref()
+                    .and_then(parse_color)
+                    .unwrap_or(FALLBACK_COLOR),
+            })
+            .collect();
+        self.draft.replace(Some(Draft {
+            start,
+            end,
+            calendars: writable
+                .iter()
+                .map(|c| (c.account_id, c.entry.id.clone(), key(c)))
+                .collect(),
+        }));
+        let names: Vec<SharedString> = rows
+            .iter()
+            .map(|row| {
+                if row.name == row.account {
+                    row.name.clone()
+                } else {
+                    format!("{} · {}", row.name, row.account).into()
+                }
+            })
+            .collect();
+        ui.set_editor_calendars(ModelRc::from(Rc::new(VecModel::from(names))));
+        ui.set_draft_calendars(ModelRc::from(Rc::new(VecModel::from(rows))));
+        ui.set_draft_calendar(chosen as i32);
+        ui.set_draft_when(when_text(start, end, self.zone).into());
+        // A ghost of the new event where it will go, in the views that have columns.
+        let ghost = has_columns && !all_day;
+        ui.set_draft_day(if ghost { day as i32 } else { -1 });
+        ui.set_draft_min(minute);
+        ui.set_draft_len(length);
+        if ghost {
+            // "About now" may be below the hours on screen.
+            ui.invoke_reveal_minute(minute);
+        }
+        ui.set_detail_visible(false);
+        ui.set_draft_visible(true);
+    }
+
+    /// Creates the event the open card describes.
+    fn save_draft(&self, title: &str, calendar: usize) {
+        let Some(draft) = self.draft.take() else {
+            return;
+        };
+        let Some((account, calendar_id, key)) = draft.calendars.get(calendar).cloned() else {
+            return;
+        };
+        // Remembered for the next new event; failing to remember is no reason not to save.
+        let _ = self.store.set_setting(NEW_EVENT_CALENDAR, &key);
+        let resource = event_resource(title, draft.start, draft.end, self.zone);
+        let mut form = editor::new_form(draft.start, draft.end, self.zone);
+        form.title = title.to_owned();
+        self.creating(account, &calendar_id, form, calendar, draft);
+        let _ = self.commands.send(Command::CreateEvent {
+            account,
+            calendar_id,
+            resource,
+        });
+    }
+
+    /// Brings back the event deleted last.
+    fn undo_delete(&self) {
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_toast(SharedString::new());
+        }
+        let Some(Undo {
+            account,
+            calendar_id,
+            kind,
+            etag,
+        }) = self.undo.take()
+        else {
+            return;
+        };
+        let _ = self.commands.send(match kind {
+            UndoKind::Recreate(resource) => Command::RestoreEvent {
+                account,
+                calendar_id,
+                resource,
+            },
+            UndoKind::Delete(event_id) => Command::DeleteEvent {
+                account,
+                calendar_id,
+                deletion: Deletion::Event { event_id, etag },
+                notify: false,
+            },
+            UndoKind::Patch { event_id, changes } => Command::PatchEvent {
+                account,
+                calendar_id,
+                event_id,
+                etag,
+                changes,
+            },
+            // The worker has not said which occurrence it was.
+            UndoKind::Occurrence(_) => return,
+        });
+    }
+
     /// Opens the day view on the day of a cell of the month grid.
     fn open_day(&self, cell: i64) {
         let day = self.range().0 + Duration::days(cell);
@@ -712,6 +2001,7 @@ impl View {
 pub fn run() -> Result<()> {
     let ui = AppWindow::new()?;
     let zone = local_zone();
+    let commands = worker::spawn(ui.as_weak());
     let view = Rc::new(View {
         ui: ui.as_weak(),
         store: open_store()?,
@@ -725,6 +2015,15 @@ pub fn run() -> Result<()> {
         days: Rc::default(),
         timed: Rc::default(),
         details: RefCell::default(),
+        targets: RefCell::default(),
+        draft: RefCell::default(),
+        undo: RefCell::default(),
+        asked: RefCell::default(),
+        editing: RefCell::default(),
+        pending: RefCell::default(),
+        generation: Cell::new(0),
+        toast_timer: Timer::default(),
+        commands: commands.clone(),
         all_day: Rc::default(),
         month_cells: Rc::default(),
         month_chips: Rc::default(),
@@ -749,8 +2048,125 @@ pub fn run() -> Result<()> {
             .collect::<Vec<_>>(),
     ))));
 
-    let commands = worker::spawn(ui.as_weak());
-
+    let theme = view.store.setting(THEME).ok().flatten();
+    ui.set_theme_mode(theme.and_then(|mode| mode.parse().ok()).unwrap_or(0));
+    if let Some(height) = view
+        .store
+        .setting(HOUR_HEIGHT)
+        .ok()
+        .flatten()
+        .and_then(|height| height.parse::<f32>().ok())
+    {
+        // The window keeps its own limits; this only guards against nonsense.
+        ui.set_hour_h(height.clamp(20.0, 192.0));
+    }
+    // Zooming changes the height many times a second; it is saved once it rests.
+    let zoom_timer = Timer::default();
+    ui.on_zoom_changed({
+        let view = view.clone();
+        move |height| {
+            let view = view.clone();
+            zoom_timer.start(
+                TimerMode::SingleShot,
+                StdDuration::from_millis(500),
+                move || {
+                    let _ = view.store.set_setting(HOUR_HEIGHT, &height.to_string());
+                },
+            );
+        }
+    });
+    ui.on_theme_chosen({
+        let view = view.clone();
+        move |mode| {
+            if let Err(error) = view.store.set_setting(THEME, &mode.to_string()) {
+                view.show_error(&error.into());
+            }
+        }
+    });
+    ui.on_delete_event({
+        let view = view.clone();
+        move |instance, scope, notify| {
+            let scope = match scope {
+                1 => Scope::Following,
+                2 => Scope::All,
+                _ => Scope::This,
+            };
+            view.delete_event(instance as usize, scope, notify);
+        }
+    });
+    ui.on_event_moved({
+        let view = view.clone();
+        move |instance, days, minutes| {
+            view.drag_event(Drag {
+                instance: instance as usize,
+                days: days.into(),
+                minutes: minutes.into(),
+                resize: false,
+            })
+        }
+    });
+    ui.on_event_resized({
+        let view = view.clone();
+        move |instance, minutes| {
+            view.drag_event(Drag {
+                instance: instance as usize,
+                days: 0,
+                minutes: minutes.into(),
+                resize: true,
+            })
+        }
+    });
+    ui.on_change_finished({
+        let view = view.clone();
+        move |changed, occurrence, etag| view.change_finished(changed, &occurrence, &etag)
+    });
+    ui.on_editor_requested({
+        let view = view.clone();
+        move |instance| view.open_editor(instance as usize)
+    });
+    ui.on_editor_from_draft({
+        let view = view.clone();
+        move |title, calendar| view.open_editor_for_draft(&title, calendar as usize)
+    });
+    ui.on_editor_save({
+        let view = view.clone();
+        move |form, calendar| view.save_editor(from_window(&form), calendar as usize)
+    });
+    ui.on_edit_scope_chosen({
+        let view = view.clone();
+        move |scope| {
+            let scope = match scope {
+                1 => Scope::Following,
+                2 => Scope::All,
+                _ => Scope::This,
+            };
+            match view.asked.take() {
+                Some(Asked::Drag(drag)) => view.send_drag(drag, scope),
+                Some(Asked::Form(saved)) => view.send_form(*saved, scope),
+                None => {}
+            }
+        }
+    });
+    ui.on_delete_finished({
+        let view = view.clone();
+        move |deleted, occurrence| view.delete_finished(deleted, &occurrence)
+    });
+    ui.on_draft_requested({
+        let view = view.clone();
+        move |day, minute, all_day, length| view.open_draft(day, minute, all_day, length)
+    });
+    ui.on_draft_save({
+        let view = view.clone();
+        move |title, calendar| view.save_draft(&title, calendar as usize)
+    });
+    ui.on_event_created({
+        let view = view.clone();
+        move |created, id, etag| view.event_created(created, &id, &etag)
+    });
+    ui.on_undo({
+        let view = view.clone();
+        move || view.undo_delete()
+    });
     ui.on_go_today({
         let view = view.clone();
         move || view.show(view.today())
@@ -847,6 +2263,18 @@ pub fn run() -> Result<()> {
                 view.refresh();
             } else if let Some(ui) = view.ui.upgrade() {
                 view.update_now(&ui);
+            }
+        }
+    });
+
+    // Without a connection, look for one more often than the usual sync does.
+    let retry_timer = Timer::default();
+    retry_timer.start(TimerMode::Repeated, OFFLINE_RETRY, {
+        let commands = commands.clone();
+        let ui = ui.as_weak();
+        move || {
+            if ui.upgrade().is_some_and(|ui| ui.get_offline()) {
+                let _ = commands.send(Command::SyncAll);
             }
         }
     });
@@ -985,6 +2413,417 @@ mod tests {
             "https://www.google.com/calendar/event?eid=abc&authuser=me@example.com"
         );
         assert_eq!(web_link(&Event::default(), "me@example.com"), "");
+    }
+
+    #[test]
+    fn only_calendars_this_account_may_write_to_allow_deleting() {
+        let calendar = |role: &str| -> CalendarListEntry {
+            serde_json::from_value(serde_json::json!({"id": "c", "accessRole": role})).unwrap()
+        };
+        assert!(calendar("owner").is_writable());
+        assert!(calendar("writer").is_writable());
+        assert!(!calendar("reader").is_writable());
+        assert!(!calendar("freeBusyReader").is_writable());
+    }
+
+    #[test]
+    fn events_without_guests_in_writable_calendars_can_be_dragged() {
+        let calendar = |role: &str| -> CalendarListEntry {
+            serde_json::from_value(serde_json::json!({"id": "c", "accessRole": role})).unwrap()
+        };
+        let event = |extra: serde_json::Value| -> Event {
+            let mut value = serde_json::json!({"id": "e"});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(value).unwrap()
+        };
+        let owner = calendar("owner");
+        assert!(can_move(&event(serde_json::json!({})), &owner));
+        assert!(can_move(
+            &event(serde_json::json!({"eventType": "default"})),
+            &owner
+        ));
+        assert!(!can_move(
+            &event(serde_json::json!({})),
+            &calendar("reader")
+        ));
+        for repeating in [
+            serde_json::json!({"recurrence": ["RRULE:FREQ=DAILY"]}),
+            serde_json::json!({"recurringEventId": "m"}),
+        ] {
+            assert!(can_move(&event(repeating), &owner));
+        }
+        for other in [
+            serde_json::json!({"attendees": [{"email": "a@example.com"}]}),
+            serde_json::json!({"eventType": "birthday"}),
+        ] {
+            assert!(!can_move(&event(other), &owner));
+        }
+    }
+
+    #[test]
+    fn a_dragged_event_keeps_its_length_and_its_time_of_day() {
+        let zone: Tz = "Europe/Prague".parse().unwrap();
+        let instant = |text: &str| text.parse::<DateTime<Utc>>().unwrap();
+        let timed = |text: &str| EventTime::Timed(instant(text));
+        // A day later and half an hour down.
+        assert_eq!(
+            moved_times(
+                timed("2026-11-16T09:00:00Z"),
+                timed("2026-11-16T10:00:00Z"),
+                1,
+                30,
+                zone
+            ),
+            (timed("2026-11-17T09:30:00Z"), timed("2026-11-17T10:30:00Z"))
+        );
+        // Across the end of summer time (25 October 2026): still 10:00 on the clock.
+        assert_eq!(
+            moved_times(
+                timed("2026-10-24T08:00:00Z"),
+                timed("2026-10-24T09:00:00Z"),
+                1,
+                0,
+                zone
+            ),
+            (timed("2026-10-25T09:00:00Z"), timed("2026-10-25T10:00:00Z"))
+        );
+        // All-day events move by days only.
+        let day = |d: u32| EventTime::AllDay(NaiveDate::from_ymd_opt(2026, 11, d).unwrap());
+        assert_eq!(
+            moved_times(day(16), day(18), -2, 45, zone),
+            (day(14), day(16))
+        );
+
+        // The lower edge: down, up, and never above a quarter of an hour.
+        let (start, end) = (timed("2026-11-16T09:00:00Z"), timed("2026-11-16T10:00:00Z"));
+        assert_eq!(
+            resized_end(start, end, 30, zone),
+            Some(timed("2026-11-16T10:30:00Z"))
+        );
+        assert_eq!(
+            resized_end(start, end, -30, zone),
+            Some(timed("2026-11-16T09:30:00Z"))
+        );
+        assert_eq!(
+            resized_end(start, end, -120, zone),
+            Some(timed("2026-11-16T09:15:00Z"))
+        );
+        assert_eq!(resized_end(day(16), day(17), 30, zone), None);
+    }
+
+    #[test]
+    fn a_drag_of_a_repeating_event_is_planned_for_each_scope() {
+        use serde_json::json;
+        let zone: Tz = "UTC".parse().unwrap();
+        let instant = |text: &str| EventTime::Timed(text.parse::<DateTime<Utc>>().unwrap());
+        let series = json!({
+            "id": "m", "etag": "\"s\"", "summary": "Standup",
+            "start": {"dateTime": "2026-11-16T10:00:00Z", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-11-16T11:00:00Z", "timeZone": "UTC"},
+            "recurrence": ["RRULE:FREQ=WEEKLY;COUNT=5;BYDAY=MO,WE"]
+        });
+        // The third occurrence: Monday 23 November (16th, 18th, 23rd, ...).
+        let target = Target {
+            account: 1,
+            calendar_id: "c".into(),
+            event_id: "m".into(),
+            etag: Some("\"s\"".into()),
+            occurrence: Some(Occurrence {
+                series_id: "m".into(),
+                original_start: instant("2026-11-23T10:00:00Z"),
+                changed: false,
+            }),
+            movable: true,
+            start: instant("2026-11-23T10:00:00Z"),
+            end: instant("2026-11-23T11:00:00Z"),
+        };
+        // A day later and half an hour down.
+        let drag = Drag {
+            instance: 0,
+            days: 1,
+            minutes: 30,
+            resize: false,
+        };
+        let plan =
+            |scope| plan_drag(&target, scope, drag, None, Some(series.clone()), zone).unwrap();
+        let moved = json!({
+            "start": {"dateTime": "2026-11-24T10:30:00Z", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-11-24T11:30:00Z", "timeZone": "UTC"}
+        });
+        let was = json!({
+            "start": {"dateTime": "2026-11-23T10:00:00Z", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-11-23T11:00:00Z", "timeZone": "UTC"}
+        });
+
+        assert_eq!(
+            plan(Scope::This),
+            (
+                Edit::Occurrence {
+                    series_id: "m".into(),
+                    original_start: instant("2026-11-23T10:00:00Z"),
+                    known_id: None,
+                    etag: None,
+                    changes: moved.clone(),
+                },
+                Some(UndoKind::Occurrence(was)),
+            )
+        );
+
+        // All: the series' own start moves by as much, and its weekdays with it.
+        assert_eq!(
+            plan(Scope::All),
+            (
+                Edit::Event {
+                    event_id: "m".into(),
+                    etag: Some("\"s\"".into()),
+                    changes: json!({
+                        "start": {"dateTime": "2026-11-17T10:30:00Z", "timeZone": "UTC"},
+                        "end": {"dateTime": "2026-11-17T11:30:00Z", "timeZone": "UTC"},
+                        "recurrence": ["RRULE:FREQ=WEEKLY;COUNT=5;BYDAY=TU,TH"]
+                    }),
+                },
+                Some(UndoKind::Patch {
+                    event_id: "m".into(),
+                    changes: json!({
+                        "start": series["start"], "end": series["end"],
+                        "recurrence": series["recurrence"]
+                    }),
+                }),
+            )
+        );
+
+        // Following: the old series ends before the occurrence; a copy goes on from
+        // its new time with the three occurrences that were left.
+        let (edit, undo) = plan(Scope::Following);
+        assert_eq!(undo, None);
+        let Edit::Following {
+            series_id,
+            etag,
+            recurrence,
+            resource,
+            ..
+        } = edit
+        else {
+            panic!("not a split");
+        };
+        assert_eq!((series_id.as_str(), etag.as_deref()), ("m", Some("\"s\"")));
+        assert_eq!(
+            recurrence,
+            ["RRULE:FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20261123T095959Z"]
+        );
+        assert_eq!(resource["summary"], "Standup");
+        assert_eq!(resource["start"], moved["start"]);
+        assert_eq!(resource["end"], moved["end"]);
+        assert_eq!(
+            resource["recurrence"],
+            json!(["RRULE:FREQ=WEEKLY;COUNT=3;BYDAY=TU,TH"])
+        );
+
+        // Resizing one occurrence only moves its end.
+        let grow = Drag {
+            instance: 0,
+            days: 0,
+            minutes: 45,
+            resize: true,
+        };
+        let (edit, _) =
+            plan_drag(&target, Scope::This, grow, None, Some(series.clone()), zone).unwrap();
+        let Edit::Occurrence { changes, .. } = edit else {
+            panic!("not an occurrence")
+        };
+        assert_eq!(changes["start"]["dateTime"], "2026-11-23T10:00:00Z");
+        assert_eq!(changes["end"]["dateTime"], "2026-11-23T11:45:00Z");
+    }
+
+    #[test]
+    fn new_times_are_sent_in_the_zone_the_event_had() {
+        let instant = |text: &str| EventTime::Timed(text.parse::<DateTime<Utc>>().unwrap());
+        let resource = serde_json::json!({
+            "start": {"dateTime": "2026-11-16T10:00:00+01:00", "timeZone": "Europe/Prague"},
+            "end": {"dateTime": "2026-11-16T11:00:00+01:00"}
+        });
+        assert_eq!(
+            time_changes(
+                &resource,
+                instant("2026-11-17T09:30:00Z"),
+                instant("2026-11-17T10:30:00Z")
+            ),
+            serde_json::json!({
+                "start": {"dateTime": "2026-11-17T09:30:00Z", "timeZone": "Europe/Prague"},
+                "end": {"dateTime": "2026-11-17T10:30:00Z"}
+            })
+        );
+        let day = |d: u32| EventTime::AllDay(NaiveDate::from_ymd_opt(2026, 11, d).unwrap());
+        assert_eq!(
+            time_changes(&serde_json::json!({}), day(16), day(17)),
+            serde_json::json!({"start": {"date": "2026-11-16"}, "end": {"date": "2026-11-17"}})
+        );
+    }
+
+    #[test]
+    fn a_deletion_is_planned_with_its_way_back() {
+        use serde_json::json;
+        let instant = |text: &str| EventTime::Timed(text.parse::<DateTime<Utc>>().unwrap());
+        let target = |event_id: &str, occurrence: Option<Occurrence>| Target {
+            account: 1,
+            calendar_id: "c".into(),
+            event_id: event_id.into(),
+            etag: Some("\"own\"".into()),
+            occurrence,
+            movable: false,
+            start: instant("2026-11-18T10:00:00Z"),
+            end: instant("2026-11-18T11:00:00Z"),
+        };
+        let series = json!({
+            "id": "m", "etag": "\"series\"",
+            "start": {"dateTime": "2026-11-16T10:00:00Z"},
+            "end": {"dateTime": "2026-11-16T11:00:00Z"},
+            "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"]
+        });
+        let third = Occurrence {
+            series_id: "m".into(),
+            original_start: instant("2026-11-18T10:00:00Z"),
+            changed: false,
+        };
+
+        // An ordinary event: deleted as the version shown, recreated to undo.
+        let plain = json!({"id": "e", "summary": "Lunch"});
+        assert_eq!(
+            plan_deletion(&target("e", None), Scope::This, Some(plain.clone()), None),
+            Some((
+                Deletion::Event {
+                    event_id: "e".into(),
+                    etag: Some("\"own\"".into())
+                },
+                UndoKind::Recreate(plain),
+            ))
+        );
+        // Gone from the cache: nothing to do.
+        assert_eq!(
+            plan_deletion(&target("e", None), Scope::This, None, None),
+            None
+        );
+
+        // One occurrence: found by its original start, or by its own identifier when it
+        // is a changed one.
+        assert_eq!(
+            plan_deletion(
+                &target("m", Some(third.clone())),
+                Scope::This,
+                None,
+                Some(series.clone())
+            ),
+            Some((
+                Deletion::Occurrence {
+                    series_id: "m".into(),
+                    original_start: third.original_start,
+                    known_id: None,
+                    etag: None,
+                },
+                UndoKind::Occurrence(json!({"status": "confirmed"})),
+            ))
+        );
+        let changed = Occurrence {
+            changed: true,
+            ..third.clone()
+        };
+        assert!(matches!(
+            plan_deletion(&target("m_x", Some(changed)), Scope::This, None, Some(series.clone())),
+            Some((Deletion::Occurrence { known_id: Some(id), .. }, _)) if id == "m_x"
+        ));
+
+        // This and following: the series ends before it, and gets its rule back to undo.
+        assert_eq!(
+            plan_deletion(
+                &target("m", Some(third.clone())),
+                Scope::Following,
+                None,
+                Some(series.clone())
+            ),
+            Some((
+                Deletion::Following {
+                    series_id: "m".into(),
+                    recurrence: vec!["RRULE:FREQ=DAILY;UNTIL=20261118T095959Z".into()],
+                    etag: Some("\"series\"".into()),
+                },
+                UndoKind::Patch {
+                    event_id: "m".into(),
+                    changes: json!({"recurrence": ["RRULE:FREQ=DAILY;COUNT=5"]}),
+                },
+            ))
+        );
+
+        // All, and "following" from the first occurrence: the series itself.
+        let whole = Some((
+            Deletion::Event {
+                event_id: "m".into(),
+                etag: Some("\"series\"".into()),
+            },
+            UndoKind::Recreate(series.clone()),
+        ));
+        assert_eq!(
+            plan_deletion(
+                &target("m", Some(third)),
+                Scope::All,
+                None,
+                Some(series.clone())
+            ),
+            whole
+        );
+        let first = Occurrence {
+            series_id: "m".into(),
+            original_start: instant("2026-11-16T10:00:00Z"),
+            changed: false,
+        };
+        assert_eq!(
+            plan_deletion(
+                &target("m", Some(first)),
+                Scope::Following,
+                None,
+                Some(series)
+            ),
+            whole
+        );
+    }
+
+    #[test]
+    fn a_new_event_lasts_an_hour_from_the_time_clicked_or_the_whole_day() {
+        let zone = chrono_tz::Europe::Prague;
+        let day = date("2026-11-17");
+        let (start, end) = draft_times(day, 9 * 60 + 30, false, 60, zone);
+        assert_eq!(
+            start,
+            EventTime::Timed("2026-11-17T08:30:00Z".parse().unwrap())
+        );
+        assert_eq!(
+            end,
+            EventTime::Timed("2026-11-17T09:30:00Z".parse().unwrap())
+        );
+        assert_eq!(
+            event_resource(" Lunch ", start, end, zone),
+            serde_json::json!({
+                "summary": "Lunch",
+                "start": {"dateTime": "2026-11-17T09:30:00+01:00", "timeZone": "Europe/Prague"},
+                "end": {"dateTime": "2026-11-17T10:30:00+01:00", "timeZone": "Europe/Prague"},
+            })
+        );
+
+        let (start, end) = draft_times(day, 0, true, 60, zone);
+        assert_eq!(
+            event_resource("Trip", start, end, zone),
+            serde_json::json!({
+                "summary": "Trip",
+                "start": {"date": "2026-11-17"},
+                "end": {"date": "2026-11-18"},
+            })
+        );
+
+        // 02:30 does not exist on the night clocks go forward.
+        let (start, _) = draft_times(date("2027-03-28"), 150, false, 60, zone);
+        assert!(matches!(start, EventTime::Timed(_)));
     }
 
     #[test]

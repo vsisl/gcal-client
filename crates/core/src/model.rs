@@ -32,6 +32,11 @@ pub struct CalendarListEntry {
 }
 
 impl CalendarListEntry {
+    /// Whether this account may create, change and delete events in the calendar.
+    pub fn is_writable(&self) -> bool {
+        matches!(self.access_role.as_deref(), Some("owner" | "writer"))
+    }
+
     /// The name to show: the user's override if set, otherwise the calendar's own name.
     pub fn display_name(&self) -> &str {
         self.summary_override.as_deref().unwrap_or(&self.summary)
@@ -86,6 +91,21 @@ impl EventTime {
     }
 }
 
+/// A guest of an event. Only what the app reads so far.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Attendee {
+    pub email: Option<String>,
+}
+
+/// Who an event belongs to. Only what the app reads so far.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Organizer {
+    /// Whether it is the account the event was fetched for.
+    #[serde(rename = "self", default)]
+    pub is_self: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Event {
@@ -102,6 +122,13 @@ pub struct Event {
     pub description: Option<String>,
     /// Address of the event in Google's web interface.
     pub html_link: Option<String>,
+    /// "default" for ordinary events; others are birthdays, out-of-office, focus time,
+    /// working location and entries created from Gmail.
+    pub event_type: Option<String>,
+    /// Guests, including the organiser when there are any.
+    #[serde(default)]
+    pub attendees: Vec<Attendee>,
+    pub organizer: Option<Organizer>,
     /// RRULE/EXDATE/RDATE lines; present only on the master event of a series.
     #[serde(default)]
     pub recurrence: Vec<String>,
@@ -126,6 +153,12 @@ impl Event {
 
     pub fn is_recurring_master(&self) -> bool {
         !self.recurrence.is_empty()
+    }
+
+    /// Whether this account invited guests to the event, who would want to hear of a
+    /// change or a cancellation.
+    pub fn has_guests_to_notify(&self) -> bool {
+        !self.attendees.is_empty() && self.organizer.as_ref().is_some_and(|o| o.is_self)
     }
 }
 
@@ -165,6 +198,29 @@ mod tests {
         assert_eq!(event.status, EventStatus::Confirmed);
         assert!(event.is_all_day());
         assert!(event.is_recurring_master());
+    }
+
+    #[test]
+    fn only_the_organiser_of_an_event_with_guests_has_guests_to_notify() {
+        let event = |json: &str| serde_json::from_str::<Event>(json).unwrap();
+        assert!(
+            event(
+                r#"{"id": "a", "organizer": {"email": "me@x.org", "self": true},
+                      "attendees": [{"email": "you@x.org"}]}"#
+            )
+            .has_guests_to_notify()
+        );
+        assert!(
+            !event(
+                r#"{"id": "a", "organizer": {"email": "you@x.org"},
+                       "attendees": [{"email": "me@x.org"}]}"#
+            )
+            .has_guests_to_notify()
+        );
+        assert!(
+            !event(r#"{"id": "a", "organizer": {"email": "me@x.org", "self": true}}"#)
+                .has_guests_to_notify()
+        );
     }
 
     #[test]

@@ -3,6 +3,8 @@
 // Rules carried over from the M0 spikes: list models are patched row by row from Rust
 // (never replaced), and geometry is computed here from a few shared lengths.
 
+import { Palette } from "std-widgets.slint";
+
 export struct TimedItem {
     // Index for looking up the event's details when it is clicked.
     instance: int,
@@ -14,6 +16,9 @@ export struct TimedItem {
     // Position among overlapping events: column `col` of `cols`.
     col: int,
     cols: int,
+    // Whether it can be dragged to another time, and by its lower edge to another length.
+    movable: bool,
+    resizable: bool,
     color: color,
     text-color: color,
 }
@@ -24,6 +29,8 @@ export struct AllDayItem {
     first-day: int,
     last-day: int,
     row: int,
+    // Whether it can be dragged to other days.
+    movable: bool,
     color: color,
     text-color: color,
 }
@@ -38,6 +45,14 @@ export struct EventDetail {
     color: color,
     // Address of the event in Google's web interface; empty if unknown.
     link: string,
+    // Whether the app can delete it itself.
+    can-delete: bool,
+    // Whether it can be changed in the editor.
+    can-edit: bool,
+    // One occurrence of a series: deleting asks how much of the series.
+    repeating: bool,
+    // The account invited guests, who can be told about a deletion.
+    notify-guests: bool,
 }
 
 // A day of the month view.
@@ -90,6 +105,32 @@ export struct MiniDay {
     shown: bool,
 }
 
+// A calendar a new event can be put in.
+export struct DraftCalendar {
+    name: string,
+    account: string,
+    color: color,
+}
+
+// The editor's fields. Dates are typed as 2026-11-17 and times as 9:30; the choices
+// are positions in the lists the editor shows.
+export struct EditorForm {
+    title: string,
+    all-day: bool,
+    start-date: string,
+    end-date: string,
+    start-time: string,
+    end-time: string,
+    repeat: int,
+    location: string,
+    description: string,
+    // 0 is the calendar's colour.
+    color: int,
+    reminder: int,
+    visibility: int,
+    busy: bool,
+}
+
 export struct DayHeader {
     weekday: string,
     number: string,
@@ -112,27 +153,38 @@ export enum StatusKind {
     idle,
     waiting-for-browser,
     syncing,
+    saving,
     failed,
 }
 
-// Colours in one place so that the dark theme (M2) is a change here only.
+// Colours in one place, each in a light and a dark version.
 global Theme {
-    out property <color> surface: #ffffff;
-    out property <color> line: #dadce0;
-    out property <color> text: #3c4043;
-    out property <color> text-dim: #70757a;
-    out property <color> hover: #f1f3f4;
-    out property <color> pressed: #e8eaed;
-    out property <color> selected: #d2e3fc;
-    out property <color> accent: #1a73e8;
-    out property <color> now: #ea4335;
-    out property <color> danger: #d93025;
+    // The user's choice: 0 follows the desktop's light or dark setting, 1 is always
+    // light, 2 always dark.
+    in-out property <int> mode;
+    out property <bool> dark: mode == 2 || (mode == 0 && Palette.color-scheme == ColorScheme.dark);
+    out property <color> surface: dark ? #1f1f1f : #ffffff;
+    // Cards floating above the surface.
+    out property <color> card: dark ? #2d2e30 : #ffffff;
+    out property <color> line: dark ? #444746 : #dadce0;
+    out property <color> text: dark ? #e3e3e3 : #3c4043;
+    out property <color> text-dim: dark ? #9aa0a6 : #70757a;
+    out property <color> hover: dark ? #303134 : #f1f3f4;
+    out property <color> pressed: dark ? #3c4043 : #e8eaed;
+    out property <color> selected: dark ? #004a77 : #d2e3fc;
+    out property <color> accent: dark ? #8ab4f8 : #1a73e8;
+    // Text on the accent colour (today's number).
+    out property <color> on-accent: dark ? #062e6f : #ffffff;
+    out property <color> now: dark ? #f28b82 : #ea4335;
+    out property <color> danger: dark ? #f28b82 : #d93025;
 }
 
 component TextButton inherits Rectangle {
     in property <string> text;
     in property <bool> outlined;
-    in property <color> text-color: Theme.text;
+    // The one thing to do next: in the accent colour.
+    in property <bool> filled;
+    in property <color> text-color: filled ? Theme.on-accent : Theme.text;
     callback clicked;
 
     height: 36px;
@@ -140,7 +192,8 @@ component TextButton inherits Rectangle {
     border-radius: self.height / 2;
     border-width: outlined ? 1px : 0px;
     border-color: Theme.line;
-    background: touch.pressed ? Theme.pressed : touch.has-hover ? Theme.hover : transparent;
+    background: filled ? Theme.accent : touch.pressed ? Theme.pressed : touch.has-hover ? Theme.hover : transparent;
+    opacity: filled && touch.has-hover ? 0.9 : 1;
     accessible-role: button;
     accessible-label: root.text;
     accessible-action-default => {
@@ -160,6 +213,242 @@ component TextButton inherits Rectangle {
         clicked => {
             root.clicked();
         }
+    }
+}
+
+// A box to type in, with a hint while it is empty.
+component Field inherits Rectangle {
+    in property <string> hint;
+    in property <string> value;
+    in property <bool> multiline;
+    in property <length> text-size: 14px;
+    in property <bool> take-focus;
+    callback edited(string);
+
+    height: multiline ? 96px : 36px;
+    border-radius: 4px;
+    background: Theme.hover;
+    clip: true;
+
+    if input.text == "": Text {
+        x: 10px;
+        y: root.multiline ? 8px : 0px;
+        height: root.multiline ? 20px : parent.height;
+        text: root.hint;
+        font-size: root.text-size;
+        color: Theme.text-dim;
+        vertical-alignment: center;
+    }
+    input := TextInput {
+        x: 10px;
+        y: root.multiline ? 8px : 0px;
+        width: parent.width - 20px;
+        height: parent.height - 2 * self.y;
+        text: root.value;
+        font-size: root.text-size;
+        color: Theme.text;
+        single-line: !root.multiline;
+        wrap: root.multiline ? word-wrap : no-wrap;
+        vertical-alignment: root.multiline ? top : center;
+        accessible-label: root.hint;
+        init => {
+            if (root.take-focus) {
+                self.focus();
+                // Typing goes on after what is there already.
+                self.set-selection-offsets(self.text.character-count, self.text.character-count);
+            }
+        }
+        edited => {
+            root.edited(self.text);
+        }
+    }
+}
+
+// One of several choices, shown as a line that opens into the list of them.
+component Choice inherits VerticalLayout {
+    in property <[string]> options;
+    in property <int> current;
+    callback chosen(int);
+    property <bool> open;
+
+    Rectangle {
+        height: 36px;
+        border-radius: 4px;
+        background: head-touch.has-hover ? Theme.pressed : Theme.hover;
+        accessible-role: combobox;
+        accessible-label: head.text;
+        accessible-action-default => {
+            root.open = !root.open;
+        }
+
+        head-touch := TouchArea {
+            clicked => {
+                root.open = !root.open;
+            }
+        }
+
+        head := Text {
+            x: 10px;
+            width: parent.width - 36px;
+            height: parent.height;
+            text: root.options[root.current];
+            font-size: 14px;
+            color: Theme.text;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        Text {
+            x: parent.width - 24px;
+            height: parent.height;
+            text: root.open ? "▴" : "▾";
+            font-size: 12px;
+            color: Theme.text-dim;
+            vertical-alignment: center;
+        }
+    }
+
+    if root.open: VerticalLayout {
+        for option[i] in root.options: Rectangle {
+            height: 30px;
+            border-radius: 4px;
+            background: i == root.current ? Theme.selected : option-touch.has-hover ? Theme.hover : transparent;
+            accessible-role: list-item;
+            accessible-label: option;
+            accessible-action-default => {
+                root.chosen(i);
+                root.open = false;
+            }
+
+            option-touch := TouchArea {
+                clicked => {
+                    root.chosen(i);
+                    root.open = false;
+                }
+            }
+
+            Text {
+                x: 22px;
+                width: parent.width - 30px;
+                height: parent.height;
+                text: option;
+                font-size: 13px;
+                color: Theme.text;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+    }
+}
+
+// A tick box with its text.
+component CheckRow inherits Rectangle {
+    in property <string> text;
+    in property <bool> checked;
+    callback toggled;
+
+    height: 36px;
+    border-radius: 4px;
+    background: touch.has-hover ? Theme.hover : transparent;
+    accessible-role: checkbox;
+    accessible-label: root.text;
+    accessible-checked: root.checked;
+    accessible-action-default => {
+        root.toggled();
+    }
+
+    touch := TouchArea {
+        clicked => {
+            root.toggled();
+        }
+    }
+
+    Rectangle {
+        x: 8px;
+        y: (parent.height - self.height) / 2;
+        width: 18px;
+        height: 18px;
+        border-radius: 3px;
+        border-width: 2px;
+        border-color: root.checked ? Theme.accent : Theme.text-dim;
+        background: root.checked ? Theme.accent : transparent;
+    }
+
+    Text {
+        x: 40px;
+        height: parent.height;
+        text: root.text;
+        font-size: 14px;
+        color: Theme.text;
+        vertical-alignment: center;
+    }
+}
+
+// A line of the editor: what it is about, then the control.
+component EditorRow inherits HorizontalLayout {
+    in property <string> label;
+    spacing: 12px;
+
+    Text {
+        width: 96px;
+        height: 36px;
+        text: root.label;
+        font-size: 13px;
+        color: Theme.text-dim;
+        vertical-alignment: center;
+    }
+
+    @children
+}
+
+// One choice of several, with a radio button in front.
+component RadioRow inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected;
+    callback clicked;
+
+    height: 36px;
+    border-radius: 4px;
+    background: touch.has-hover ? Theme.hover : transparent;
+    accessible-role: list-item;
+    accessible-label: root.text;
+    accessible-item-selected: root.selected;
+    accessible-action-default => {
+        root.clicked();
+    }
+
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+
+    Rectangle {
+        x: 8px;
+        y: (parent.height - self.height) / 2;
+        width: 18px;
+        height: 18px;
+        border-radius: 9px;
+        border-width: 2px;
+        border-color: root.selected ? Theme.accent : Theme.text-dim;
+
+        if root.selected: Rectangle {
+            x: 4px;
+            y: 4px;
+            width: 10px;
+            height: 10px;
+            border-radius: 5px;
+            background: Theme.accent;
+        }
+    }
+
+    Text {
+        x: 40px;
+        height: parent.height;
+        text: root.text;
+        font-size: 14px;
+        color: Theme.text;
+        vertical-alignment: center;
     }
 }
 
@@ -222,11 +511,152 @@ export component AppWindow inherits Window {
     in-out property <bool> detail-visible;
     // The list of keyboard shortcuts, opened with "?".
     property <bool> help-visible;
+    // The editor: all of an event's fields. Rust fills `editor` and shows it; "Save"
+    // hands the form back, with the calendar chosen for a new event.
+    in-out property <EditorForm> editor;
+    in-out property <bool> editor-visible;
+    in property <bool> editor-new;
+    // The event repeats, or reminds, in a way the lists do not offer: one more choice
+    // keeps that as it is.
+    in property <bool> editor-custom-repeat;
+    in property <bool> editor-custom-reminder;
+    in property <string> editor-calendar-name;
+    in property <[string]> editor-calendars;
+    // The calendar's colour, then Google's event colours.
+    in property <[color]> editor-colors;
+    // Why the form cannot be saved as it is.
+    in property <string> editor-error;
+    callback editor-requested(int);
+    callback editor-from-draft(string, int);
+    callback editor-save(EditorForm, int);
+    changed editor-visible => {
+        if (!root.editor-visible) {
+            keys.focus();
+        }
+    }
+    // The settings card, opened with "s" or its button.
+    property <bool> settings-visible;
+    // Light or dark: 0 as the desktop, 1 light, 2 dark. Rust sets the remembered choice
+    // at start and is told of a new one.
+    in-out property <int> theme-mode <=> Theme.mode;
+    callback theme-chosen(int);
     // Where the event was clicked; the details open next to it.
     property <length> detail-x;
     property <length> detail-y;
 
+    // Which instance the details card is about.
+    property <int> detail-instance;
+    // Deletes the event behind an instance: how much of a series (0 this occurrence,
+    // 1 this and following, 2 all) and whether to tell the guests. The worker answers
+    // with delete-finished, naming the occurrence it removed if it was a single one.
+    callback delete-event(int, int, bool);
+    callback delete-finished(bool, string);
+    // An event was dragged: by how many days and minutes; or its lower edge, by how
+    // many minutes. The worker answers with change-finished.
+    callback event-moved(int, int, int);
+    callback event-resized(int, int);
+    // Whether it was made, the occurrence it was made to if it was a single one, and
+    // the version the event now has.
+    callback change-finished(bool, string, string);
+    // Counted up by Rust whenever the views are redrawn from the cache. A drag notes it
+    // at its start and is dropped if it has changed by its end: the block dragged may
+    // then stand for another event.
+    in property <int> generation;
+    // A repeating event was dragged: the question card asks how much of the series is
+    // meant and answers with edit-scope-chosen (0 this, 1 this and following, 2 all).
+    property <bool> ask-edit;
+    callback edit-scope-chosen(int);
+    public function ask-edit-scope() {
+        root.detail-visible = false;
+        root.delete-scope = 0;
+        root.ask-edit = true;
+        root.delete-ask-visible = true;
+    }
+
+    function confirm-ask() {
+        if (root.ask-edit) {
+            root.delete-ask-visible = false;
+            root.edit-scope-chosen(root.delete-scope);
+        } else {
+            root.delete-event(root.detail-instance, root.delete-scope, root.delete-notify);
+        }
+    }
+    // Google cannot be reached: the calendar shows what was fetched last and nothing
+    // can be changed (no changes are kept for later).
+    in property <bool> offline;
+    // The questions asked before deleting a repeating event or one with guests.
+    in-out property <bool> delete-ask-visible;
+    property <int> delete-scope;
+    property <bool> delete-notify;
+
+    // Deletes the event of the open details card, asking first where there is a choice.
+    function ask-delete() {
+        if (root.offline) {
+            return;
+        }
+        if (root.detail.repeating || root.detail.notify-guests) {
+            root.delete-scope = 0;
+            root.delete-notify = root.detail.notify-guests;
+            root.ask-edit = false;
+            root.delete-ask-visible = true;
+        } else {
+            root.delete-event(root.detail-instance, 0, false);
+        }
+    }
+    // A short message about the last change, with "Undo"; empty when there is none.
+    in property <string> toast;
+    in property <bool> toast-undo;
+    // A new event: asked for with a day (counted from the first one shown; negative for
+    // "about now"), the minute of the day, and whether it is to last all day. Rust fills
+    // in the card's properties and shows it.
+    // The last number is its length in minutes, 0 for the usual hour.
+    callback draft-requested(int, int, bool, int);
+    // Title and the position of the chosen calendar.
+    callback draft-save(string, int);
+    // The worker's answer to creating an event: whether it exists now, and its
+    // identifier and version, which allow taking it back.
+    callback event-created(bool, string, string);
+    in-out property <bool> draft-visible;
+    in property <string> draft-when;
+    in property <[DraftCalendar]> draft-calendars;
+    in-out property <int> draft-calendar;
+    // Where the new event's ghost is drawn in the day columns; day -1 for none.
+    in property <int> draft-day: -1;
+    in property <int> draft-min;
+    in property <int> draft-len: 60;
+    // The time being dragged out on empty hours for a new event; day -1 for none.
+    property <int> sel-day: -1;
+    property <int> sel-from;
+    property <int> sel-start;
+    property <int> sel-end;
+
+    // Scrolls the hours so that a time of day is on screen, if it is not.
+    public function reveal-minute(minute: int) {
+        if (minute / 60.0 * hour-h < -grid.content-y || (minute + 60) / 60.0 * hour-h > -grid.content-y + grid.height) {
+            grid.content-y = -Math.max(0px, Math.min(hour-h * 24 - grid.height, minute / 60.0 * hour-h - grid.height / 3));
+        }
+    }
+
+    function ask-draft(day: int, minute: int, all-day: bool, length: int, x: length, y: length) {
+        if (root.offline) {
+            return;
+        }
+        detail-x = x;
+        detail-y = y;
+        root.draft-requested(day, minute, all-day, length);
+    }
+
+    function close-draft() {
+        root.draft-visible = false;
+        keys.focus();
+    }
+    callback undo();
+    // Something the user must read before going on (a change that was refused, say).
+    // Shown as a dialog until dismissed; empty when there is none.
+    in-out property <string> notice;
+
     function show-detail(instance: int, x: length, y: length) {
+        detail-instance = instance;
         detail-x = x;
         detail-y = y;
         root.event-clicked(instance);
@@ -239,7 +669,32 @@ export component AppWindow inherits Window {
     // Raised from the background worker when the cache changed.
     callback data-changed();
 
-    property <length> hour-h: 48px;
+    // The height of an hour in the day columns: the zoom. Changed with Ctrl and the
+    // wheel, Ctrl and + or -, or in the settings; Rust remembers it.
+    in-out property <length> hour-h: 48px;
+    callback zoom-changed(float);
+    property <float> zoom-centre;
+
+    // Sets the height of an hour, keeping the time in the middle of the screen there.
+    function set-hour-height(height: length) {
+        root.zoom-centre = (grid.height / 2 - grid.content-y) / root.hour-h;
+        root.hour-h = Math.max(20px, Math.min(192px, height));
+        grid.content-y = -Math.max(0px, Math.min(root.hour-h * 24 - grid.height, root.zoom-centre * root.hour-h - grid.height / 2));
+        root.zoom-changed(root.hour-h / 1px);
+    }
+
+    // A step from a key or a button: a tenth.
+    function zoom-by(steps: int) {
+        root.set-hour-height(steps > 0 ? root.hour-h * 1.1 : root.hour-h / 1.1);
+    }
+
+    // The wheel or two fingers on a touchpad, with Ctrl: in proportion to how far it
+    // was turned. One notch of a wheel is about 60 px, which makes a twelfth.
+    function zoom-wheel(delta: length) {
+        root.set-hour-height(root.hour-h * (1 + Math.max(-90, Math.min(90, delta / 1px)) * 0.0014));
+    }
+    // The height of an hour when two fingers began to pinch.
+    property <length> pinch-start;
     property <length> gutter: 56px;
     property <length> head-h: 80px;
     property <length> bar-h: 22px;
@@ -256,15 +711,94 @@ export component AppWindow inherits Window {
 
     keys := FocusScope {
         key-pressed(event) => {
+            // What is open on top takes the keys, and nothing behind it does: a key
+            // meant for a card must never act on the calendar underneath (Delete with
+            // an event's details open behind the settings would delete that event).
+            if (root.notice != "") {
+                // The dialog is all there is until it is dismissed.
+                if (event.text == Key.Escape || event.text == Key.Return) {
+                    root.notice = "";
+                }
+                return accept;
+            }
+            if (root.delete-ask-visible) {
+                // Only its own keys while the question is open.
+                if (event.text == Key.Escape) {
+                    root.delete-ask-visible = false;
+                } else if (event.text == Key.Return) {
+                    root.confirm-ask();
+                } else if (event.text == Key.DownArrow && (root.ask-edit || root.detail.repeating)) {
+                    root.delete-scope = Math.min(2, root.delete-scope + 1);
+                } else if (event.text == Key.UpArrow && (root.ask-edit || root.detail.repeating)) {
+                    root.delete-scope = Math.max(0, root.delete-scope - 1);
+                }
+                return accept;
+            }
+            if (root.editor-visible) {
+                // Keys its fields did not take.
+                if (event.text == Key.Escape) {
+                    root.editor-visible = false;
+                } else if (event.modifiers.control && (event.text == "s" || event.text == Key.Return)) {
+                    root.editor-save(root.editor, root.draft-calendar);
+                }
+                return accept;
+            }
+            if (root.draft-visible) {
+                // Keys its title did not take.
+                if (event.text == Key.Escape) {
+                    root.close-draft();
+                }
+                return accept;
+            }
+            if (event.modifiers.control && (event.text == "+" || event.text == "=")) {
+                root.zoom-by(1);
+                return accept;
+            }
+            if (event.modifiers.control && event.text == "-") {
+                root.zoom-by(-1);
+                return accept;
+            }
+            if (event.modifiers.control && event.text == "0") {
+                root.set-hour-height(48px);
+                return accept;
+            }
             if (event.modifiers.control || event.modifiers.alt || event.modifiers.meta) {
                 return reject;
             }
-            if (event.text == Key.Escape && root.help-visible) {
-                root.help-visible = false;
+            if (root.settings-visible) {
+                if (event.text == Key.Escape || event.text == "s") {
+                    root.settings-visible = false;
+                }
+                return accept;
+            }
+            if (root.help-visible) {
+                if (event.text == Key.Escape || event.text == "?") {
+                    root.help-visible = false;
+                }
+                return accept;
+            }
+            if (event.text == "s") {
+                root.settings-visible = true;
                 return accept;
             }
             if (event.text == Key.Escape && root.detail-visible) {
                 root.detail-visible = false;
+                return accept;
+            }
+            if ((event.text == Key.Delete || event.text == Key.Backspace) && root.detail-visible && root.detail.can-delete) {
+                root.ask-delete();
+                return accept;
+            }
+            if (event.text == "e" && root.detail-visible && root.detail.can-edit && !root.offline) {
+                root.editor-requested(root.detail-instance);
+                return accept;
+            }
+            if (event.text == "c") {
+                root.ask-draft(-1, 0, false, 0, root.width / 2 - 200px, root.height / 3);
+                return accept;
+            }
+            if (event.text == "z" && root.toast != "" && root.toast-undo) {
+                root.undo();
                 return accept;
             }
             if (event.text == "?") {
@@ -366,7 +900,7 @@ export component AppWindow inherits Window {
                 }
 
                 status := Text {
-                    text: root.status-kind == StatusKind.waiting-for-browser ? @tr("Finish signing in in your browser…") : root.status-kind == StatusKind.syncing ? @tr("Syncing…") : root.status-kind == StatusKind.failed ? root.status-detail : "";
+                    text: root.status-kind == StatusKind.waiting-for-browser ? @tr("Finish signing in in your browser…") : root.status-kind == StatusKind.syncing ? (root.status-detail != "" ? root.status-detail : @tr("Syncing…")) : root.status-kind == StatusKind.saving ? @tr("Saving…") : root.status-kind == StatusKind.failed ? root.status-detail : "";
                     font-size: 13px;
                     color: root.status-kind == StatusKind.failed ? Theme.danger : Theme.text-dim;
                     vertical-alignment: center;
@@ -400,11 +934,72 @@ export component AppWindow inherits Window {
                 VerticalLayout {
                     alignment: center;
                     TextButton {
+                        text: @tr("Settings");
+                        clicked => {
+                            root.settings-visible = true;
+                        }
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    TextButton {
                         text: @tr("Add account");
                         outlined: true;
                         text-color: Theme.accent;
                         clicked => {
                             root.add-account();
+                        }
+                    }
+                }
+            }
+
+            // Something is going on in the background: a bar running under the top bar.
+            // A first sync of a large account takes minutes and must not look frozen.
+            Rectangle {
+                height: 3px;
+                clip: true;
+
+                if root.status-kind != StatusKind.idle && root.status-kind != StatusKind.failed: Rectangle {
+                    property <float> phase: Math.mod(animation-tick() / 1ms, 1400) / 1400;
+                    x: self.phase * (parent.width + self.width) - self.width;
+                    width: parent.width / 4;
+                    height: parent.height;
+                    background: Theme.accent;
+                    accessible-role: progress-indicator;
+                    accessible-label: status.text;
+                }
+            }
+
+            if root.offline: Rectangle {
+                height: 36px;
+                background: Theme.pressed;
+                accessible-role: groupbox;
+                accessible-label: offline-text.text;
+
+                HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 8px;
+                    spacing: 12px;
+
+                    offline-text := Text {
+                        text: @tr("No connection to Google. You see what was fetched last; changes can't be made until the connection is back.");
+                        font-size: 13px;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        TextButton {
+                            text: @tr("Try again");
+                            height: 28px;
+                            text-color: Theme.accent;
+                            clicked => {
+                                root.sync-now();
+                            }
                         }
                     }
                 }
@@ -489,7 +1084,7 @@ export component AppWindow inherits Window {
                                 Text {
                                     text: day.label;
                                     font-size: 11px;
-                                    color: day.today ? white : day.dim ? Theme.text-dim : Theme.text;
+                                    color: day.today ? Theme.on-accent : day.dim ? Theme.text-dim : Theme.text;
                                     horizontal-alignment: center;
                                     vertical-alignment: center;
                                 }
@@ -648,7 +1243,7 @@ export component AppWindow inherits Window {
                                 Text {
                                     text: day.number;
                                     font-size: 24px;
-                                    color: day.today ? white : Theme.text;
+                                    color: day.today ? Theme.on-accent : Theme.text;
                                     horizontal-alignment: center;
                                     vertical-alignment: center;
                                 }
@@ -663,19 +1258,62 @@ export component AppWindow inherits Window {
                             height: strip-h;
                             background: Theme.line;
                         }
+                        // Empty part of the strip: a click starts an all-day event.
+                        TouchArea {
+                            x: gutter;
+                            y: head-h;
+                            width: parent.width - gutter;
+                            height: strip-h;
+                            clicked => {
+                                root.ask-draft(Math.floor(self.mouse-x / day-w), 0, true, 0, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                            }
+                        }
                         for item in root.all-day: Rectangle {
-                            x: gutter + item.first-day * day-w + 2px;
+                            // While it is dragged: by how many days, and where the pointer
+                            // went down in the window (the bar moves under the pointer, so
+                            // positions inside it cannot measure the drag).
+                            property <bool> dragging;
+                            property <int> drag-days;
+                            property <length> press-x;
+                            property <int> press-generation;
+
+                            x: gutter + (item.first-day + self.drag-days) * day-w + 2px;
                             y: head-h + 2px + item.row * bar-h;
                             width: (item.last-day - item.first-day + 1) * day-w - 8px;
                             height: bar-h - 2px;
                             border-radius: 4px;
                             background: item.color;
+                            opacity: self.dragging ? 0.7 : 1;
                             clip: true;
 
                             TouchArea {
                                 mouse-cursor: pointer;
-                                clicked => {
-                                    root.show-detail(item.instance, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                pointer-event(event) => {
+                                    if (event.button != PointerEventButton.left) {
+                                        return;
+                                    }
+                                    if (event.kind == PointerEventKind.down) {
+                                        parent.press-x = self.absolute-position.x + self.mouse-x;
+                                        parent.press-generation = root.generation;
+                                    } else if (event.kind == PointerEventKind.up) {
+                                        if (parent.dragging) {
+                                            if (parent.drag-days != 0 && parent.press-generation == root.generation) {
+                                                root.event-moved(item.instance, parent.drag-days, 0);
+                                            }
+                                            parent.dragging = false;
+                                            parent.drag-days = 0;
+                                        } else {
+                                            root.show-detail(item.instance, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                        }
+                                    }
+                                }
+                                moved => {
+                                    if (item.movable && !root.offline && self.pressed) {
+                                        if (parent.dragging || Math.abs(self.absolute-position.x + self.mouse-x - parent.press-x) > 6px) {
+                                            parent.dragging = true;
+                                            parent.drag-days = Math.max(-item.first-day, Math.min(root.day-count - 1 - item.last-day, Math.round((self.absolute-position.x + self.mouse-x - parent.press-x) / day-w)));
+                                        }
+                                    }
                                 }
                             }
 
@@ -699,15 +1337,72 @@ export component AppWindow inherits Window {
                         }
 
                         // Hour grid.
-                        grid := Flickable {
+                        Rectangle {
                             x: 0;
                             y: head-h + strip-h + 1px;
                             width: parent.width;
                             height: parent.height - self.y;
+
+                        // Two fingers moving apart or together zoom, on touch screens (and
+                        // on touchpads where the system passes the gesture on).
+                        ScaleRotateGestureHandler {
+                            started => {
+                                root.pinch-start = root.hour-h;
+                            }
+                            updated => {
+                                root.set-hour-height(root.pinch-start * self.scale);
+                            }
+
+                        grid := Flickable {
+                            x: 0;
+                            y: 0;
+                            width: parent.width;
+                            height: parent.height;
                             // Wheel and touchpad scrolling only; pointer drags are for events.
                             interactive: false;
                             content-width: self.width;
                             content-height: hour-h * 24;
+
+                            // Empty time: a click starts a new event there. Events are drawn
+                            // later, so theirs come first.
+                            TouchArea {
+                                x: gutter;
+                                width: parent.width - gutter;
+                                height: hour-h * 24;
+                                scroll-event(event) => {
+                                    if (event.modifiers.control) {
+                                        root.zoom-wheel(event.delta-y);
+                                        return accept;
+                                    }
+                                    reject
+                                }
+                                // A click is an hour from the half hour clicked; a drag
+                                // marks the time out in quarters of an hour.
+                                pointer-event(event) => {
+                                    if (event.button != PointerEventButton.left) {
+                                        return;
+                                    }
+                                    if (event.kind == PointerEventKind.down && !root.offline) {
+                                        root.sel-day = Math.floor(self.mouse-x / day-w);
+                                        root.sel-from = Math.floor(self.mouse-y / (hour-h / 4)) * 15;
+                                        root.sel-start = root.sel-from;
+                                        root.sel-end = root.sel-from;
+                                    } else if (event.kind == PointerEventKind.up && root.sel-day >= 0) {
+                                        if (root.sel-end - root.sel-start >= 30) {
+                                            root.ask-draft(root.sel-day, root.sel-start, false, root.sel-end - root.sel-start, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                        } else {
+                                            root.ask-draft(root.sel-day, Math.floor(root.sel-from / 30) * 30, false, 0, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                        }
+                                        root.sel-day = -1;
+                                    }
+                                }
+                                moved => {
+                                    if (self.pressed && root.sel-day >= 0) {
+                                        root.sel-start = Math.max(0, Math.min(root.sel-from, Math.round(self.mouse-y / (hour-h / 4)) * 15));
+                                        root.sel-end = Math.min(24 * 60, Math.max(root.sel-from, Math.round(self.mouse-y / (hour-h / 4)) * 15));
+                                    }
+                                }
+                            }
 
                             for h in 24: Rectangle {
                                 x: gutter - 8px;
@@ -737,14 +1432,28 @@ export component AppWindow inherits Window {
                                 property <length> slot-w: (day-w - 10px) / item.cols;
                                 property <string> shown-title: item.title == "" ? @tr("(No title)") : item.title;
 
-                                x: gutter + item.day * day-w + 1px + item.col * slot-w;
-                                y: item.start-min / 60.0 * hour-h;
-                                width: slot-w - 1px;
-                                height: (item.end-min - item.start-min) / 60.0 * hour-h - 1px;
+                                // While it is dragged: by how many days and minutes (in
+                                // quarters of an hour), or by how many minutes its lower
+                                // edge; and where the pointer went down in the window (the
+                                // block moves under the pointer, so positions inside it
+                                // cannot measure the drag).
+                                property <bool> dragging;
+                                property <int> drag-days;
+                                property <int> drag-min;
+                                property <int> grow-min;
+                                property <length> press-x;
+                                property <length> press-y;
+                                property <int> press-generation;
+
+                                x: self.dragging ? gutter + (item.day + self.drag-days) * day-w + 1px : gutter + item.day * day-w + 1px + item.col * slot-w;
+                                y: (item.start-min + self.drag-min) / 60.0 * hour-h;
+                                width: self.dragging ? day-w - 10px : slot-w - 1px;
+                                height: (item.end-min - item.start-min + self.grow-min) / 60.0 * hour-h - 1px;
                                 border-radius: 4px;
                                 border-width: 1px;
                                 border-color: Theme.surface;
                                 background: item.color;
+                                opacity: self.dragging || self.grow-min != 0 ? 0.7 : 1;
                                 clip: true;
                                 accessible-role: list-item;
                                 accessible-label: "\{self.shown-title}, \{item.time}";
@@ -754,8 +1463,68 @@ export component AppWindow inherits Window {
 
                                 TouchArea {
                                     mouse-cursor: pointer;
-                                    clicked => {
-                                        root.show-detail(item.instance, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                    scroll-event(event) => {
+                                        if (event.modifiers.control) {
+                                            root.zoom-wheel(event.delta-y);
+                                            return accept;
+                                        }
+                                        reject
+                                    }
+                                    pointer-event(event) => {
+                                        if (event.button != PointerEventButton.left) {
+                                            return;
+                                        }
+                                        if (event.kind == PointerEventKind.down) {
+                                            parent.press-x = self.absolute-position.x + self.mouse-x;
+                                            parent.press-y = self.absolute-position.y + self.mouse-y;
+                                            parent.press-generation = root.generation;
+                                        } else if (event.kind == PointerEventKind.up) {
+                                            if (parent.dragging) {
+                                                if ((parent.drag-days != 0 || parent.drag-min != 0) && parent.press-generation == root.generation) {
+                                                    root.event-moved(item.instance, parent.drag-days, parent.drag-min);
+                                                }
+                                                parent.dragging = false;
+                                                parent.drag-days = 0;
+                                                parent.drag-min = 0;
+                                            } else {
+                                                root.show-detail(item.instance, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                            }
+                                        }
+                                    }
+                                    moved => {
+                                        if (item.movable && !root.offline && self.pressed) {
+                                            if (parent.dragging || Math.abs(self.absolute-position.x + self.mouse-x - parent.press-x) > 6px || Math.abs(self.absolute-position.y + self.mouse-y - parent.press-y) > 6px) {
+                                                parent.dragging = true;
+                                                parent.drag-days = Math.max(-item.day, Math.min(root.day-count - 1 - item.day, Math.round((self.absolute-position.x + self.mouse-x - parent.press-x) / day-w)));
+                                                parent.drag-min = Math.max(-item.start-min, Math.min(24 * 60 - item.end-min, Math.round((self.absolute-position.y + self.mouse-y - parent.press-y) / (hour-h / 4)) * 15));
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // The lower edge: dragging it changes when the event ends.
+                                if item.resizable && !root.offline: TouchArea {
+                                    y: parent.height - self.height;
+                                    height: Math.min(8px, parent.height / 3);
+                                    mouse-cursor: ns-resize;
+                                    pointer-event(event) => {
+                                        if (event.button != PointerEventButton.left) {
+                                            return;
+                                        }
+                                        if (event.kind == PointerEventKind.down) {
+                                            parent.press-y = self.absolute-position.y + self.mouse-y;
+                                            parent.press-generation = root.generation;
+                                        } else if (event.kind == PointerEventKind.up) {
+                                            if (parent.grow-min != 0 && parent.press-generation == root.generation) {
+                                                root.event-resized(item.instance, parent.grow-min);
+                                            }
+                                            parent.grow-min = 0;
+                                        }
+                                    }
+                                    moved => {
+                                        if (self.pressed) {
+                                            parent.grow-min = Math.max(15 - (item.end-min - item.start-min), Math.min(24 * 60 - item.end-min, Math.round((self.absolute-position.y + self.mouse-y - parent.press-y) / (hour-h / 4)) * 15));
+                                        }
                                     }
                                 }
 
@@ -766,7 +1535,8 @@ export component AppWindow inherits Window {
                                     width: parent.width - 8px;
                                     height: parent.height;
                                     text: "\{parent.shown-title}, \{item.time}";
-                                    font-size: parent.height < 16px ? 10px : 12px;
+                                    // Zoomed far out, a short event is only a few pixels high.
+                                    font-size: Math.min(12px, Math.max(7px, parent.height - 3px));
                                     color: item.text-color;
                                     vertical-alignment: center;
                                     overflow: elide;
@@ -792,6 +1562,28 @@ export component AppWindow inherits Window {
                                 }
                             }
 
+                            // The new event being typed in.
+                            if root.draft-visible && root.draft-day >= 0: Rectangle {
+                                x: gutter + root.draft-day * day-w + 1px;
+                                y: root.draft-min / 60.0 * hour-h;
+                                width: day-w - 10px;
+                                height: root.draft-len / 60.0 * hour-h - 1px;
+                                border-radius: 4px;
+                                background: Theme.accent;
+                                opacity: 0.6;
+                            }
+
+                            // The time being dragged out for a new event.
+                            if root.sel-day >= 0 && root.sel-end - root.sel-start >= 15: Rectangle {
+                                x: gutter + root.sel-day * day-w + 1px;
+                                y: root.sel-start / 60.0 * hour-h;
+                                width: day-w - 10px;
+                                height: (root.sel-end - root.sel-start) / 60.0 * hour-h - 1px;
+                                border-radius: 4px;
+                                background: Theme.accent;
+                                opacity: 0.6;
+                            }
+
                             // Current time.
                             if root.now-day >= 0: Rectangle {
                                 x: gutter + root.now-day * day-w;
@@ -808,6 +1600,8 @@ export component AppWindow inherits Window {
                                 border-radius: 6px;
                                 background: Theme.now;
                             }
+                        }
+                        }
                         }
                     }
 
@@ -832,6 +1626,13 @@ export component AppWindow inherits Window {
                             y: month-names-h + Math.floor(i / 7) * month-row-h;
                             width: month-col-w;
                             height: month-row-h;
+
+                            // An empty part of the cell: a click starts an all-day event.
+                            TouchArea {
+                                clicked => {
+                                    root.ask-draft(i, 0, true, 0, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                }
+                            }
 
                             Rectangle {
                                 x: 0;
@@ -866,7 +1667,7 @@ export component AppWindow inherits Window {
                                     text: cell.label;
                                     font-size: 12px;
                                     font-weight: 500;
-                                    color: cell.today ? white : cell.dim ? Theme.text-dim : Theme.text;
+                                    color: cell.today ? Theme.on-accent : cell.dim ? Theme.text-dim : Theme.text;
                                     horizontal-alignment: center;
                                     vertical-alignment: center;
                                 }
@@ -1002,7 +1803,7 @@ export component AppWindow inherits Window {
                                     Text {
                                         text: row.day-number;
                                         font-size: 18px;
-                                        color: row.today ? white : Theme.text;
+                                        color: row.today ? Theme.on-accent : Theme.text;
                                         horizontal-alignment: center;
                                         vertical-alignment: center;
                                     }
@@ -1077,7 +1878,7 @@ export component AppWindow inherits Window {
             // Beside the click, shifted back inside the window where it would not fit.
             x: Math.max(self.margin, Math.min(root.detail-x + 12px, root.width - self.width - self.margin));
             y: Math.max(self.margin, Math.min(root.detail-y - 24px, root.height - self.height - self.margin));
-            background: Theme.surface;
+            background: Theme.card;
             border-radius: 12px;
             border-width: 1px;
             border-color: Theme.line;
@@ -1099,6 +1900,21 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     alignment: end;
                     spacing: 4px;
+                    if root.detail.can-edit && !root.offline: TextButton {
+                        text: @tr("Edit");
+                        height: 32px;
+                        clicked => {
+                            root.editor-requested(root.detail-instance);
+                        }
+                    }
+                    if root.detail.can-delete && !root.offline: TextButton {
+                        text: @tr("Delete");
+                        height: 32px;
+                        text-color: Theme.danger;
+                        clicked => {
+                            root.ask-delete();
+                        }
+                    }
                     if root.detail.link != "": TextButton {
                         text: @tr("Open in browser");
                         height: 32px;
@@ -1172,8 +1988,699 @@ export component AppWindow inherits Window {
             }
         }
 
-        // Keyboard shortcuts. Like the details card, an overlay that takes no focus, so
-        // the shortcuts it lists keep working while it is open.
+        // Before deleting a repeating event or one with guests: how much, and whether
+        // the guests are told.
+        if root.delete-ask-visible: Rectangle {
+            background: #00000066;
+            TouchArea {
+                clicked => {
+                    root.delete-ask-visible = false;
+                }
+            }
+        }
+        if root.delete-ask-visible: Rectangle {
+            width: Math.min(360px, root.width - 24px);
+            height: Math.min(delete-box.preferred-height, root.height - 24px);
+            background: Theme.card;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.line;
+            drop-shadow-blur: 24px;
+            drop-shadow-offset-y: 6px;
+            drop-shadow-color: #00000040;
+            clip: true;
+            accessible-role: groupbox;
+            accessible-label: delete-title.text;
+
+            TouchArea { }
+
+            delete-box := VerticalLayout {
+                padding: 24px;
+                padding-bottom: 12px;
+                spacing: 6px;
+
+                delete-title := Text {
+                    text: root.ask-edit ? @tr("Edit repeating event") : root.detail.repeating ? @tr("Delete repeating event") : @tr("Delete event");
+                    font-size: 18px;
+                    color: Theme.text;
+                }
+
+                Rectangle {
+                    height: 8px;
+                }
+
+                if root.ask-edit || root.detail.repeating: VerticalLayout {
+                    for label[i] in [@tr("This event"), @tr("This and following events"), @tr("All events")]: RadioRow {
+                        text: label;
+                        selected: root.delete-scope == i;
+                        clicked => {
+                            root.delete-scope = i;
+                        }
+                    }
+                }
+                if !root.ask-edit && root.detail.notify-guests: Rectangle {
+                    height: 36px;
+                    border-radius: 4px;
+                    background: notify-touch.has-hover ? Theme.hover : transparent;
+                    accessible-role: checkbox;
+                    accessible-label: notify-label.text;
+                    accessible-checked: root.delete-notify;
+                    accessible-action-default => {
+                        root.delete-notify = !root.delete-notify;
+                    }
+
+                    notify-touch := TouchArea {
+                        clicked => {
+                            root.delete-notify = !root.delete-notify;
+                        }
+                    }
+
+                    Rectangle {
+                        x: 8px;
+                        y: (parent.height - self.height) / 2;
+                        width: 18px;
+                        height: 18px;
+                        border-radius: 3px;
+                        border-width: 2px;
+                        border-color: root.delete-notify ? Theme.accent : Theme.text-dim;
+                        background: root.delete-notify ? Theme.accent : transparent;
+                    }
+
+                    notify-label := Text {
+                        x: 40px;
+                        height: parent.height;
+                        text: @tr("Send cancellation e-mails to guests");
+                        font-size: 14px;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                    }
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 4px;
+                    padding-top: 8px;
+                    TextButton {
+                        text: @tr("Cancel");
+                        height: 32px;
+                        clicked => {
+                            root.delete-ask-visible = false;
+                        }
+                    }
+
+                    TextButton {
+                        text: root.ask-edit ? @tr("OK") : @tr("Delete");
+                        height: 32px;
+                        text-color: root.ask-edit ? Theme.accent : Theme.danger;
+                        clicked => {
+                            root.confirm-ask();
+                        }
+                    }
+                }
+            }
+        }
+
+        // A new event. Unlike the other cards this one is typed into, so its text field
+        // takes the keyboard until the card closes.
+        if root.draft-visible: TouchArea {
+            clicked => {
+                root.close-draft();
+            }
+        }
+        if root.draft-visible: Rectangle {
+            property <length> margin: 12px;
+            width: Math.min(400px, root.width - 2 * self.margin);
+            height: Math.min(draft.preferred-height, root.height - 2 * self.margin);
+            x: Math.max(self.margin, Math.min(root.detail-x + 12px, root.width - self.width - self.margin));
+            y: Math.max(self.margin, Math.min(root.detail-y - 24px, root.height - self.height - self.margin));
+            background: Theme.card;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.line;
+            drop-shadow-blur: 24px;
+            drop-shadow-offset-y: 6px;
+            drop-shadow-color: #00000040;
+            clip: true;
+            accessible-role: groupbox;
+            accessible-label: @tr("New event");
+
+            TouchArea { }
+
+            draft := VerticalLayout {
+                padding: 16px;
+                padding-top: 8px;
+                spacing: 10px;
+
+                HorizontalLayout {
+                    alignment: end;
+                    TextButton {
+                        text: "✕";
+                        height: 32px;
+                        width: 32px;
+                        accessible-label: @tr("Close");
+                        clicked => {
+                            root.close-draft();
+                        }
+                    }
+                }
+
+                // The title: a line to write on, as on the web.
+                Rectangle {
+                    height: 40px;
+
+                    if draft-title.text == "": Text {
+                        x: 2px;
+                        text: @tr("Add title");
+                        font-size: 20px;
+                        color: Theme.text-dim;
+                        vertical-alignment: center;
+                    }
+                    draft-title := TextInput {
+                        x: 2px;
+                        width: parent.width - 4px;
+                        font-size: 20px;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                        single-line: true;
+                        accessible-label: @tr("Title");
+                        init => {
+                            self.focus();
+                        }
+                        accepted => {
+                            root.draft-save(self.text, root.draft-calendar);
+                            root.close-draft();
+                        }
+                        key-pressed(event) => {
+                            if (event.text == Key.Escape) {
+                                root.close-draft();
+                                return accept;
+                            }
+                            reject
+                        }
+                    }
+
+                    Rectangle {
+                        y: parent.height - self.height;
+                        height: draft-title.has-focus ? 2px : 1px;
+                        background: draft-title.has-focus ? Theme.accent : Theme.line;
+                    }
+                }
+
+                Text {
+                    text: root.draft-when;
+                    font-size: 14px;
+                    color: Theme.text;
+                    wrap: word-wrap;
+                }
+
+                // Which calendar it goes into, of all accounts.
+                Choice {
+                    options: root.editor-calendars;
+                    current: root.draft-calendar;
+                    chosen(i) => {
+                        root.draft-calendar = i;
+                    }
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    padding-top: 4px;
+                    TextButton {
+                        text: @tr("More options");
+                        height: 36px;
+                        text-color: Theme.accent;
+                        clicked => {
+                            root.editor-from-draft(draft-title.text, root.draft-calendar);
+                        }
+                    }
+
+                    TextButton {
+                        text: @tr("Save");
+                        height: 36px;
+                        filled: true;
+                        clicked => {
+                            root.draft-save(draft-title.text, root.draft-calendar);
+                            root.close-draft();
+                        }
+                    }
+                }
+            }
+        }
+
+        // The editor. Its fields take the keyboard; what they leave reaches the
+        // window's key handler, which knows the editor is open.
+        if root.editor-visible: Rectangle {
+            background: #00000066;
+            TouchArea { }
+        }
+        if root.editor-visible: Rectangle {
+            width: Math.min(560px, root.width - 24px);
+            height: Math.min(editor-form.preferred-height, root.height - 24px);
+            background: Theme.card;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.line;
+            drop-shadow-blur: 24px;
+            drop-shadow-offset-y: 6px;
+            drop-shadow-color: #00000040;
+            clip: true;
+            accessible-role: groupbox;
+            accessible-label: root.editor-new ? @tr("New event") : @tr("Edit event");
+
+            TouchArea { }
+
+            Flickable {
+                interactive: false;
+                content-height: editor-form.preferred-height;
+
+                editor-form := VerticalLayout {
+                    padding: 20px;
+                    padding-bottom: 12px;
+                    spacing: 8px;
+
+                    Field {
+                        height: 44px;
+                        hint: @tr("Add title");
+                        text-size: 18px;
+                        take-focus: true;
+                        value: root.editor.title;
+                        edited(text) => {
+                            root.editor.title = text;
+                        }
+                    }
+
+                    EditorRow {
+                        label: @tr("Starts");
+                        Field {
+                            hint: "2026-11-17";
+                            value: root.editor.start-date;
+                            edited(text) => {
+                                root.editor.start-date = text;
+                            }
+                        }
+
+                        if !root.editor.all-day: Field {
+                            width: 110px;
+                            hint: "9:30";
+                            value: root.editor.start-time;
+                            edited(text) => {
+                                root.editor.start-time = text;
+                            }
+                        }
+                    }
+
+                    EditorRow {
+                        label: @tr("Ends");
+                        Field {
+                            hint: "2026-11-17";
+                            value: root.editor.end-date;
+                            edited(text) => {
+                                root.editor.end-date = text;
+                            }
+                        }
+
+                        if !root.editor.all-day: Field {
+                            width: 110px;
+                            hint: "10:30";
+                            value: root.editor.end-time;
+                            edited(text) => {
+                                root.editor.end-time = text;
+                            }
+                        }
+                    }
+
+                    EditorRow {
+                        label: "";
+                        CheckRow {
+                            text: @tr("All day");
+                            checked: root.editor.all-day;
+                            toggled => {
+                                root.editor.all-day = !root.editor.all-day;
+                            }
+                        }
+                    }
+
+                    EditorRow {
+                        label: @tr("Repeats");
+                        Choice {
+                            options: root.editor-custom-repeat ? [@tr("Does not repeat"), @tr("Daily"), @tr("Weekly on the same weekday"), @tr("Monthly on the same day"), @tr("Annually on the same date"), @tr("Every weekday (Monday to Friday)"), @tr("As it repeats now")] : [@tr("Does not repeat"), @tr("Daily"), @tr("Weekly on the same weekday"), @tr("Monthly on the same day"), @tr("Annually on the same date"), @tr("Every weekday (Monday to Friday)")];
+                            current: root.editor.repeat;
+                            chosen(i) => {
+                                root.editor.repeat = i;
+                            }
+                        }
+                    }
+
+                    EditorRow {
+                        label: @tr("Where");
+                        Field {
+                            hint: @tr("Add location");
+                            value: root.editor.location;
+                            edited(text) => {
+                                root.editor.location = text;
+                            }
+                        }
+                    }
+
+                    EditorRow {
+                        label: @tr("Description");
+                        Field {
+                            multiline: true;
+                            hint: @tr("Add description");
+                            value: root.editor.description;
+                            edited(text) => {
+                                root.editor.description = text;
+                            }
+                        }
+                    }
+
+                    EditorRow {
+                        label: @tr("Calendar");
+                        if root.editor-new: Choice {
+                            options: root.editor-calendars;
+                            current: root.draft-calendar;
+                            chosen(i) => {
+                                root.draft-calendar = i;
+                            }
+                        }
+                        if !root.editor-new: Text {
+                            height: 36px;
+                            text: root.editor-calendar-name;
+                            font-size: 14px;
+                            color: Theme.text;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+
+                    EditorRow {
+                        label: @tr("Colour");
+                        HorizontalLayout {
+                            alignment: start;
+                            spacing: 6px;
+                            for swatch[i] in root.editor-colors: Rectangle {
+                                width: 28px;
+                                height: 36px;
+                                accessible-role: list-item;
+                                accessible-label: i == 0 ? @tr("Calendar colour") : @tr("Colour {}", i);
+                                accessible-item-selected: root.editor.color == i;
+                                accessible-action-default => {
+                                    root.editor.color = i;
+                                }
+
+                                Rectangle {
+                                    y: (parent.height - self.height) / 2;
+                                    width: 24px;
+                                    height: 24px;
+                                    border-radius: 12px;
+                                    background: swatch;
+                                    border-width: root.editor.color == i ? 3px : 0px;
+                                    border-color: Theme.text;
+                                }
+
+                                TouchArea {
+                                    clicked => {
+                                        root.editor.color = i;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    EditorRow {
+                        label: @tr("Reminder");
+                        Choice {
+                            options: root.editor-custom-reminder ? [@tr("The calendar's usual reminders"), @tr("None"), @tr("When it starts"), @tr("5 minutes before"), @tr("10 minutes before"), @tr("15 minutes before"), @tr("30 minutes before"), @tr("1 hour before"), @tr("1 day before"), @tr("As it reminds now")] : [@tr("The calendar's usual reminders"), @tr("None"), @tr("When it starts"), @tr("5 minutes before"), @tr("10 minutes before"), @tr("15 minutes before"), @tr("30 minutes before"), @tr("1 hour before"), @tr("1 day before")];
+                            current: root.editor.reminder;
+                            chosen(i) => {
+                                root.editor.reminder = i;
+                            }
+                        }
+                    }
+
+                    EditorRow {
+                        label: @tr("Visibility");
+                        Choice {
+                            options: [@tr("The calendar's default"), @tr("Public"), @tr("Private")];
+                            current: root.editor.visibility;
+                            chosen(i) => {
+                                root.editor.visibility = i;
+                            }
+                        }
+                    }
+
+                    EditorRow {
+                        label: @tr("Shown as");
+                        Choice {
+                            options: [@tr("Busy"), @tr("Free")];
+                            current: root.editor.busy ? 0 : 1;
+                            chosen(i) => {
+                                root.editor.busy = i == 0;
+                            }
+                        }
+                    }
+
+                    if root.editor-error != "": Text {
+                        text: root.editor-error;
+                        font-size: 13px;
+                        color: Theme.danger;
+                        wrap: word-wrap;
+                    }
+
+                    HorizontalLayout {
+                        alignment: end;
+                        spacing: 4px;
+                        padding-top: 4px;
+                        TextButton {
+                            text: @tr("Cancel");
+                            height: 32px;
+                            clicked => {
+                                root.editor-visible = false;
+                            }
+                        }
+
+                        TextButton {
+                            text: @tr("Save");
+                            height: 32px;
+                            filled: true;
+                            clicked => {
+                                root.editor-save(root.editor, root.draft-calendar);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // What just happened, with the way back. Bottom left, as on the web.
+        if root.toast != "": Rectangle {
+            x: 24px;
+            y: root.height - self.height - 24px;
+            width: toast-row.preferred-width;
+            height: 48px;
+            border-radius: 4px;
+            background: #323232;
+            drop-shadow-blur: 12px;
+            drop-shadow-offset-y: 3px;
+            drop-shadow-color: #00000040;
+            accessible-role: groupbox;
+            accessible-label: root.toast;
+
+            toast-row := HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 8px;
+                spacing: 16px;
+
+                Text {
+                    text: root.toast;
+                    font-size: 14px;
+                    color: white;
+                    vertical-alignment: center;
+                }
+
+                if root.toast-undo: VerticalLayout {
+                    alignment: center;
+                    TextButton {
+                        text: @tr("Undo");
+                        height: 32px;
+                        text-color: #8ab4f8;
+                        clicked => {
+                            root.undo();
+                        }
+                    }
+                }
+            }
+        }
+
+        // A message that must be read: dims the window and waits for "OK".
+        if root.notice != "": Rectangle {
+            background: #00000066;
+            TouchArea { }
+        }
+        if root.notice != "": Rectangle {
+            width: Math.min(440px, root.width - 24px);
+            height: Math.min(notice-box.preferred-height, root.height - 24px);
+            background: Theme.card;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.line;
+            drop-shadow-blur: 24px;
+            drop-shadow-offset-y: 6px;
+            drop-shadow-color: #00000040;
+            clip: true;
+            accessible-role: groupbox;
+            accessible-label: root.notice;
+
+            notice-box := VerticalLayout {
+                padding: 24px;
+                padding-bottom: 12px;
+                spacing: 16px;
+
+                Text {
+                    text: root.notice;
+                    font-size: 14px;
+                    color: Theme.text;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    TextButton {
+                        text: @tr("OK");
+                        height: 32px;
+                        text-color: Theme.accent;
+                        clicked => {
+                            root.notice = "";
+                        }
+                    }
+                }
+            }
+        }
+
+        // Settings. Kept on this computer, for all accounts.
+        if root.settings-visible: Rectangle {
+            background: #00000066;
+            TouchArea {
+                clicked => {
+                    root.settings-visible = false;
+                }
+            }
+        }
+        if root.settings-visible: Rectangle {
+            width: Math.min(380px, root.width - 24px);
+            height: Math.min(settings-box.preferred-height, root.height - 24px);
+            background: Theme.card;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.line;
+            drop-shadow-blur: 24px;
+            drop-shadow-offset-y: 6px;
+            drop-shadow-color: #00000040;
+            clip: true;
+            accessible-role: groupbox;
+            accessible-label: @tr("Settings");
+
+            TouchArea { }
+
+            settings-box := VerticalLayout {
+                padding: 24px;
+                padding-bottom: 12px;
+                spacing: 4px;
+
+                Text {
+                    text: @tr("Settings");
+                    font-size: 18px;
+                    color: Theme.text;
+                }
+
+                Rectangle {
+                    height: 12px;
+                }
+
+                Text {
+                    text: @tr("Theme");
+                    font-size: 12px;
+                    font-weight: 500;
+                    color: Theme.text-dim;
+                }
+
+                for label[i] in [@tr("Same as the desktop"), @tr("Light"), @tr("Dark")]: RadioRow {
+                    text: label;
+                    selected: root.theme-mode == i;
+                    clicked => {
+                        root.theme-mode = i;
+                        root.theme-chosen(i);
+                    }
+                }
+
+                Rectangle {
+                    height: 8px;
+                }
+
+                Text {
+                    text: @tr("Zoom of the day columns");
+                    font-size: 12px;
+                    font-weight: 500;
+                    color: Theme.text-dim;
+                }
+
+                HorizontalLayout {
+                    alignment: start;
+                    spacing: 8px;
+                    TextButton {
+                        text: "−";
+                        width: 36px;
+                        outlined: true;
+                        accessible-label: @tr("Zoom out");
+                        clicked => {
+                            root.zoom-by(-1);
+                        }
+                    }
+
+                    Text {
+                        width: 64px;
+                        text: "\{Math.round(root.hour-h / 48px * 100)} %";
+                        font-size: 14px;
+                        color: Theme.text;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    TextButton {
+                        text: "+";
+                        width: 36px;
+                        outlined: true;
+                        accessible-label: @tr("Zoom in");
+                        clicked => {
+                            root.zoom-by(1);
+                        }
+                    }
+
+                    TextButton {
+                        text: @tr("Reset");
+                        clicked => {
+                            root.set-hour-height(48px);
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    padding-top: 8px;
+                    TextButton {
+                        text: @tr("Close");
+                        height: 32px;
+                        text-color: Theme.accent;
+                        clicked => {
+                            root.settings-visible = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Keyboard shortcuts. Until it is closed, keys do nothing else.
         if root.help-visible: TouchArea {
             clicked => {
                 root.help-visible = false;
@@ -1182,7 +2689,7 @@ export component AppWindow inherits Window {
         if root.help-visible: Rectangle {
             width: Math.min(380px, root.width - 24px);
             height: Math.min(shortcuts.preferred-height, root.height - 24px);
-            background: Theme.surface;
+            background: Theme.card;
             border-radius: 12px;
             border-width: 1px;
             border-color: Theme.line;
@@ -1219,7 +2726,15 @@ export component AppWindow inherits Window {
                     { keys: "x / 4", what: @tr("4 days view") },
                     { keys: "a / 5", what: @tr("Schedule view") },
                     { keys: "r", what: @tr("Refresh") },
+                    { keys: "c", what: @tr("Create an event") },
+                    { keys: "e", what: @tr("Edit the open event") },
+                    { keys: "Ctrl+S", what: @tr("Save in the editor") },
+                    { keys: "s", what: @tr("Settings") },
+                    { keys: "Ctrl + / −", what: @tr("Zoom the day columns (also Ctrl and the wheel)") },
+                    { keys: "Ctrl+0", what: @tr("Usual zoom") },
                     { keys: "Esc", what: @tr("Close event details") },
+                    { keys: "Delete", what: @tr("Delete the open event") },
+                    { keys: "z", what: @tr("Undo the last change") },
                     { keys: "?", what: @tr("Show or hide this list") },
                 ]: HorizontalLayout {
                     spacing: 12px;

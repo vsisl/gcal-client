@@ -3,6 +3,7 @@
 //! Started without arguments it opens the window. The commands below are a small
 //! command-line front end to the same pieces, kept for diagnosing sign-in and sync.
 
+mod editor;
 mod gui;
 mod vault;
 mod worker;
@@ -157,6 +158,35 @@ async fn logout(email: &str) -> Result<()> {
     Ok(())
 }
 
+/// Creates an event from a resource in a file, as the window would. Only in the build
+/// for automated tests of the window, which need events the window cannot make yet
+/// (repeating ones, ones with guests) in the test account.
+#[cfg(feature = "ui-testing")]
+async fn insert(email: &str, calendar_id: &str, file: &str) -> Result<()> {
+    let resource: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(file).with_context(|| format!("cannot read {file}"))?,
+    )?;
+    let mut store = open_store()?;
+    let Some(account) = store.accounts()?.into_iter().find(|a| a.email == email) else {
+        bail!("no account {email}");
+    };
+    let refresh_token = Vault::open()
+        .await?
+        .load(email)
+        .await?
+        .with_context(|| format!("{email}: not signed in"))?;
+    let client = GoogleClient::new(
+        HttpClient::new(),
+        load_config()?,
+        Endpoints::default(),
+        refresh_token,
+    );
+    let created = client.insert_event(calendar_id, &resource).await?;
+    store.apply_event(account.id, calendar_id, &created)?;
+    println!("{}", created["id"].as_str().unwrap_or_default());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -172,6 +202,8 @@ fn main() -> Result<()> {
             ["sync"] => sync().await,
             ["accounts"] => accounts(),
             ["logout", email] => logout(email).await,
+            #[cfg(feature = "ui-testing")]
+            ["insert", email, calendar_id, file] => insert(email, calendar_id, file).await,
             _ => {
                 eprintln!("{USAGE}");
                 std::process::exit(2);
