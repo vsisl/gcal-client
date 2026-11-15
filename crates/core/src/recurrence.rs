@@ -185,12 +185,54 @@ where
 }
 
 /// An event that does not repeat, as an instance if it may overlap `from..to`.
+/// A date or date-time as recurrence lines write it, without what comes before the
+/// digits and without a trailing `Z`: comparable as text within one series.
+fn digits(value: &str) -> &str {
+    let start = value.find(|c: char| c.is_ascii_digit()).unwrap_or(0);
+    value[start..].trim_end_matches(['Z', 'z'])
+}
+
+fn boundary_digits(boundary: EventTime) -> String {
+    match boundary {
+        EventTime::Timed(start) => start.format("%Y%m%dT%H%M%S").to_string(),
+        EventTime::AllDay(day) => day.format("%Y%m%d").to_string(),
+    }
+}
+
+/// The recurrence lines with the extra dates (`RDATE`) on one side of `boundary` only:
+/// those before it, or with `later` those from it on. Used when a series is cut in two,
+/// so that an extra date ends up in exactly one of the halves. Dates given in a time
+/// zone are compared as they are written, which can be off by the zone's offset; for
+/// the rare series with extra dates right at the cut that is accepted.
+pub fn split_dates(recurrence: &[String], boundary: EventTime, later: bool) -> Vec<String> {
+    let boundary = boundary_digits(boundary);
+    recurrence
+        .iter()
+        .filter_map(|line| {
+            if !line.to_ascii_uppercase().starts_with("RDATE") {
+                return Some(line.clone());
+            }
+            let (head, values) = line.split_once(':')?;
+            let kept: Vec<&str> = values
+                .split(',')
+                .filter(|value| {
+                    let value = digits(value);
+                    // A date without a time is compared with the boundary's day.
+                    let length = value.len().min(boundary.len());
+                    (value[..length] >= boundary[..length]) == later
+                })
+                .collect();
+            (!kept.is_empty()).then(|| format!("{head}:{}", kept.join(",")))
+        })
+        .collect()
+}
+
 /// The recurrence lines of a series cut short so that the occurrence that would start at
 /// `first_removed`, and every later one, no longer happens.
 ///
-/// Each rule gets an `UNTIL` just before that start in place of whatever ended it before
-/// (`COUNT` or a later `UNTIL`): in UTC for timed series and as a date for all-day ones,
-/// the two forms Google accepts.
+/// Each rule gets an `UNTIL` just before that start in place of a `COUNT` or a later
+/// `UNTIL` (an earlier one stays): in UTC for timed series and as a date for all-day
+/// ones, the two forms Google accepts. Extra dates from there on are dropped.
 pub fn end_series_before(recurrence: &[String], first_removed: EventTime) -> Vec<String> {
     let until = match first_removed {
         EventTime::Timed(start) => (start - Duration::seconds(1))
@@ -198,24 +240,32 @@ pub fn end_series_before(recurrence: &[String], first_removed: EventTime) -> Vec
             .to_string(),
         EventTime::AllDay(day) => (day - Duration::days(1)).format("%Y%m%d").to_string(),
     };
-    recurrence
+    let rules: Vec<String> = recurrence
         .iter()
         .map(|line| {
             let Some(rule) = line.strip_prefix("RRULE:") else {
                 return line.clone();
             };
+            let name = |part: &str| part.split('=').next().unwrap_or("").to_ascii_uppercase();
+            // A rule that already ends earlier keeps its own end.
+            let earlier = rule
+                .split(';')
+                .find(|part| name(part) == "UNTIL")
+                .and_then(|part| part.split_once('='))
+                .map(|(_, old)| old)
+                .filter(|old| digits(old) < digits(&until));
             let kept: Vec<&str> = rule
                 .split(';')
-                .filter(|part| {
-                    let name = part.split('=').next().unwrap_or("");
-                    !part.is_empty()
-                        && !name.eq_ignore_ascii_case("COUNT")
-                        && !name.eq_ignore_ascii_case("UNTIL")
-                })
+                .filter(|part| !part.is_empty() && name(part) != "COUNT" && name(part) != "UNTIL")
                 .collect();
-            format!("RRULE:{};UNTIL={until}", kept.join(";"))
+            format!(
+                "RRULE:{};UNTIL={}",
+                kept.join(";"),
+                earlier.unwrap_or(&until)
+            )
         })
-        .collect()
+        .collect();
+    split_dates(&rules, first_removed, false)
 }
 
 /// Rewrites one part (`NAME=value`) of every rule among recurrence lines; `change`
@@ -295,9 +345,14 @@ pub fn occurrences_before(master: &Event, before: EventTime) -> u32 {
         return 0;
     }
     let length = instant(end) - from;
+    // A COUNT counts what the rule produces, also the dates taken out again by EXDATE.
+    let mut rule_only = master.clone();
+    rule_only
+        .recurrence
+        .retain(|line| !line.to_ascii_uppercase().starts_with("EXDATE"));
     // An occurrence is listed when it overlaps the range; looking from one length
     // earlier, and counting starts, makes zero-length events count too.
-    let series = Series::new([((), master.clone())]);
+    let series = Series::new([((), rule_only)]);
     series
         .expand(from - length - Duration::seconds(1), to, |_| true)
         .iter()
@@ -981,6 +1036,50 @@ mod tests {
     }
 
     #[test]
+    fn a_cut_keeps_an_earlier_end_and_parts_the_extra_dates() {
+        let lines = |lines: &[&str]| lines.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+        let cut = EventTime::Timed(instant("2026-11-19T10:00:00Z"));
+        // Of two rules, the one that ended earlier still does.
+        assert_eq!(
+            end_series_before(
+                &lines(&[
+                    "RRULE:FREQ=DAILY;UNTIL=20261117T100000Z",
+                    "RRULE:FREQ=WEEKLY;UNTIL=20270101T100000Z"
+                ]),
+                cut,
+            ),
+            lines(&[
+                "RRULE:FREQ=DAILY;UNTIL=20261117T100000Z",
+                "RRULE:FREQ=WEEKLY;UNTIL=20261119T095959Z"
+            ])
+        );
+        // Extra dates go with the half they fall in.
+        let extra = lines(&[
+            "RRULE:FREQ=WEEKLY",
+            "RDATE:20261118T100000Z,20261121T100000Z",
+            "RDATE;VALUE=DATE:20261125",
+            "EXDATE:20261123T100000Z",
+        ]);
+        assert_eq!(
+            end_series_before(&extra, cut),
+            lines(&[
+                "RRULE:FREQ=WEEKLY;UNTIL=20261119T095959Z",
+                "RDATE:20261118T100000Z",
+                "EXDATE:20261123T100000Z"
+            ])
+        );
+        assert_eq!(
+            split_dates(&extra, cut, true),
+            lines(&[
+                "RRULE:FREQ=WEEKLY",
+                "RDATE:20261121T100000Z",
+                "RDATE;VALUE=DATE:20261125",
+                "EXDATE:20261123T100000Z"
+            ])
+        );
+    }
+
+    #[test]
     fn occurrences_before_a_date_are_counted() {
         let master = event(json!({
             "id": "m",
@@ -992,6 +1091,18 @@ mod tests {
         assert_eq!(before("2026-11-16T10:00:00Z"), 0);
         assert_eq!(before("2026-11-17T10:00:00Z"), 1);
         assert_eq!(before("2026-11-19T10:00:00Z"), 3);
+
+        // A date taken out by EXDATE still used up one of the rule's count.
+        let with_gap = event(json!({
+            "id": "m",
+            "start": {"dateTime": "2026-11-16T10:00:00Z", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-11-16T11:00:00Z", "timeZone": "UTC"},
+            "recurrence": ["RRULE:FREQ=DAILY;COUNT=5", "EXDATE:20261117T100000Z"]
+        }));
+        assert_eq!(
+            occurrences_before(&with_gap, EventTime::Timed(instant("2026-11-19T10:00:00Z"))),
+            3
+        );
 
         let all_day = event(json!({
             "id": "a",

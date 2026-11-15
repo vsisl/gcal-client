@@ -374,6 +374,21 @@ impl Store {
         Ok(())
     }
 
+    /// Whether the cache holds changed or deleted occurrences of a series.
+    pub fn has_occurrences(
+        &self,
+        account: AccountId,
+        calendar_id: &str,
+        series_id: &str,
+    ) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM events WHERE account_id = ?1
+             AND calendar_id = ?2 AND recurring_event_id = ?3)",
+            params![account, calendar_id, series_id],
+            |row| row.get(0),
+        )?)
+    }
+
     /// The complete resource of an event as Google sent it, including the fields this app
     /// does not read.
     pub fn event_json(
@@ -534,6 +549,8 @@ mod tests {
             ids
         };
         assert_eq!(ids(&store), ["m", "m_20261117T100000Z"]);
+        assert!(store.has_occurrences(account, "c", "m").unwrap());
+        assert!(!store.has_occurrences(account, "c", "other").unwrap());
         // The series is deleted; Google lists its deleted occurrence once more.
         store
             .apply_events(
