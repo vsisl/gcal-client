@@ -140,6 +140,13 @@ impl Store {
     /// at its largest size, and removing an account can free most of it.
     pub fn compact(&self) -> Result<()> {
         self.conn.execute_batch("VACUUM")?;
+        // In write-ahead mode the vacuumed database first lands in the log, and the file
+        // only shrinks when the log is folded back in; the window's connection keeps the
+        // log from being folded in on close. If that connection is reading right now this
+        // reports "busy" and does nothing, and the space comes back with a later write
+        // or when the app exits.
+        self.conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
         Ok(())
     }
 
@@ -575,6 +582,18 @@ mod tests {
             .apply_events(account, "cal", &new, Some("ev-2"), true)
             .unwrap();
         assert_eq!(ids(&store, DAY, DAY + 24 * HOUR), ["new"]);
+    }
+
+    #[test]
+    fn compacting_keeps_what_is_stored() {
+        let (mut store, account) = store_with_calendar();
+        let items = [timed("e", "2026-11-16T10:00:00Z", "2026-11-16T11:00:00Z")];
+        store
+            .apply_events(account, "cal", &items, None, true)
+            .unwrap();
+        store.compact().unwrap();
+        assert_eq!(store.calendars().unwrap().len(), 1);
+        assert_eq!(store.single_events_for_range(0, i64::MAX).unwrap().len(), 1);
     }
 
     #[test]
