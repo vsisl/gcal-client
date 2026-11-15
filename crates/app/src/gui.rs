@@ -16,7 +16,7 @@ use gcal_core::recurrence::{
 use gcal_core::schedule::{DayPart, schedule};
 use gcal_core::text::plain_text;
 use gcal_core::week::{WeekLayout, layout_days, local_day_start};
-use gcal_core::{CalendarListEntry, Event, EventTime};
+use gcal_core::{CalendarListEntry, Event, EventTime, ResponseStatus};
 use gcal_store::{Account, AccountId, Store, StoredCalendar};
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
@@ -344,6 +344,38 @@ fn own_zone_text(event: &Event, start: EventTime, end: EventTime, shown_in: Tz) 
         clock(end, own),
         own.name().replace('_', " ")
     )
+}
+
+/// A guest's answer as the window counts it: 0 none yet, 1 yes, 2 no, 3 maybe.
+fn answer_number(answer: ResponseStatus) -> i32 {
+    match answer {
+        ResponseStatus::NeedsAction => 0,
+        ResponseStatus::Accepted => 1,
+        ResponseStatus::Declined => 2,
+        ResponseStatus::Tentative => 3,
+    }
+}
+
+/// What to send to answer the invitation in `resource` for this account, and what
+/// takes it back: the list of guests with only this account's answer changed. `None`
+/// if the account is not among the guests or has given this answer already.
+fn rsvp_changes(
+    resource: &serde_json::Value,
+    answer: ResponseStatus,
+) -> Option<(serde_json::Value, serde_json::Value)> {
+    let before = resource.get("attendees")?.as_array()?;
+    let mut after = before.clone();
+    let own = after
+        .iter_mut()
+        .find(|guest| guest["self"].as_bool() == Some(true))?;
+    if own["responseStatus"].as_str() == Some(answer.as_str()) {
+        return None;
+    }
+    own["responseStatus"] = answer.as_str().into();
+    Some((
+        serde_json::json!({ "attendees": after }),
+        serde_json::json!({ "attendees": before }),
+    ))
 }
 
 fn web_link(event: &Event, account_email: &str) -> String {
@@ -1453,6 +1485,26 @@ impl View {
                     can_edit: can_move(event, &calendar.entry),
                     repeating: event.is_recurring_master() || event.recurring_event_id.is_some(),
                     notify_guests: event.has_guests_to_notify(),
+                    guests: ModelRc::from(Rc::new(VecModel::from(
+                        event
+                            .attendees
+                            .iter()
+                            .map(|guest| Guest {
+                                name: guest.name().into(),
+                                status: answer_number(guest.response_status),
+                                organizer: guest.organizer,
+                                optional: guest.optional,
+                            })
+                            .collect::<Vec<_>>(),
+                    ))),
+                    meet: event.hangout_link.as_deref().unwrap_or("").into(),
+                    // An answer is given in the account's own calendar.
+                    rsvp: match event.own_invitation() {
+                        Some(own) if calendar.entry.is_writable() => {
+                            answer_number(own.response_status)
+                        }
+                        _ => -1,
+                    },
                 }
             })
             .collect();
@@ -1717,6 +1769,39 @@ impl View {
         if scope == Scope::This {
             self.draw_drag(drag);
         }
+    }
+
+    /// Answers the invitation to the event behind an instance. For an occurrence of a
+    /// series that was not changed on its own, the answer is for the whole series.
+    fn rsvp(&self, instance: usize, answer: ResponseStatus) {
+        let Some(target) = self.targets.borrow().get(instance).cloned() else {
+            return;
+        };
+        let (own, series) = match self.resources(&target) {
+            Ok(resources) => resources,
+            Err(error) => return self.show_error(&error),
+        };
+        let changed = target.occurrence.as_ref().is_none_or(|o| o.changed);
+        let Some(resource) = (if changed { own } else { series }) else {
+            return;
+        };
+        let (Some(event_id), Some((changes, before))) =
+            (resource["id"].as_str(), rsvp_changes(&resource, answer))
+        else {
+            return;
+        };
+        self.send_edit(
+            &target,
+            Edit::Event {
+                event_id: event_id.to_owned(),
+                etag: resource["etag"].as_str().map(str::to_owned),
+                changes,
+            },
+            Some(UndoKind::Patch {
+                event_id: event_id.to_owned(),
+                changes: before,
+            }),
+        );
     }
 
     /// Sends a change to Google and remembers how to take it back.
@@ -2443,6 +2528,17 @@ pub fn run() -> Result<()> {
         let view = view.clone();
         move |changed, occurrence, etag| view.change_finished(changed, &occurrence, &etag)
     });
+    ui.on_rsvp({
+        let view = view.clone();
+        move |instance, answer| {
+            let answer = match answer {
+                1 => ResponseStatus::Accepted,
+                2 => ResponseStatus::Declined,
+                _ => ResponseStatus::Tentative,
+            };
+            view.rsvp(instance as usize, answer);
+        }
+    });
     ui.on_editor_requested({
         let view = view.clone();
         move |instance| view.open_editor(instance as usize)
@@ -2820,6 +2916,40 @@ mod tests {
         assert_eq!(own_zone_text(&event("Not/AZone"), start, end, prague), "");
         let day = EventTime::AllDay(date("2026-11-17"));
         assert_eq!(own_zone_text(&event("Asia/Tokyo"), day, day, prague), "");
+    }
+
+    #[test]
+    fn answering_changes_only_this_accounts_entry() {
+        use serde_json::json;
+        let event = json!({
+            "id": "e",
+            "attendees": [
+                {"email": "boss@x.org", "organizer": true, "responseStatus": "accepted"},
+                {"email": "me@x.org", "self": true, "responseStatus": "needsAction", "comment": "hm"}
+            ]
+        });
+        let (changes, before) = rsvp_changes(&event, ResponseStatus::Declined).unwrap();
+        assert_eq!(
+            changes,
+            json!({"attendees": [
+                {"email": "boss@x.org", "organizer": true, "responseStatus": "accepted"},
+                {"email": "me@x.org", "self": true, "responseStatus": "declined", "comment": "hm"}
+            ]})
+        );
+        assert_eq!(before, json!({"attendees": event["attendees"]}));
+        // The same answer again, or an event this account is not a guest of: nothing.
+        assert_eq!(rsvp_changes(&event, ResponseStatus::NeedsAction), None);
+        assert_eq!(
+            rsvp_changes(&json!({"id": "e"}), ResponseStatus::Accepted),
+            None
+        );
+        assert_eq!(
+            rsvp_changes(
+                &json!({"id": "e", "attendees": [{"email": "a@x.org"}]}),
+                ResponseStatus::Accepted
+            ),
+            None
+        );
     }
 
     #[test]

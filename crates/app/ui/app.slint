@@ -35,6 +35,15 @@ export struct AllDayItem {
     text-color: color,
 }
 
+// One guest of an event.
+export struct Guest {
+    name: string,
+    // 0 has not answered, 1 yes, 2 no, 3 maybe.
+    status: int,
+    organizer: bool,
+    optional: bool,
+}
+
 export struct EventDetail {
     title: string,
     when: string,
@@ -55,6 +64,12 @@ export struct EventDetail {
     repeating: bool,
     // The account invited guests, who can be told about a deletion.
     notify-guests: bool,
+    // Who is invited, and the address of the video meeting, if any.
+    guests: [Guest],
+    meet: string,
+    // This account's own answer to the invitation: 0 none yet, 1 yes, 2 no, 3 maybe;
+    // -1 when it is not invited (or cannot answer here).
+    rsvp: int,
 }
 
 // A day of the month view.
@@ -604,6 +619,8 @@ export component AppWindow inherits Window {
     // with delete-finished, naming the occurrence it removed if it was a single one.
     callback delete-event(int, int, bool);
     callback delete-finished(bool, string);
+    // Answers the invitation to the event behind an instance: 1 yes, 2 no, 3 maybe.
+    callback rsvp(int, int);
     // An event was dragged: by how many days and minutes; or its lower edge, by how
     // many minutes. The worker answers with change-finished.
     callback event-moved(int, int, int);
@@ -2284,6 +2301,85 @@ export component AppWindow inherits Window {
                     }
                 }
 
+                if root.detail.meet != "": HorizontalLayout {
+                    alignment: start;
+                    TextButton {
+                        text: @tr("Join the video meeting");
+                        height: 34px;
+                        filled: true;
+                        clicked => {
+                            root.open-link(root.detail.meet);
+                        }
+                    }
+                }
+                if root.detail.guests.length > 0: VerticalLayout {
+                    spacing: 2px;
+
+                    Text {
+                        text: root.detail.guests.length == 1 ? @tr("1 guest") : @tr("{} guests", root.detail.guests.length);
+                        font-size: 12px;
+                        font-weight: 500;
+                        color: Theme.text-dim;
+                    }
+
+                    Flickable {
+                        height: Math.min(6, root.detail.guests.length) * 24px;
+                        interactive: false;
+                        content-height: root.detail.guests.length * 24px;
+
+                        for guest[i] in root.detail.guests: Rectangle {
+                            y: i * 24px;
+                            height: 24px;
+                            accessible-role: list-item;
+                            accessible-label: "\{guest.name}, \{guest.status == 1 ? @tr("yes") : guest.status == 2 ? @tr("no") : guest.status == 3 ? @tr("maybe") : @tr("no answer yet")}";
+
+                            // Green for yes, red for no, hollow while unanswered or unsure.
+                            Rectangle {
+                                x: 2px;
+                                y: (parent.height - self.height) / 2;
+                                width: 10px;
+                                height: 10px;
+                                border-radius: 5px;
+                                border-width: 2px;
+                                border-color: guest.status == 1 ? #34a853 : guest.status == 2 ? Theme.danger : Theme.text-dim;
+                                background: guest.status == 1 ? #34a853 : guest.status == 2 ? Theme.danger : transparent;
+                            }
+
+                            Text {
+                                x: 22px;
+                                width: parent.width - 22px;
+                                height: parent.height;
+                                text: guest.organizer ? @tr("{} (organiser)", guest.name) : guest.optional ? @tr("{} (optional)", guest.name) : guest.status == 3 ? @tr("{} (maybe)", guest.name) : guest.name;
+                                font-size: 13px;
+                                color: Theme.text;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                }
+                if root.detail.rsvp >= 0 && !root.offline: HorizontalLayout {
+                    spacing: 6px;
+                    alignment: start;
+
+                    Text {
+                        text: @tr("Going?");
+                        font-size: 13px;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                    }
+
+                    for answer[i] in [@tr("Yes"), @tr("No"), @tr("Maybe")]: TextButton {
+                        text: answer;
+                        height: 30px;
+                        outlined: true;
+                        filled: root.detail.rsvp == i + 1;
+                        clicked => {
+                            root.rsvp(root.detail-instance, i + 1);
+                            root.detail-visible = false;
+                        }
+                    }
+                }
                 if root.detail.location != "": Text {
                     text: root.detail.location;
                     font-size: 13px;

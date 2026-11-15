@@ -91,11 +91,57 @@ impl EventTime {
     }
 }
 
-/// A guest of an event. Only what the app reads so far.
+/// A guest's answer to an invitation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ResponseStatus {
+    #[default]
+    NeedsAction,
+    Accepted,
+    Declined,
+    Tentative,
+}
+
+impl ResponseStatus {
+    /// As Google's API writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ResponseStatus::NeedsAction => "needsAction",
+            ResponseStatus::Accepted => "accepted",
+            ResponseStatus::Declined => "declined",
+            ResponseStatus::Tentative => "tentative",
+        }
+    }
+}
+
+/// A guest of an event.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Attendee {
     pub email: Option<String>,
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub response_status: ResponseStatus,
+    /// Whether it is the account the event was fetched for.
+    #[serde(rename = "self", default)]
+    pub is_self: bool,
+    #[serde(default)]
+    pub organizer: bool,
+    #[serde(default)]
+    pub optional: bool,
+    /// A room or a piece of equipment rather than a person.
+    #[serde(default)]
+    pub resource: bool,
+}
+
+impl Attendee {
+    /// The name to show: the guest's own, else the address.
+    pub fn name(&self) -> &str {
+        self.display_name
+            .as_deref()
+            .or(self.email.as_deref())
+            .unwrap_or("")
+    }
 }
 
 /// Who an event belongs to. Only what the app reads so far.
@@ -129,6 +175,8 @@ pub struct Event {
     #[serde(default)]
     pub attendees: Vec<Attendee>,
     pub organizer: Option<Organizer>,
+    /// The address of the event's video meeting, if it has one.
+    pub hangout_link: Option<String>,
     /// RRULE/EXDATE/RDATE lines; present only on the master event of a series.
     #[serde(default)]
     pub recurrence: Vec<String>,
@@ -153,6 +201,11 @@ impl Event {
 
     pub fn is_recurring_master(&self) -> bool {
         !self.recurrence.is_empty()
+    }
+
+    /// This account's own entry among the guests, if it was invited.
+    pub fn own_invitation(&self) -> Option<&Attendee> {
+        self.attendees.iter().find(|guest| guest.is_self)
     }
 
     /// Whether this account invited guests to the event, who would want to hear of a
@@ -221,6 +274,43 @@ mod tests {
             !event(r#"{"id": "a", "organizer": {"email": "me@x.org", "self": true}}"#)
                 .has_guests_to_notify()
         );
+    }
+
+    #[test]
+    fn guests_are_read_with_their_answers() {
+        let event: Event = serde_json::from_str(
+            r#"{"id": "a", "hangoutLink": "https://meet.google.com/abc-defg-hij",
+                "attendees": [
+                  {"email": "boss@x.org", "displayName": "The Boss", "organizer": true,
+                   "responseStatus": "accepted"},
+                  {"email": "me@x.org", "self": true, "responseStatus": "tentative"},
+                  {"email": "room@x.org", "resource": true, "responseStatus": "declined"},
+                  {"email": "new@x.org"}
+                ]}"#,
+        )
+        .unwrap();
+        let names: Vec<_> = event.attendees.iter().map(Attendee::name).collect();
+        assert_eq!(names, ["The Boss", "me@x.org", "room@x.org", "new@x.org"]);
+        let answers: Vec<_> = event.attendees.iter().map(|g| g.response_status).collect();
+        assert_eq!(
+            answers,
+            [
+                ResponseStatus::Accepted,
+                ResponseStatus::Tentative,
+                ResponseStatus::Declined,
+                ResponseStatus::NeedsAction
+            ]
+        );
+        assert_eq!(
+            event.own_invitation().unwrap().email.as_deref(),
+            Some("me@x.org")
+        );
+        assert!(event.attendees[2].resource && event.attendees[0].organizer);
+        assert_eq!(
+            event.hangout_link.as_deref(),
+            Some("https://meet.google.com/abc-defg-hij")
+        );
+        assert_eq!(ResponseStatus::Tentative.as_str(), "tentative");
     }
 
     #[test]
