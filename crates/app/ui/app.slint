@@ -636,13 +636,22 @@ export component AppWindow inherits Window {
     // at its start and is dropped if it has changed by its end: the block dragged may
     // then stand for another event.
     in property <int> generation;
-    // A repeating event was dragged: the question card asks how much of the series is
-    // meant and answers with edit-scope-chosen (0 this, 1 this and following, 2 all).
+    // A repeating event, or one with guests, was changed: the question card asks how
+    // much of the series is meant (0 this, 1 this and following, 2 all) and whether the
+    // guests are to be told, and answers with edit-scope-chosen.
     property <bool> ask-edit;
-    callback edit-scope-chosen(int);
-    public function ask-edit-scope() {
+    property <bool> ask-repeating;
+    property <bool> ask-guests;
+    // What the open question offers, whether it is about a change or a deletion.
+    property <bool> ask-has-scope: root.ask-edit ? root.ask-repeating : root.detail.repeating;
+    property <bool> ask-has-guests: root.ask-edit ? root.ask-guests : root.detail.notify-guests;
+    callback edit-scope-chosen(int, bool);
+    public function ask-edit-scope(repeating: bool, guests: bool) {
         root.detail-visible = false;
         root.delete-scope = 0;
+        root.ask-repeating = repeating;
+        root.ask-guests = guests;
+        root.delete-notify = guests;
         root.ask-edit = true;
         root.delete-ask-visible = true;
     }
@@ -650,7 +659,7 @@ export component AppWindow inherits Window {
     function confirm-ask() {
         if (root.ask-edit) {
             root.delete-ask-visible = false;
-            root.edit-scope-chosen(root.delete-scope);
+            root.edit-scope-chosen(root.delete-scope, root.delete-notify);
         } else {
             root.delete-event(root.detail-instance, root.delete-scope, root.delete-notify);
         }
@@ -802,9 +811,9 @@ export component AppWindow inherits Window {
                     root.delete-ask-visible = false;
                 } else if (event.text == Key.Return) {
                     root.confirm-ask();
-                } else if (event.text == Key.DownArrow && (root.ask-edit || root.detail.repeating)) {
+                } else if (event.text == Key.DownArrow && root.ask-has-scope) {
                     root.delete-scope = Math.min(2, root.delete-scope + 1);
-                } else if (event.text == Key.UpArrow && (root.ask-edit || root.detail.repeating)) {
+                } else if (event.text == Key.UpArrow && root.ask-has-scope) {
                     root.delete-scope = Math.max(0, root.delete-scope - 1);
                 }
                 return accept;
@@ -2460,7 +2469,7 @@ export component AppWindow inherits Window {
                 spacing: 6px;
 
                 delete-title := Text {
-                    text: root.ask-edit ? @tr("Edit repeating event") : root.detail.repeating ? @tr("Delete repeating event") : @tr("Delete event");
+                    text: root.ask-edit ? (root.ask-repeating ? @tr("Edit repeating event") : @tr("Edit event")) : root.detail.repeating ? @tr("Delete repeating event") : @tr("Delete event");
                     font-size: 18px;
                     color: Theme.text;
                 }
@@ -2469,7 +2478,7 @@ export component AppWindow inherits Window {
                     height: 8px;
                 }
 
-                if root.ask-edit || root.detail.repeating: VerticalLayout {
+                if root.ask-has-scope: VerticalLayout {
                     for label[i] in [@tr("This event"), @tr("This and following events"), @tr("All events")]: RadioRow {
                         text: label;
                         selected: root.delete-scope == i;
@@ -2478,7 +2487,7 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                if !root.ask-edit && root.detail.notify-guests: Rectangle {
+                if root.ask-has-guests: Rectangle {
                     height: 36px;
                     border-radius: 4px;
                     background: notify-touch.has-hover ? Theme.hover : transparent;
@@ -2509,7 +2518,7 @@ export component AppWindow inherits Window {
                     notify-label := Text {
                         x: 40px;
                         height: parent.height;
-                        text: @tr("Send cancellation e-mails to guests");
+                        text: root.ask-edit ? @tr("Send update e-mails to guests") : @tr("Send cancellation e-mails to guests");
                         font-size: 14px;
                         color: Theme.text;
                         vertical-alignment: center;

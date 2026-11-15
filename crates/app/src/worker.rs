@@ -4,7 +4,7 @@
 //! cache changed or something is worth telling the user, the worker posts back to the
 //! window's event loop.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -50,6 +50,8 @@ pub enum Command {
         account: AccountId,
         calendar_id: String,
         edit: Edit,
+        /// Whether Google is to tell the event's guests.
+        notify: bool,
     },
     /// Changes fields of an event to take an earlier change back; with an `etag`, only
     /// if nothing else changed it since.
@@ -175,6 +177,9 @@ struct Worker {
     /// earlier attempt (the user may have closed its tab): an attempt gives up as soon as
     /// this no longer holds its own number.
     sign_in_attempt: Rc<watch::Sender<u64>>,
+    /// Whether the change being made is to be told to the event's guests. Changes run
+    /// one at a time, so this belongs to the one that is running.
+    notify: Rc<Cell<bool>>,
     /// Held while accounts are synced or removed, so the two never interleave.
     cache: Rc<Mutex<()>>,
 }
@@ -215,6 +220,7 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
         http,
         activity: Rc::default(),
         sign_in_attempt: Rc::new(watch::Sender::new(0)),
+        notify: Rc::default(),
         cache: Rc::default(),
     };
     while let Some(command) = commands.recv().await {
@@ -271,8 +277,11 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
                     account,
                     calendar_id,
                     edit,
+                    notify,
                 } => {
+                    worker.notify.set(notify);
                     let changed = worker.edit_event(account, &calendar_id, edit).await;
+                    worker.notify.set(false);
                     // The window may have drawn the change already and takes it back on
                     // failure; to undo a change to one occurrence it needs to know
                     // which event that is.
@@ -708,7 +717,9 @@ impl Worker {
                     return Ok((String::new(), String::new()));
                 };
                 // The second half did not come into being, and the first must not stay
-                // cut: its later occurrences would simply be gone. Give it its rule back.
+                // cut: its later occurrences would simply be gone. Give it its rule back
+                // (without a second round of e-mails to the guests).
+                self.notify.set(false);
                 let restored = self
                     .patch_event(
                         account,
@@ -743,7 +754,7 @@ impl Worker {
         let mut store = open_store()?;
         let client = self.account_client(&store, account).await?;
         let answer = client
-            .patch_event(calendar_id, event_id, &changes, etag, false)
+            .patch_event(calendar_id, event_id, &changes, etag, self.notify.get())
             .await;
         let Some(changed) = self.written(answer).await? else {
             let _ = self.sync_accounts().await;

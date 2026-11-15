@@ -484,6 +484,8 @@ struct Target {
     occurrence: Option<Occurrence>,
     /// Whether it can be dragged to another time.
     movable: bool,
+    /// Whether this account invited guests to it, who can be told of a change.
+    guests: bool,
     /// When this instance starts and ends.
     start: EventTime,
     end: EventTime,
@@ -606,12 +608,13 @@ fn plan_drag(
     ))
 }
 
-/// Whether the event can be moved and resized by dragging. Not yet: events with guests
-/// (who would have to be told); never the special kinds of entry (birthdays, ...).
+/// Whether the event can be changed in the app: dragged, resized, opened in the
+/// editor. An event with guests only by the account that invited them (a guest's copy
+/// would drift from the organiser's); never the special kinds of entry (birthdays, ...).
 fn can_move(event: &Event, calendar: &CalendarListEntry) -> bool {
     calendar.is_writable()
         && matches!(event.event_type.as_deref(), None | Some("default"))
-        && event.attendees.is_empty()
+        && (event.attendees.is_empty() || event.has_guests_to_notify())
 }
 
 /// An instant moved by whole days and minutes on the local clock, so that a move across
@@ -1546,6 +1549,7 @@ impl View {
                     etag: instance.event.etag.clone(),
                     occurrence: occurrence_of(instance.event, instance.start),
                     movable: can_move(instance.event, &calendar.entry),
+                    guests: instance.event.has_guests_to_notify(),
                     start: instance.start,
                     end: instance.end,
                 }
@@ -1766,19 +1770,21 @@ impl View {
         if !target.movable {
             return;
         }
-        if target.occurrence.is_some() {
+        // How much of a series, and whether the guests are told: asked where there is
+        // a choice.
+        if target.occurrence.is_some() || target.guests {
             self.asked.replace(Some(Asked::Drag(drag)));
             if let Some(ui) = self.ui.upgrade() {
-                ui.invoke_ask_edit_scope();
+                ui.invoke_ask_edit_scope(target.occurrence.is_some(), target.guests);
             }
         } else {
-            self.send_drag(drag, Scope::This);
+            self.send_drag(drag, Scope::This, false);
         }
     }
 
     /// Sends a drag to Google. The undo is prepared from the cache before anything is
     /// sent.
-    fn send_drag(&self, drag: Drag, scope: Scope) {
+    fn send_drag(&self, drag: Drag, scope: Scope, notify: bool) {
         let Some(target) = self.targets.borrow().get(drag.instance).cloned() else {
             return;
         };
@@ -1800,7 +1806,7 @@ impl View {
         let Some((edit, undo)) = plan_drag(&target, scope, drag, own, series, self.zone) else {
             return;
         };
-        self.send_edit(&target, edit, undo);
+        self.send_edit(&target, edit, undo, notify);
         if scope == Scope::This {
             self.draw_drag(drag);
         }
@@ -1836,11 +1842,13 @@ impl View {
                 event_id: event_id.to_owned(),
                 changes: before,
             }),
+            // The organiser sees the answer in the event; no e-mail on top.
+            false,
         );
     }
 
     /// Sends a change to Google and remembers how to take it back.
-    fn send_edit(&self, target: &Target, edit: Edit, undo: Option<UndoKind>) {
+    fn send_edit(&self, target: &Target, edit: Edit, undo: Option<UndoKind>, notify: bool) {
         self.pending.borrow_mut().push_back(Pending {
             undo: undo.map(|kind| Undo {
                 account: target.account,
@@ -1857,6 +1865,7 @@ impl View {
             account: target.account,
             calendar_id: target.calendar_id.clone(),
             edit,
+            notify,
         });
     }
 
@@ -2016,11 +2025,12 @@ impl View {
             own: editing.own,
             series: editing.series,
         };
-        if saved.target.occurrence.is_some() {
+        let (repeating, guests) = (saved.target.occurrence.is_some(), saved.target.guests);
+        if repeating || guests {
             self.asked.replace(Some(Asked::Form(Box::new(saved))));
-            ui.invoke_ask_edit_scope();
+            ui.invoke_ask_edit_scope(repeating, guests);
         } else {
-            self.send_form(saved, Scope::This);
+            self.send_form(saved, Scope::This, false);
         }
     }
 
@@ -2030,7 +2040,7 @@ impl View {
     }
 
     /// Sends what the editor changed, for as much of a series as was chosen.
-    fn send_form(&self, saved: Saved, scope: Scope) {
+    fn send_form(&self, saved: Saved, scope: Scope, notify: bool) {
         match plan_form(
             &saved,
             scope,
@@ -2038,7 +2048,7 @@ impl View {
             saved.series.clone(),
             self.zone,
         ) {
-            Ok(Some((edit, undo))) => self.send_edit(&saved.target, edit, undo),
+            Ok(Some((edit, undo))) => self.send_edit(&saved.target, edit, undo, notify),
             Ok(None) => {}
             Err(problem) => {
                 if let Some(ui) = self.ui.upgrade() {
@@ -2588,15 +2598,15 @@ pub fn run() -> Result<()> {
     });
     ui.on_edit_scope_chosen({
         let view = view.clone();
-        move |scope| {
+        move |scope, notify| {
             let scope = match scope {
                 1 => Scope::Following,
                 2 => Scope::All,
                 _ => Scope::This,
             };
             match view.asked.take() {
-                Some(Asked::Drag(drag)) => view.send_drag(drag, scope),
-                Some(Asked::Form(saved)) => view.send_form(*saved, scope),
+                Some(Asked::Drag(drag)) => view.send_drag(drag, scope, notify),
+                Some(Asked::Form(saved)) => view.send_form(*saved, scope, notify),
                 None => {}
             }
         }
@@ -3057,6 +3067,13 @@ mod tests {
         ] {
             assert!(can_move(&event(repeating), &owner));
         }
+        // With guests: only the one who invited them.
+        assert!(can_move(
+            &event(serde_json::json!({
+                "organizer": {"self": true}, "attendees": [{"email": "a@example.com"}]
+            })),
+            &owner
+        ));
         for other in [
             serde_json::json!({"attendees": [{"email": "a@example.com"}]}),
             serde_json::json!({"eventType": "birthday"}),
@@ -3139,6 +3156,7 @@ mod tests {
                 changed: false,
             }),
             movable: true,
+            guests: false,
             start: instant("2026-11-23T10:00:00Z"),
             end: instant("2026-11-23T11:00:00Z"),
         };
@@ -3276,6 +3294,7 @@ mod tests {
             etag: Some("\"own\"".into()),
             occurrence,
             movable: false,
+            guests: false,
             start: instant("2026-11-18T10:00:00Z"),
             end: instant("2026-11-18T11:00:00Z"),
         };

@@ -33,3 +33,18 @@ time.sleep(1)
 call("click_element", elementHandle=items("AT invite")[0]); time.sleep(0.5)
 shot("rsvp-answered")
 key(ESC)
+
+# The organiser may change an event with guests; it asks whether to tell them.
+guests_before = named("AT invite")[0]["attendees"]
+call("click_element", elementHandle=items("AT invite")[0]); time.sleep(0.5)
+key("e"); time.sleep(0.5)
+key(" "); key("2")
+click("Button", "Save"); time.sleep(0.5)
+shot("rsvp-edit-ask")
+asked = [label(h) for h in find("Checkbox")]
+print("   asked:", asked)
+wait("the question offers to tell the guests", lambda: "Send update e-mails to guests" in asked)
+# Not for a made-up address.
+click("Checkbox", "Send update e-mails to guests")
+key(ENTER)
+wait("renamed at Google, guests as they were", lambda: len(named("AT invite 2")) == 1 and named("AT invite 2")[0]["attendees"] == guests_before)
