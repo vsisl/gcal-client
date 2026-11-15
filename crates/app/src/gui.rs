@@ -37,6 +37,8 @@ const NEW_EVENT_CALENDAR: &str = "new_event_calendar";
 /// Setting: light or dark, as the number the window uses (0 as the desktop, 1 light,
 /// 2 dark).
 const THEME: &str = "theme";
+/// Setting: the height of an hour in the day columns, in pixels (the zoom).
+const HOUR_HEIGHT: &str = "hour_height";
 /// How long "Undo" stays on offer after a deletion.
 const UNDO_PERIOD: StdDuration = StdDuration::from_secs(10);
 /// The sidebar's small month always shows six weeks.
@@ -1925,6 +1927,22 @@ pub fn run() -> Result<()> {
 
     let theme = view.store.setting(THEME).ok().flatten();
     ui.set_theme_mode(theme.and_then(|mode| mode.parse().ok()).unwrap_or(0));
+    if let Some(height) = view
+        .store
+        .setting(HOUR_HEIGHT)
+        .ok()
+        .flatten()
+        .and_then(|height| height.parse::<f32>().ok())
+    {
+        // The window keeps its own limits; this only guards against nonsense.
+        ui.set_hour_h(height.clamp(20.0, 192.0));
+    }
+    ui.on_zoom_changed({
+        let view = view.clone();
+        move |height| {
+            let _ = view.store.set_setting(HOUR_HEIGHT, &height.to_string());
+        }
+    });
     ui.on_theme_chosen({
         let view = view.clone();
         move |mode| {

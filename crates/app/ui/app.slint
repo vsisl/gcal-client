@@ -662,7 +662,23 @@ export component AppWindow inherits Window {
     // Raised from the background worker when the cache changed.
     callback data-changed();
 
-    property <length> hour-h: 48px;
+    // The height of an hour in the day columns: the zoom. Changed with Ctrl and the
+    // wheel, Ctrl and + or -, or in the settings; Rust remembers it.
+    in-out property <length> hour-h: 48px;
+    callback zoom-changed(float);
+    property <float> zoom-centre;
+
+    // Sets the height of an hour, keeping the time in the middle of the screen there.
+    function set-hour-height(height: length) {
+        root.zoom-centre = (grid.height / 2 - grid.content-y) / root.hour-h;
+        root.hour-h = Math.max(20px, Math.min(192px, height));
+        grid.content-y = -Math.max(0px, Math.min(root.hour-h * 24 - grid.height, root.zoom-centre * root.hour-h - grid.height / 2));
+        root.zoom-changed(root.hour-h / 1px);
+    }
+
+    function zoom-by(steps: int) {
+        root.set-hour-height(steps > 0 ? root.hour-h * 1.25 : root.hour-h * 0.8);
+    }
     property <length> gutter: 56px;
     property <length> head-h: 80px;
     property <length> bar-h: 22px;
@@ -686,6 +702,18 @@ export component AppWindow inherits Window {
                 } else if (event.modifiers.control && (event.text == "s" || event.text == Key.Return)) {
                     root.editor-save(root.editor, root.draft-calendar);
                 }
+                return accept;
+            }
+            if (event.modifiers.control && (event.text == "+" || event.text == "=")) {
+                root.zoom-by(1);
+                return accept;
+            }
+            if (event.modifiers.control && event.text == "-") {
+                root.zoom-by(-1);
+                return accept;
+            }
+            if (event.modifiers.control && event.text == "0") {
+                root.set-hour-height(48px);
                 return accept;
             }
             if (event.modifiers.control || event.modifiers.alt || event.modifiers.meta) {
@@ -1293,6 +1321,13 @@ export component AppWindow inherits Window {
                                 x: gutter;
                                 width: parent.width - gutter;
                                 height: hour-h * 24;
+                                scroll-event(event) => {
+                                    if (event.modifiers.control) {
+                                        root.zoom-by(event.delta-y > 0 ? 1 : -1);
+                                        return accept;
+                                    }
+                                    reject
+                                }
                                 // A click is an hour from the half hour clicked; a drag
                                 // marks the time out in quarters of an hour.
                                 pointer-event(event) => {
@@ -1379,6 +1414,13 @@ export component AppWindow inherits Window {
 
                                 TouchArea {
                                     mouse-cursor: pointer;
+                                    scroll-event(event) => {
+                                        if (event.modifiers.control) {
+                                            root.zoom-by(event.delta-y > 0 ? 1 : -1);
+                                            return accept;
+                                        }
+                                        reject
+                                    }
                                     pointer-event(event) => {
                                         if (event.button != PointerEventButton.left) {
                                             return;
@@ -1442,7 +1484,8 @@ export component AppWindow inherits Window {
                                     width: parent.width - 8px;
                                     height: parent.height;
                                     text: "\{parent.shown-title}, \{item.time}";
-                                    font-size: parent.height < 16px ? 10px : 12px;
+                                    // Zoomed far out, a short event is only a few pixels high.
+                                    font-size: Math.min(12px, Math.max(7px, parent.height - 3px));
                                     color: item.text-color;
                                     vertical-alignment: center;
                                     overflow: elide;
@@ -2518,6 +2561,57 @@ export component AppWindow inherits Window {
                     }
                 }
 
+                Rectangle {
+                    height: 8px;
+                }
+
+                Text {
+                    text: @tr("Zoom of the day columns");
+                    font-size: 12px;
+                    font-weight: 500;
+                    color: Theme.text-dim;
+                }
+
+                HorizontalLayout {
+                    alignment: start;
+                    spacing: 8px;
+                    TextButton {
+                        text: "−";
+                        width: 36px;
+                        outlined: true;
+                        accessible-label: @tr("Zoom out");
+                        clicked => {
+                            root.zoom-by(-1);
+                        }
+                    }
+
+                    Text {
+                        width: 64px;
+                        text: "\{Math.round(root.hour-h / 48px * 100)} %";
+                        font-size: 14px;
+                        color: Theme.text;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    TextButton {
+                        text: "+";
+                        width: 36px;
+                        outlined: true;
+                        accessible-label: @tr("Zoom in");
+                        clicked => {
+                            root.zoom-by(1);
+                        }
+                    }
+
+                    TextButton {
+                        text: @tr("Reset");
+                        clicked => {
+                            root.set-hour-height(48px);
+                        }
+                    }
+                }
+
                 HorizontalLayout {
                     alignment: end;
                     padding-top: 8px;
@@ -2584,6 +2678,8 @@ export component AppWindow inherits Window {
                     { keys: "e", what: @tr("Edit the open event") },
                     { keys: "Ctrl+S", what: @tr("Save in the editor") },
                     { keys: "s", what: @tr("Settings") },
+                    { keys: "Ctrl + / −", what: @tr("Zoom the day columns (also Ctrl and the wheel)") },
+                    { keys: "Ctrl+0", what: @tr("Usual zoom") },
                     { keys: "Esc", what: @tr("Close event details") },
                     { keys: "Delete", what: @tr("Delete the open event") },
                     { keys: "z", what: @tr("Undo the last change") },
