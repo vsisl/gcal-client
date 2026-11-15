@@ -102,6 +102,7 @@ impl GoogleClient {
             &["users", "me", "calendarList"],
             &[("maxResults", "250")],
             sync_token,
+            &|_| (),
         )
         .await
     }
@@ -111,15 +112,20 @@ impl GoogleClient {
     /// Series are returned as one master event plus its changed occurrences rather than
     /// expanded, so the result stays small and a sync token can be used. The parameters must
     /// be identical on every call for the token to remain valid.
+    ///
+    /// A large calendar arrives in many pages; `fetched` is told after each how many
+    /// events have come so far, for showing that something is happening.
     pub async fn list_events(
         &self,
         calendar_id: &str,
         sync_token: Option<&str>,
+        fetched: &dyn Fn(usize),
     ) -> Result<Listing, ApiError> {
         self.list(
             &["calendars", calendar_id, "events"],
             &[("maxResults", "2500"), ("singleEvents", "false")],
             sync_token,
+            fetched,
         )
         .await
     }
@@ -129,6 +135,7 @@ impl GoogleClient {
         path: &[&str],
         params: &[(&str, &str)],
         sync_token: Option<&str>,
+        fetched: &dyn Fn(usize),
     ) -> Result<Listing, ApiError> {
         let mut items = Vec::new();
         let mut page_token: Option<String> = None;
@@ -142,6 +149,7 @@ impl GoogleClient {
             }
             let page: Page = self.get(path, &query).await?;
             items.extend(page.items);
+            fetched(items.len());
             match page.next_page_token {
                 Some(next) => page_token = Some(next),
                 // The sync token arrives only on the last page.
@@ -233,6 +241,7 @@ impl GoogleClient {
                 &["calendars", calendar_id, "events", series_id, "instances"],
                 &[("timeMin", &from), ("timeMax", &to), ("maxResults", "250")],
                 None,
+                &|_| (),
             )
             .await
             .map_err(gone_if_missing)?;
@@ -404,11 +413,16 @@ mod tests {
             .mount(&server)
             .await;
 
+        let counts = std::cell::RefCell::new(Vec::new());
         let listing = client(&server)
             .await
-            .list_events("team@example.com", None)
+            .list_events("team@example.com", None, &|so_far| {
+                counts.borrow_mut().push(so_far)
+            })
             .await
             .unwrap();
+        // Told after each page how many events have arrived.
+        assert_eq!(*counts.borrow(), [1, 2]);
         let ids: Vec<_> = listing
             .items
             .iter()

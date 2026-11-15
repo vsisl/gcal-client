@@ -26,6 +26,17 @@ pub struct SyncReport {
     pub failed_calendars: Vec<(String, String)>,
 }
 
+/// How far a running sync has come.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Progress {
+    /// The calendar being fetched, counted from 1, and how many the account has.
+    pub calendar: usize,
+    pub calendars: usize,
+    /// Events fetched so far, over all calendars. How many there will be, Google does
+    /// not say in advance.
+    pub events: usize,
+}
+
 /// Brings one account's calendar list and events up to date.
 ///
 /// Uses the stored sync tokens to fetch only changes. When Google rejects a token (it
@@ -35,6 +46,17 @@ pub async fn sync_account(
     store: &mut Store,
     account: AccountId,
 ) -> Result<SyncReport, SyncError> {
+    sync_account_reporting(client, store, account, &|_| ()).await
+}
+
+/// [`sync_account`], telling `progress` how far it has come after every page of events.
+/// A first sync of a large account takes minutes.
+pub async fn sync_account_reporting(
+    client: &GoogleClient,
+    store: &mut Store,
+    account: AccountId,
+    progress: &dyn Fn(Progress),
+) -> Result<SyncReport, SyncError> {
     let token = store.calendar_list_sync_token(account)?;
     let (list, full) = fetch(token.as_deref(), |t| client.list_calendars(t)).await?;
     store.apply_calendar_list(account, &list.items, list.sync_token.as_deref(), full)?;
@@ -43,16 +65,29 @@ pub async fn sync_account(
         changed: full || !list.items.is_empty(),
         ..SyncReport::default()
     };
-    for calendar in store
+    let calendars: Vec<_> = store
         .calendars()?
         .into_iter()
         .filter(|c| c.account_id == account)
-    {
+        .collect();
+    let mut events_before = 0;
+    for (position, calendar) in calendars.iter().enumerate() {
         let id = &calendar.entry.id;
+        let page_fetched = |events: usize| {
+            progress(Progress {
+                calendar: position + 1,
+                calendars: calendars.len(),
+                events: events_before + events,
+            });
+        };
+        page_fetched(0);
         let fetched = fetch(calendar.events_sync_token.as_deref(), |t| {
-            client.list_events(id, t)
+            client.list_events(id, t, &page_fetched)
         })
         .await;
+        if let Ok((events, _)) = &fetched {
+            events_before += events.items.len();
+        }
         match fetched {
             Ok((events, full)) => {
                 let applied = store.apply_events(

@@ -14,7 +14,7 @@ use gcal_google::{
     ApiError, ClientConfig, Endpoints, GoogleClient, HttpClient, SCOPE_CALENDAR, TokenSet,
 };
 use gcal_store::{AccountId, Store};
-use gcal_sync::{SyncError, SyncReport};
+use gcal_sync::{Progress, SyncError, SyncReport};
 use serde_json::Value;
 use slint::Weak;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -114,6 +114,8 @@ struct Activity {
     syncing: u32,
     /// Changes being sent to Google.
     saving: u32,
+    /// How far the running sync has come, in words; empty when there is nothing to say.
+    progress: String,
     /// The latest failure, shown until the user starts something new.
     error: Option<String>,
 }
@@ -288,7 +290,7 @@ impl Worker {
             } else if activity.saving > 0 {
                 (StatusKind::Saving, String::new())
             } else if activity.syncing > 0 {
-                (StatusKind::Syncing, String::new())
+                (StatusKind::Syncing, activity.progress.clone())
             } else if let Some(error) = &activity.error {
                 (StatusKind::Failed, error.clone())
             } else {
@@ -362,7 +364,7 @@ impl Worker {
         let mut store = open_store()?;
         let account = store.add_account(&email)?;
         self.data_changed();
-        let result = gcal_sync::sync_account(&client, &mut store, account).await;
+        let result = self.sync_account(&client, &mut store, account).await;
         if let Some(problem) = sync_problem(&email, &result) {
             bail!(problem);
         }
@@ -408,7 +410,7 @@ impl Worker {
                 continue;
             };
             let client = self.client(config.clone(), refresh_token);
-            let result = gcal_sync::sync_account(&client, &mut store, account.id).await;
+            let result = self.sync_account(&client, &mut store, account.id).await;
             problems.extend(sync_problem(&account.email, &result));
             // Redrawing closes an open details card and costs time, so the window is only
             // told when there is something new to show. A failed run may have saved part
@@ -425,6 +427,26 @@ impl Worker {
             bail!("{}", problems.join("; "));
         }
         Ok(())
+    }
+
+    /// Syncs one account, saying in the status line how far a long fetch has come.
+    async fn sync_account(
+        &self,
+        client: &GoogleClient,
+        store: &mut Store,
+        account: AccountId,
+    ) -> Result<SyncReport, SyncError> {
+        let report = |progress: Progress| {
+            let text = progress_text(progress);
+            let changed = self.activity.borrow().progress != text;
+            if changed {
+                self.activity.borrow_mut().progress = text;
+                self.publish();
+            }
+        };
+        let result = gcal_sync::sync_account_reporting(client, store, account, &report).await;
+        self.activity.borrow_mut().progress.clear();
+        result
     }
 
     /// A client for the account that owns what is being changed.
@@ -612,6 +634,27 @@ async fn occurrence_id(
         .context("that occurrence no longer exists")
 }
 
+/// What the status line says about a running sync. Nothing for the usual quick one
+/// that fetches a few changes; the count once a calendar comes in several pages.
+fn progress_text(progress: Progress) -> String {
+    if progress.events < 1000 {
+        return String::new();
+    }
+    // 57000 reads better as 57,000.
+    let digits = progress.events.to_string();
+    let mut events = String::new();
+    for (position, digit) in digits.chars().enumerate() {
+        if position > 0 && (digits.len() - position).is_multiple_of(3) {
+            events.push(',');
+        }
+        events.push(digit);
+    }
+    format!(
+        "Fetching events… {events} so far (calendar {} of {})",
+        progress.calendar, progress.calendars
+    )
+}
+
 /// An error message as a sentence of its own: capitalised, with a full stop.
 fn sentence(text: &str) -> String {
     let mut letters = text.chars();
@@ -675,6 +718,24 @@ mod tests {
                 "end": {"dateTime": "2026-11-17T13:00:00+01:00", "timeZone": "Europe/Prague"},
                 "reminders": {"useDefault": true}
             })
+        );
+    }
+
+    #[test]
+    fn progress_is_only_spelled_out_for_a_long_fetch() {
+        let progress = |events| Progress {
+            calendar: 3,
+            calendars: 14,
+            events,
+        };
+        assert_eq!(progress_text(progress(999)), "");
+        assert_eq!(
+            progress_text(progress(57_500)),
+            "Fetching events… 57,500 so far (calendar 3 of 14)"
+        );
+        assert_eq!(
+            progress_text(progress(1_250_000)),
+            "Fetching events… 1,250,000 so far (calendar 3 of 14)"
         );
     }
 

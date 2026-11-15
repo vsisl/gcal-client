@@ -543,7 +543,7 @@ export component AppWindow inherits Window {
                 }
 
                 status := Text {
-                    text: root.status-kind == StatusKind.waiting-for-browser ? @tr("Finish signing in in your browser…") : root.status-kind == StatusKind.syncing ? @tr("Syncing…") : root.status-kind == StatusKind.saving ? @tr("Saving…") : root.status-kind == StatusKind.failed ? root.status-detail : "";
+                    text: root.status-kind == StatusKind.waiting-for-browser ? @tr("Finish signing in in your browser…") : root.status-kind == StatusKind.syncing ? (root.status-detail != "" ? root.status-detail : @tr("Syncing…")) : root.status-kind == StatusKind.saving ? @tr("Saving…") : root.status-kind == StatusKind.failed ? root.status-detail : "";
                     font-size: 13px;
                     color: root.status-kind == StatusKind.failed ? Theme.danger : Theme.text-dim;
                     vertical-alignment: center;
@@ -594,6 +594,23 @@ export component AppWindow inherits Window {
                             root.add-account();
                         }
                     }
+                }
+            }
+
+            // Something is going on in the background: a bar running under the top bar.
+            // A first sync of a large account takes minutes and must not look frozen.
+            Rectangle {
+                height: 3px;
+                clip: true;
+
+                if root.status-kind != StatusKind.idle && root.status-kind != StatusKind.failed: Rectangle {
+                    property <float> phase: Math.mod(animation-tick() / 1ms, 1400) / 1400;
+                    x: self.phase * (parent.width + self.width) - self.width;
+                    width: parent.width / 4;
+                    height: parent.height;
+                    background: Theme.accent;
+                    accessible-role: progress-indicator;
+                    accessible-label: status.text;
                 }
             }
 
