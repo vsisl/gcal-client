@@ -42,8 +42,8 @@ still asks for, to pick up later. Each item is one or a few commits; none depend
 
 - **Google's current calendar colours**: the API returns the classic palette
   (`backgroundColor`); the web maps those to its modern palette. Add the mapping table.
-- **Dark theme** and follow-the-system: all colours already come from `Theme` in
-  `crates/app/ui/app.slint`.
+- **Dark theme**: done on the M3 branch (follows the desktop's setting). Still open: a
+  light / dark / system choice in settings, and event colours tuned for dark.
 - **Hour labels**: the label of the first visible hour is clipped by the all-day strip's
   line.
 - **Strings from Rust** ("All day", "Until …", month and weekday names) are not yet marked

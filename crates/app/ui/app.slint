@@ -3,6 +3,8 @@
 // Rules carried over from the M0 spikes: list models are patched row by row from Rust
 // (never replaced), and geometry is computed here from a few shared lengths.
 
+import { Palette } from "std-widgets.slint";
+
 export struct TimedItem {
     // Index for looking up the event's details when it is clicked.
     instance: int,
@@ -125,18 +127,24 @@ export enum StatusKind {
     failed,
 }
 
-// Colours in one place so that the dark theme (M2) is a change here only.
+// Colours in one place, each in a light and a dark version.
 global Theme {
-    out property <color> surface: #ffffff;
-    out property <color> line: #dadce0;
-    out property <color> text: #3c4043;
-    out property <color> text-dim: #70757a;
-    out property <color> hover: #f1f3f4;
-    out property <color> pressed: #e8eaed;
-    out property <color> selected: #d2e3fc;
-    out property <color> accent: #1a73e8;
-    out property <color> now: #ea4335;
-    out property <color> danger: #d93025;
+    // Follows the desktop's light or dark setting.
+    out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+    out property <color> surface: dark ? #1f1f1f : #ffffff;
+    // Cards floating above the surface.
+    out property <color> card: dark ? #2d2e30 : #ffffff;
+    out property <color> line: dark ? #444746 : #dadce0;
+    out property <color> text: dark ? #e3e3e3 : #3c4043;
+    out property <color> text-dim: dark ? #9aa0a6 : #70757a;
+    out property <color> hover: dark ? #303134 : #f1f3f4;
+    out property <color> pressed: dark ? #3c4043 : #e8eaed;
+    out property <color> selected: dark ? #004a77 : #d2e3fc;
+    out property <color> accent: dark ? #8ab4f8 : #1a73e8;
+    // Text on the accent colour (today's number).
+    out property <color> on-accent: dark ? #062e6f : #ffffff;
+    out property <color> now: dark ? #f28b82 : #ea4335;
+    out property <color> danger: dark ? #f28b82 : #d93025;
 }
 
 component TextButton inherits Rectangle {
@@ -547,7 +555,7 @@ export component AppWindow inherits Window {
                                 Text {
                                     text: day.label;
                                     font-size: 11px;
-                                    color: day.today ? white : day.dim ? Theme.text-dim : Theme.text;
+                                    color: day.today ? Theme.on-accent : day.dim ? Theme.text-dim : Theme.text;
                                     horizontal-alignment: center;
                                     vertical-alignment: center;
                                 }
@@ -706,7 +714,7 @@ export component AppWindow inherits Window {
                                 Text {
                                     text: day.number;
                                     font-size: 24px;
-                                    color: day.today ? white : Theme.text;
+                                    color: day.today ? Theme.on-accent : Theme.text;
                                     horizontal-alignment: center;
                                     vertical-alignment: center;
                                 }
@@ -953,7 +961,7 @@ export component AppWindow inherits Window {
                                     text: cell.label;
                                     font-size: 12px;
                                     font-weight: 500;
-                                    color: cell.today ? white : cell.dim ? Theme.text-dim : Theme.text;
+                                    color: cell.today ? Theme.on-accent : cell.dim ? Theme.text-dim : Theme.text;
                                     horizontal-alignment: center;
                                     vertical-alignment: center;
                                 }
@@ -1089,7 +1097,7 @@ export component AppWindow inherits Window {
                                     Text {
                                         text: row.day-number;
                                         font-size: 18px;
-                                        color: row.today ? white : Theme.text;
+                                        color: row.today ? Theme.on-accent : Theme.text;
                                         horizontal-alignment: center;
                                         vertical-alignment: center;
                                     }
@@ -1164,7 +1172,7 @@ export component AppWindow inherits Window {
             // Beside the click, shifted back inside the window where it would not fit.
             x: Math.max(self.margin, Math.min(root.detail-x + 12px, root.width - self.width - self.margin));
             y: Math.max(self.margin, Math.min(root.detail-y - 24px, root.height - self.height - self.margin));
-            background: Theme.surface;
+            background: Theme.card;
             border-radius: 12px;
             border-width: 1px;
             border-color: Theme.line;
@@ -1280,7 +1288,7 @@ export component AppWindow inherits Window {
             height: Math.min(draft.preferred-height, root.height - 2 * self.margin);
             x: Math.max(self.margin, Math.min(root.detail-x + 12px, root.width - self.width - self.margin));
             y: Math.max(self.margin, Math.min(root.detail-y - 24px, root.height - self.height - self.margin));
-            background: Theme.surface;
+            background: Theme.card;
             border-radius: 12px;
             border-width: 1px;
             border-color: Theme.line;
@@ -1461,7 +1469,7 @@ export component AppWindow inherits Window {
         if root.help-visible: Rectangle {
             width: Math.min(380px, root.width - 24px);
             height: Math.min(shortcuts.preferred-height, root.height - 24px);
-            background: Theme.surface;
+            background: Theme.card;
             border-radius: 12px;
             border-width: 1px;
             border-color: Theme.line;
