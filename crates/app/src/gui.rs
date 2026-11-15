@@ -9,12 +9,12 @@ use anyhow::Result;
 use chrono::{DateTime, Datelike, Duration, Months, NaiveDate, Timelike, Utc};
 use chrono_tz::Tz;
 use gcal_core::month::{MonthLayout, layout_month};
-use gcal_core::recurrence::expand;
+use gcal_core::recurrence::{Series, single_instance};
 use gcal_core::schedule::{DayPart, schedule};
 use gcal_core::text::plain_text;
 use gcal_core::week::{WeekLayout, layout_days, local_day_start};
 use gcal_core::{CalendarListEntry, Event, EventTime};
-use gcal_store::{Account, AccountId, Store, StoredCalendar, StoredEvent};
+use gcal_store::{Account, AccountId, Store, StoredCalendar};
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
 use crate::open_store;
@@ -247,8 +247,19 @@ fn patch<T: Clone + PartialEq + 'static>(model: &VecModel<T>, rows: Vec<T>) {
 struct Loaded {
     accounts: Vec<Account>,
     calendars: Vec<StoredCalendar>,
-    /// Series masters and their changed or deleted occurrences.
-    recurring: Vec<StoredEvent>,
+    /// Series masters and their changed or deleted occurrences, each under the position
+    /// of its calendar in `calendars`. Remembers the occurrences it has worked out.
+    series: Series<usize, Event>,
+}
+
+impl Loaded {
+    fn calendar_index(&self) -> HashMap<(AccountId, &str), usize> {
+        self.calendars
+            .iter()
+            .enumerate()
+            .map(|(index, c)| ((c.account_id, c.entry.id.as_str()), index))
+            .collect()
+    }
 }
 
 struct View {
@@ -289,11 +300,23 @@ impl View {
     /// Re-reads the cache after it changed, then redraws.
     fn reload(&self) {
         let loaded = (|| -> Result<Loaded> {
-            Ok(Loaded {
+            let mut loaded = Loaded {
                 accounts: self.store.accounts()?,
                 calendars: self.store.calendars()?,
-                recurring: self.store.recurring_events()?,
-            })
+                series: Series::default(),
+            };
+            let index = loaded.calendar_index();
+            let recurring: Vec<(usize, Event)> = self
+                .store
+                .recurring_events()?
+                .into_iter()
+                .filter_map(|e| {
+                    let calendar = *index.get(&(e.account_id, e.calendar_id.as_str()))?;
+                    Some((calendar, e.event))
+                })
+                .collect();
+            loaded.series = Series::new(recurring);
+            Ok(loaded)
         })();
         match loaded {
             Ok(loaded) => {
@@ -381,27 +404,21 @@ impl View {
         }
         patch(&self.sidebar, sidebar);
 
-        let shown: HashMap<(AccountId, &str), &CalendarListEntry> = calendars
-            .iter()
-            .filter(|c| c.shown)
-            .map(|c| ((c.account_id, c.entry.id.as_str()), &c.entry))
-            .collect();
-
         let from = local_day_start(week_start, self.zone);
         let to = local_day_start(week_start + Duration::days(days), self.zone);
         let singles = self
             .store
             .single_events_for_range(from.timestamp() - 86_400, to.timestamp() + 86_400)?;
-        let instances = expand(
-            loaded
-                .recurring
-                .iter()
-                .chain(&singles)
-                .map(|e| ((e.account_id, e.calendar_id.as_str()), &e.event))
-                .filter(|(key, _)| shown.contains_key(key)),
-            from,
-            to,
-        );
+        // An instance's key is the position of its calendar in `calendars`.
+        let index = loaded.calendar_index();
+        let mut instances = loaded
+            .series
+            .expand(from, to, |calendar| calendars[*calendar].shown);
+        instances.extend(singles.iter().filter_map(|e| {
+            let calendar = *index.get(&(e.account_id, e.calendar_id.as_str()))?;
+            let shown = calendars[calendar].shown;
+            single_instance(calendar, &e.event, from, to).filter(|_| shown)
+        }));
         let spans: Vec<_> = instances.iter().map(|i| (i.start, i.end)).collect();
         // Only one of the views is on screen; the models of the others are emptied.
         let layout = if is_month || is_schedule {
@@ -431,7 +448,7 @@ impl View {
         };
         let color = |index: usize| {
             let instance = &instances[index];
-            event_color(instance.event, shown[&instance.key])
+            event_color(instance.event, &calendars[instance.key].entry)
         };
 
         let entries = if is_schedule {
@@ -577,13 +594,14 @@ impl View {
             .enumerate()
             .map(|(index, instance)| {
                 let event = instance.event;
-                let email = emails.get(&instance.key.0).copied().unwrap_or("");
+                let calendar = &calendars[instance.key];
+                let email = emails.get(&calendar.account_id).copied().unwrap_or("");
                 EventDetail {
                     title: title(index),
                     when: when_text(instance.start, instance.end, self.zone).into(),
                     location: event.location.as_deref().unwrap_or("").into(),
                     description: plain_text(event.description.as_deref().unwrap_or("")).into(),
-                    calendar: shown[&instance.key].display_name().into(),
+                    calendar: calendar.entry.display_name().into(),
                     account: email.into(),
                     color: color(index),
                     link: web_link(event, email).into(),
@@ -612,14 +630,19 @@ impl View {
 
     /// Shows or hides a calendar, remembers the choice, and redraws.
     fn set_calendar_shown(&self, account: AccountId, calendar_id: &str, shown: bool) {
-        let saved = self
-            .store
-            .set_calendar_shown(account, calendar_id, shown)
-            .and_then(|()| self.store.calendars());
-        match saved {
-            Ok(calendars) => {
-                // Only the calendar list changed; the series need no re-reading.
-                self.loaded.borrow_mut().calendars = calendars;
+        match self.store.set_calendar_shown(account, calendar_id, shown) {
+            Ok(()) => {
+                // Changed in place: the series refer to calendars by their position, and
+                // need no re-reading for this.
+                let mut loaded = self.loaded.borrow_mut();
+                if let Some(calendar) = loaded
+                    .calendars
+                    .iter_mut()
+                    .find(|c| c.account_id == account && c.entry.id == calendar_id)
+                {
+                    calendar.shown = shown;
+                }
+                drop(loaded);
                 self.refresh();
             }
             Err(error) => self.show_error(&error.into()),
