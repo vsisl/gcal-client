@@ -1,0 +1,535 @@
+// The main window: top bar, account sidebar and the merged week view.
+//
+// Rules carried over from the M0 spikes: list models are patched row by row from Rust
+// (never replaced), and geometry is computed here from a few shared lengths.
+
+export struct TimedItem {
+    title: string,
+    time: string,
+    day: int,
+    start-min: int,
+    end-min: int,
+    // Position among overlapping events: column `col` of `cols`.
+    col: int,
+    cols: int,
+    color: color,
+    text-color: color,
+}
+
+export struct AllDayItem {
+    title: string,
+    first-day: int,
+    last-day: int,
+    row: int,
+    color: color,
+    text-color: color,
+}
+
+export struct DayHeader {
+    weekday: string,
+    number: string,
+    today: bool,
+}
+
+// The sidebar is one flat list: an account row followed by that account's calendars.
+export struct SidebarRow {
+    is-account: bool,
+    text: string,
+    email: string,
+    color: color,
+    shown: bool,
+}
+
+export enum StatusKind {
+    idle,
+    waiting-for-browser,
+    syncing,
+    failed,
+}
+
+// Colours in one place so that the dark theme (M2) is a change here only.
+global Theme {
+    out property <color> surface: #ffffff;
+    out property <color> line: #dadce0;
+    out property <color> text: #3c4043;
+    out property <color> text-dim: #70757a;
+    out property <color> hover: #f1f3f4;
+    out property <color> pressed: #e8eaed;
+    out property <color> accent: #1a73e8;
+    out property <color> now: #ea4335;
+    out property <color> danger: #d93025;
+}
+
+component TextButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> outlined;
+    in property <color> text-color: Theme.text;
+    callback clicked;
+
+    height: 36px;
+    width: label.preferred-width + 28px;
+    border-radius: self.height / 2;
+    border-width: outlined ? 1px : 0px;
+    border-color: Theme.line;
+    background: touch.pressed ? Theme.pressed : touch.has-hover ? Theme.hover : transparent;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => {
+        root.clicked();
+    }
+
+    label := Text {
+        text: root.text;
+        font-size: 14px;
+        font-weight: 500;
+        color: root.text-color;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "gcal-client";
+    preferred-width: 1280px;
+    preferred-height: 820px;
+    min-width: 720px;
+    min-height: 420px;
+    background: Theme.surface;
+    forward-focus: keys;
+
+    in property <string> period-title;
+    in property <StatusKind> status-kind: StatusKind.idle;
+    in property <string> status-detail;
+    in property <[DayHeader]> days;
+    in property <[TimedItem]> timed;
+    in property <[AllDayItem]> all-day;
+    in property <int> all-day-rows;
+    in property <[SidebarRow]> sidebar;
+    // Position of the current-time line; `now-day` is -1 when today is not in view.
+    in property <int> now-day: -1;
+    in property <int> now-min;
+    // The account whose removal is waiting for confirmation, if any.
+    in-out property <string> confirm-remove;
+
+    callback go-today();
+    callback go-previous();
+    callback go-next();
+    callback add-account();
+    callback remove-account(string);
+    callback sync-now();
+    // Raised from the background worker when the cache changed.
+    callback data-changed();
+
+    property <length> hour-h: 48px;
+    property <length> gutter: 56px;
+    property <length> head-h: 80px;
+    property <length> bar-h: 22px;
+    property <length> strip-h: Math.max(1, root.all-day-rows) * bar-h + 6px;
+    property <length> day-w: (main.width - gutter) / 7;
+
+    public function scroll-to-hour(hour: int) {
+        grid.content-y = -hour * hour-h;
+    }
+
+    keys := FocusScope {
+        key-pressed(event) => {
+            if (event.modifiers.control || event.modifiers.alt || event.modifiers.meta) {
+                return reject;
+            }
+            if (event.text == "t") {
+                root.go-today();
+                return accept;
+            }
+            if (event.text == "j" || event.text == "n") {
+                root.go-next();
+                return accept;
+            }
+            if (event.text == "k" || event.text == "p") {
+                root.go-previous();
+                return accept;
+            }
+            if (event.text == "r") {
+                root.sync-now();
+                return accept;
+            }
+            reject
+        }
+
+        VerticalLayout {
+            // Top bar.
+            HorizontalLayout {
+                height: 64px;
+                padding-left: 16px;
+                padding-right: 16px;
+                spacing: 8px;
+
+                VerticalLayout {
+                    alignment: center;
+                    TextButton {
+                        text: @tr("Today");
+                        outlined: true;
+                        clicked => {
+                            root.go-today();
+                        }
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    TextButton {
+                        text: "‹";
+                        width: 36px;
+                        accessible-label: @tr("Previous week");
+                        clicked => {
+                            root.go-previous();
+                        }
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    TextButton {
+                        text: "›";
+                        width: 36px;
+                        accessible-label: @tr("Next week");
+                        clicked => {
+                            root.go-next();
+                        }
+                    }
+                }
+
+                Text {
+                    text: root.period-title;
+                    font-size: 22px;
+                    color: Theme.text;
+                    vertical-alignment: center;
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                    min-width: 16px;
+                }
+
+                status := Text {
+                    text: root.status-kind == StatusKind.waiting-for-browser ? @tr("Finish signing in in your browser…") : root.status-kind == StatusKind.syncing ? @tr("Syncing…") : root.status-kind == StatusKind.failed ? root.status-detail : "";
+                    font-size: 13px;
+                    color: root.status-kind == StatusKind.failed ? Theme.danger : Theme.text-dim;
+                    vertical-alignment: center;
+                    horizontal-alignment: right;
+                    overflow: elide;
+                    max-width: 420px;
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    TextButton {
+                        text: @tr("Refresh");
+                        clicked => {
+                            root.sync-now();
+                        }
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    TextButton {
+                        text: @tr("Add account");
+                        outlined: true;
+                        text-color: Theme.accent;
+                        clicked => {
+                            root.add-account();
+                        }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                // Sidebar: accounts and their calendars.
+                Flickable {
+                    width: 256px;
+                    interactive: false;
+                    content-height: rows.preferred-height;
+
+                    rows := VerticalLayout {
+                        alignment: start;
+                        padding-top: 8px;
+
+                        for row in root.sidebar: Rectangle {
+                            height: row.is-account ? 44px : 30px;
+
+                            if row.is-account: HorizontalLayout {
+                                padding-left: 16px;
+                                padding-right: 8px;
+                                spacing: 4px;
+
+                                Text {
+                                    text: row.text;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    color: Theme.text;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+
+                                if root.confirm-remove != row.email: VerticalLayout {
+                                    alignment: center;
+                                    TextButton {
+                                        text: "✕";
+                                        height: 28px;
+                                        width: 28px;
+                                        accessible-label: @tr("Remove account {}", row.email);
+                                        clicked => {
+                                            root.confirm-remove = row.email;
+                                        }
+                                    }
+                                }
+                                if root.confirm-remove == row.email: VerticalLayout {
+                                    alignment: center;
+                                    TextButton {
+                                        text: @tr("Remove");
+                                        height: 28px;
+                                        text-color: Theme.danger;
+                                        clicked => {
+                                            root.confirm-remove = "";
+                                            root.remove-account(row.email);
+                                        }
+                                    }
+                                }
+                                if root.confirm-remove == row.email: VerticalLayout {
+                                    alignment: center;
+                                    TextButton {
+                                        text: @tr("Keep");
+                                        height: 28px;
+                                        clicked => {
+                                            root.confirm-remove = "";
+                                        }
+                                    }
+                                }
+                            }
+                            if !row.is-account: HorizontalLayout {
+                                padding-left: 24px;
+                                padding-right: 12px;
+                                spacing: 12px;
+
+                                Rectangle {
+                                    width: 16px;
+                                    Rectangle {
+                                        width: 16px;
+                                        height: 16px;
+                                        y: (parent.height - self.height) / 2;
+                                        border-radius: 3px;
+                                        border-width: 2px;
+                                        border-color: row.color;
+                                        background: row.shown ? row.color : transparent;
+                                    }
+                                }
+
+                                Text {
+                                    text: row.text;
+                                    font-size: 13px;
+                                    color: row.shown ? Theme.text : Theme.text-dim;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+                            }
+                        }
+                        if root.sidebar.length == 0: Text {
+                            text: @tr("No accounts yet.\nChoose “Add account” to sign in.");
+                            font-size: 13px;
+                            color: Theme.text-dim;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
+                // The week.
+                main := Rectangle {
+                    horizontal-stretch: 1;
+                    clip: true;
+
+                    // Day headers.
+                    for day[d] in root.days: Rectangle {
+                        x: gutter + d * day-w;
+                        y: 0;
+                        width: day-w;
+                        height: head-h;
+
+                        Text {
+                            y: 10px;
+                            width: parent.width;
+                            text: day.weekday;
+                            font-size: 11px;
+                            font-weight: 500;
+                            color: day.today ? Theme.accent : Theme.text-dim;
+                            horizontal-alignment: center;
+                        }
+
+                        Rectangle {
+                            x: (parent.width - self.width) / 2;
+                            y: 28px;
+                            width: 44px;
+                            height: 44px;
+                            border-radius: 22px;
+                            background: day.today ? Theme.accent : transparent;
+
+                            Text {
+                                text: day.number;
+                                font-size: 24px;
+                                color: day.today ? white : Theme.text;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+
+                    // All-day strip.
+                    for d in 7: Rectangle {
+                        x: gutter + d * day-w;
+                        y: head-h;
+                        width: 1px;
+                        height: strip-h;
+                        background: Theme.line;
+                    }
+                    for item in root.all-day: Rectangle {
+                        x: gutter + item.first-day * day-w + 2px;
+                        y: head-h + 2px + item.row * bar-h;
+                        width: (item.last-day - item.first-day + 1) * day-w - 8px;
+                        height: bar-h - 2px;
+                        border-radius: 4px;
+                        background: item.color;
+                        clip: true;
+
+                        Text {
+                            x: 8px;
+                            width: parent.width - 12px;
+                            text: item.title == "" ? @tr("(No title)") : item.title;
+                            font-size: 12px;
+                            font-weight: 500;
+                            color: item.text-color;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                    Rectangle {
+                        x: 0;
+                        y: head-h + strip-h;
+                        width: parent.width;
+                        height: 1px;
+                        background: Theme.line;
+                    }
+
+                    // Hour grid.
+                    grid := Flickable {
+                        x: 0;
+                        y: head-h + strip-h + 1px;
+                        width: parent.width;
+                        height: parent.height - self.y;
+                        // Wheel and touchpad scrolling only; pointer drags are for events.
+                        interactive: false;
+                        content-width: self.width;
+                        content-height: hour-h * 24;
+
+                        for h in 24: Rectangle {
+                            x: gutter - 8px;
+                            y: h * hour-h;
+                            width: grid.width - gutter + 8px;
+                            height: 1px;
+                            background: Theme.line;
+                        }
+                        for h in 24: Text {
+                            x: 0;
+                            y: h * hour-h - 7px;
+                            width: gutter - 12px;
+                            horizontal-alignment: right;
+                            text: h == 0 ? "" : "\{h}:00";
+                            font-size: 10px;
+                            color: Theme.text-dim;
+                        }
+                        for d in 7: Rectangle {
+                            x: gutter + d * day-w;
+                            y: 0;
+                            width: 1px;
+                            height: hour-h * 24;
+                            background: Theme.line;
+                        }
+
+                        for item in root.timed: Rectangle {
+                            property <length> slot-w: (day-w - 10px) / item.cols;
+                            property <string> shown-title: item.title == "" ? @tr("(No title)") : item.title;
+
+                            x: gutter + item.day * day-w + 1px + item.col * slot-w;
+                            y: item.start-min / 60.0 * hour-h;
+                            width: slot-w - 1px;
+                            height: (item.end-min - item.start-min) / 60.0 * hour-h - 1px;
+                            border-radius: 4px;
+                            border-width: 1px;
+                            border-color: Theme.surface;
+                            background: item.color;
+                            clip: true;
+                            accessible-role: list-item;
+                            accessible-label: "\{self.shown-title}, \{item.time}";
+
+                            // Short blocks have room for one line only.
+                            if parent.height <= 34px: Text {
+                                x: 6px;
+                                y: 0;
+                                width: parent.width - 8px;
+                                height: parent.height;
+                                text: "\{parent.shown-title}, \{item.time}";
+                                font-size: parent.height < 16px ? 10px : 12px;
+                                color: item.text-color;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            if parent.height > 34px: Text {
+                                x: 6px;
+                                y: 3px;
+                                width: parent.width - 8px;
+                                text: parent.shown-title;
+                                font-size: 12px;
+                                font-weight: 500;
+                                color: item.text-color;
+                                overflow: elide;
+                            }
+                            if parent.height > 34px: Text {
+                                x: 6px;
+                                y: 19px;
+                                width: parent.width - 8px;
+                                text: item.time;
+                                font-size: 11px;
+                                color: item.text-color;
+                                overflow: elide;
+                            }
+                        }
+
+                        // Current time.
+                        if root.now-day >= 0: Rectangle {
+                            x: gutter + root.now-day * day-w;
+                            y: root.now-min / 60.0 * hour-h - 1px;
+                            width: day-w;
+                            height: 2px;
+                            background: Theme.now;
+                        }
+                        if root.now-day >= 0: Rectangle {
+                            x: gutter + root.now-day * day-w - 6px;
+                            y: root.now-min / 60.0 * hour-h - 6px;
+                            width: 12px;
+                            height: 12px;
+                            border-radius: 6px;
+                            background: Theme.now;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
