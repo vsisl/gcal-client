@@ -164,12 +164,18 @@ impl GoogleClient {
     }
 
     /// Creates an event from the given resource and returns it as Google stored it.
-    pub async fn insert_event(&self, calendar_id: &str, event: &Value) -> Result<Value, ApiError> {
+    /// With `notify`, Google e-mails an invitation to the event's guests.
+    pub async fn insert_event(
+        &self,
+        calendar_id: &str,
+        event: &Value,
+        notify: bool,
+    ) -> Result<Value, ApiError> {
         let response = self
             .send(
                 Method::POST,
                 &["calendars", calendar_id, "events"],
-                &[],
+                send_updates(notify),
                 Some(event),
                 None,
             )
@@ -481,7 +487,7 @@ mod tests {
 
         let client = client(&server).await;
         let created = client
-            .insert_event("me@example.com", &json!({"summary": "Lunch"}))
+            .insert_event("me@example.com", &json!({"summary": "Lunch"}), false)
             .await
             .unwrap();
         assert_eq!(created["id"], "e1");

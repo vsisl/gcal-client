@@ -43,8 +43,8 @@ click("Button", "Save"); time.sleep(0.5)
 shot("rsvp-edit-ask")
 asked = [label(h) for h in find("Checkbox")]
 print("   asked:", asked)
-wait("the question offers to tell the guests", lambda: "Send update e-mails to guests" in asked)
+wait("the question offers to tell the guests", lambda: "Send e-mails to the guests" in asked)
 # Not for a made-up address.
-click("Checkbox", "Send update e-mails to guests")
+click("Checkbox", "Send e-mails to the guests")
 key(ENTER)
 wait("renamed at Google, guests as they were", lambda: len(named("AT invite 2")) == 1 and named("AT invite 2")[0]["attendees"] == guests_before)

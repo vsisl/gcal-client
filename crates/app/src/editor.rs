@@ -51,6 +51,8 @@ pub struct Form {
     pub reminder: usize,
     pub visibility: usize,
     pub busy: bool,
+    /// The guests' addresses, separated by commas, spaces or new lines.
+    pub guests: String,
 }
 
 /// What the form cannot show but must not lose.
@@ -60,6 +62,13 @@ pub struct Kept {
     pub reminders: Value,
     pub start_zone: Option<String>,
     pub end_zone: Option<String>,
+    /// The guests as the event has them, with their answers and whatever else Google
+    /// keeps about each; a guest who stays in the form stays as it is here.
+    pub attendees: Vec<Value>,
+    /// The address of the account the event belongs to. It is added to the guests
+    /// when the first ones are invited, as the web does, so that the organiser is
+    /// among them.
+    pub own_email: String,
 }
 
 fn clock(instant: DateTime<Utc>, zone: Tz) -> String {
@@ -135,8 +144,19 @@ pub fn form_of(resource: &Value, start: EventTime, end: EventTime, zone: Tz) -> 
         reminders: resource["reminders"].clone(),
         start_zone: resource["start"]["timeZone"].as_str().map(str::to_owned),
         end_zone: resource["end"]["timeZone"].as_str().map(str::to_owned),
+        attendees: resource["attendees"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
+        own_email: String::new(),
     };
+    let guests: Vec<&str> = kept
+        .attendees
+        .iter()
+        .filter_map(|guest| guest["email"].as_str())
+        .collect();
     let mut form = Form {
+        guests: guests.join(", "),
         title: text("summary"),
         location: text("location"),
         description: plain_text(&text("description")),
@@ -254,6 +274,7 @@ pub fn fields(form: &Form, kept: &Kept, zone: Tz) -> Result<Value, String> {
         }),
     };
     Ok(json!({
+        "attendees": guest_list(form, kept)?,
         "summary": form.title.trim(),
         "start": start,
         "end": end,
@@ -265,6 +286,52 @@ pub fn fields(form: &Form, kept: &Kept, zone: Tz) -> Result<Value, String> {
         "visibility": VISIBILITY.get(form.visibility).copied().unwrap_or("default"),
         "transparency": if form.busy { "opaque" } else { "transparent" },
     }))
+}
+
+/// The guests the form names, as Google's list of attendees. A guest the event had
+/// keeps its entry; a new one is its address alone. Fails with a sentence when
+/// something in the field is not an e-mail address.
+fn guest_list(form: &Form, kept: &Kept) -> Result<Vec<Value>, String> {
+    let same = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    let mut addresses: Vec<&str> = Vec::new();
+    for address in form
+        .guests
+        .split([',', ';', ' ', '\n', '\t'])
+        .filter(|part| !part.is_empty())
+    {
+        let (name, domain) = address.split_once('@').unwrap_or(("", ""));
+        if name.is_empty() || !domain.contains('.') || domain.contains('@') {
+            return Err(format!("“{address}” is not an e-mail address."));
+        }
+        if !addresses.iter().any(|known| same(known, address)) {
+            addresses.push(address);
+        }
+    }
+    let mut guests: Vec<Value> = addresses
+        .iter()
+        .map(|address| {
+            kept.attendees
+                .iter()
+                .find(|guest| {
+                    guest["email"]
+                        .as_str()
+                        .is_some_and(|known| same(known, address))
+                })
+                .cloned()
+                .unwrap_or_else(|| json!({ "email": address }))
+        })
+        .collect();
+    // The first guests of an event: the organiser joins them, as going.
+    let own_among = addresses
+        .iter()
+        .any(|address| same(address, &kept.own_email));
+    if kept.attendees.is_empty() && !guests.is_empty() && !kept.own_email.is_empty() && !own_among {
+        guests.insert(
+            0,
+            json!({ "email": kept.own_email, "responseStatus": "accepted" }),
+        );
+    }
+    Ok(guests)
 }
 
 /// A start or end as a change to send. Google merges a change into what the event
@@ -311,7 +378,7 @@ pub fn inverse(changes: &Value, resource: &Value) -> Value {
         for name in changes.keys() {
             let was = match (name.as_str(), resource.get(name)) {
                 (_, Some(value)) => value.clone(),
-                ("recurrence", None) => json!([]),
+                ("recurrence" | "attendees", None) => json!([]),
                 (_, None) => Value::Null,
             };
             before.insert(name.clone(), was);
@@ -330,7 +397,7 @@ pub fn creation(fields: Value) -> Value {
     let says_nothing = |name: &str, value: &Value| match name {
         "location" | "description" => value == "",
         "colorId" => value.is_null(),
-        "recurrence" => value == &json!([]),
+        "recurrence" | "attendees" => value == &json!([]),
         "reminders" => value == &json!({ "useDefault": true }),
         "visibility" => value == "default",
         "transparency" => value == "opaque",
@@ -673,6 +740,7 @@ mod tests {
                 reminder: REMINDER_CUSTOM,
                 visibility: 2,
                 busy: false,
+                guests: String::new(),
             }
         );
         let opened = fields(&form, &kept, zone()).unwrap();
@@ -786,6 +854,77 @@ mod tests {
                 "start": {"dateTime": "2026-11-17T12:00:00+01:00", "timeZone": "Europe/Prague", "date": null},
                 "end": {"dateTime": "2026-11-17T13:00:00+01:00", "timeZone": "Europe/Prague", "date": null},
             })
+        );
+    }
+
+    #[test]
+    fn guests_are_added_and_removed_by_their_addresses() {
+        let (start, end) = (timed("2026-11-17T11:00:00Z"), timed("2026-11-17T12:00:00Z"));
+        // A new event with its first guests: the organiser joins them.
+        let mut form = new_form(start, end, zone());
+        form.title = "Review".into();
+        form.guests = "ann@x.org, Bob@x.org\nann@x.org".into();
+        let kept = Kept {
+            own_email: "me@x.org".into(),
+            ..Kept::default()
+        };
+        let created = creation(fields(&form, &kept, zone()).unwrap());
+        assert_eq!(
+            created["attendees"],
+            json!([
+                {"email": "me@x.org", "responseStatus": "accepted"},
+                {"email": "ann@x.org"},
+                {"email": "Bob@x.org"}
+            ])
+        );
+        // Without guests the field is not sent at all.
+        form.guests = " ".into();
+        assert!(
+            creation(fields(&form, &kept, zone()).unwrap())
+                .get("attendees")
+                .is_none()
+        );
+        form.guests = "ann@x.org, not-an-address".into();
+        assert_eq!(
+            fields(&form, &kept, zone()).unwrap_err(),
+            "“not-an-address” is not an e-mail address."
+        );
+
+        // An event that has guests: untouched, nothing is sent; one removed and one
+        // added, the others keep their answers.
+        let event = json!({
+            "id": "e",
+            "start": {"dateTime": "2026-11-17T12:00:00+01:00", "timeZone": "Europe/Prague"},
+            "end": {"dateTime": "2026-11-17T13:00:00+01:00", "timeZone": "Europe/Prague"},
+            "attendees": [
+                {"email": "me@x.org", "self": true, "organizer": true, "responseStatus": "accepted"},
+                {"email": "ann@x.org", "responseStatus": "declined", "comment": "away"},
+                {"email": "bob@x.org", "responseStatus": "needsAction"}
+            ]
+        });
+        let (opened, mut kept) = form_of(&event, start, end, zone());
+        kept.own_email = "me@x.org".into();
+        assert_eq!(opened.guests, "me@x.org, ann@x.org, bob@x.org");
+        let before = fields(&opened, &kept, zone()).unwrap();
+        assert_eq!(before["attendees"], event["attendees"]);
+        let mut edited = opened.clone();
+        edited.guests = "me@x.org, ANN@x.org, cy@x.org".into();
+        let changes = diff(&before, &fields(&edited, &kept, zone()).unwrap());
+        assert_eq!(
+            changes,
+            json!({"attendees": [
+                {"email": "me@x.org", "self": true, "organizer": true, "responseStatus": "accepted"},
+                {"email": "ann@x.org", "responseStatus": "declined", "comment": "away"},
+                {"email": "cy@x.org"}
+            ]})
+        );
+        assert_eq!(
+            inverse(&changes, &event),
+            json!({"attendees": event["attendees"]})
+        );
+        assert_eq!(
+            inverse(&changes, &json!({"id": "e"})),
+            json!({"attendees": []})
         );
     }
 

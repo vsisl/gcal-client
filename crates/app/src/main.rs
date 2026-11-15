@@ -190,7 +190,8 @@ async fn insert(email: &str, calendar_id: &str, file: &str) -> Result<()> {
         Endpoints::default(),
         refresh_token,
     );
-    let created = client.insert_event(calendar_id, &resource).await?;
+    // Never with invitations: test events may name made-up guests.
+    let created = client.insert_event(calendar_id, &resource, false).await?;
     store.apply_event(account.id, calendar_id, &created)?;
     println!("{}", created["id"].as_str().unwrap_or_default());
     Ok(())

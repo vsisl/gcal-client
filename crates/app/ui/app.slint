@@ -146,6 +146,8 @@ export struct EditorForm {
     reminder: int,
     visibility: int,
     busy: bool,
+    // The guests' e-mail addresses, separated by commas.
+    guests: string,
 }
 
 export struct DayHeader {
@@ -656,6 +658,16 @@ export component AppWindow inherits Window {
         root.delete-ask-visible = true;
     }
 
+    // The question was closed without an answer. A change that came from the editor
+    // goes back there, so that nothing typed is lost.
+    callback edit-scope-cancelled();
+    function cancel-ask() {
+        root.delete-ask-visible = false;
+        if (root.ask-edit) {
+            root.edit-scope-cancelled();
+        }
+    }
+
     function confirm-ask() {
         if (root.ask-edit) {
             root.delete-ask-visible = false;
@@ -808,7 +820,7 @@ export component AppWindow inherits Window {
             if (root.delete-ask-visible) {
                 // Only its own keys while the question is open.
                 if (event.text == Key.Escape) {
-                    root.delete-ask-visible = false;
+                    root.cancel-ask();
                 } else if (event.text == Key.Return) {
                     root.confirm-ask();
                 } else if (event.text == Key.DownArrow && root.ask-has-scope) {
@@ -2443,7 +2455,7 @@ export component AppWindow inherits Window {
             background: #00000066;
             TouchArea {
                 clicked => {
-                    root.delete-ask-visible = false;
+                    root.cancel-ask();
                 }
             }
         }
@@ -2469,7 +2481,7 @@ export component AppWindow inherits Window {
                 spacing: 6px;
 
                 delete-title := Text {
-                    text: root.ask-edit ? (root.ask-repeating ? @tr("Edit repeating event") : @tr("Edit event")) : root.detail.repeating ? @tr("Delete repeating event") : @tr("Delete event");
+                    text: root.ask-edit ? (root.ask-repeating ? @tr("Edit repeating event") : @tr("Guests")) : root.detail.repeating ? @tr("Delete repeating event") : @tr("Delete event");
                     font-size: 18px;
                     color: Theme.text;
                 }
@@ -2518,7 +2530,7 @@ export component AppWindow inherits Window {
                     notify-label := Text {
                         x: 40px;
                         height: parent.height;
-                        text: root.ask-edit ? @tr("Send update e-mails to guests") : @tr("Send cancellation e-mails to guests");
+                        text: root.ask-edit ? @tr("Send e-mails to the guests") : @tr("Send cancellation e-mails to guests");
                         font-size: 14px;
                         color: Theme.text;
                         vertical-alignment: center;
@@ -2533,7 +2545,7 @@ export component AppWindow inherits Window {
                         text: @tr("Cancel");
                         height: 32px;
                         clicked => {
-                            root.delete-ask-visible = false;
+                            root.cancel-ask();
                         }
                     }
 
@@ -2777,6 +2789,17 @@ export component AppWindow inherits Window {
                             current: root.editor.repeat;
                             chosen(i) => {
                                 root.editor.repeat = i;
+                            }
+                        }
+                    }
+
+                    EditorRow {
+                        label: @tr("Guests");
+                        Field {
+                            hint: @tr("ann@example.com, bob@example.com");
+                            value: root.editor.guests;
+                            edited(text) => {
+                                root.editor.guests = text;
                             }
                         }
                     }

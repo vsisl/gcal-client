@@ -779,6 +779,19 @@ fn plan_deletion(
 enum Asked {
     Drag(Drag),
     Form(Box<Saved>),
+    /// A new event with guests, waiting for "send them e-mails?".
+    Create(Box<NewEvent>),
+}
+
+/// A new event ready to be created.
+struct NewEvent {
+    account: AccountId,
+    calendar_id: String,
+    resource: serde_json::Value,
+    /// What it was made from, to give back if creating it fails.
+    form: Form,
+    calendar: usize,
+    draft: Draft,
 }
 
 /// The editor while it is open: the event it is for (`None` for a new one), and the
@@ -827,6 +840,7 @@ fn to_window(form: &Form) -> EditorForm {
         reminder: form.reminder as i32,
         visibility: form.visibility as i32,
         busy: form.busy,
+        guests: form.guests.as_str().into(),
     }
 }
 
@@ -845,6 +859,7 @@ fn from_window(form: &EditorForm) -> Form {
         reminder: form.reminder.max(0) as usize,
         visibility: form.visibility.max(0) as usize,
         busy: form.busy,
+        guests: form.guests.to_string(),
     }
 }
 
@@ -1561,7 +1576,10 @@ impl View {
         // What they described may have moved or gone. The question about a change from
         // the editor stays: that change carries its event with it.
         ui.set_detail_visible(false);
-        if !matches!(*self.asked.borrow(), Some(Asked::Form(_))) {
+        if !matches!(
+            *self.asked.borrow(),
+            Some(Asked::Form(_) | Asked::Create(_))
+        ) {
             ui.set_delete_ask_visible(false);
         }
         // A drag refers to an instance on screen, which may now be another one. An
@@ -1909,21 +1927,70 @@ impl View {
             editor::adopt_series_rule(&mut form, &mut kept, series, self.zone);
         }
         let detail = self.details.borrow().get(instance).cloned();
-        let calendar_color = {
-            let loaded = self.loaded.borrow();
-            loaded
-                .calendars
-                .iter()
-                .find(|c| c.account_id == target.account && c.entry.id == target.calendar_id)
-                .and_then(|c| c.entry.background_color.as_deref().and_then(parse_color))
-                .unwrap_or(FALLBACK_COLOR)
-        };
+        let calendar_color = self.calendar_color(&target);
         ui.set_editor_new(false);
         ui.set_editor_calendar_name(detail.map(|d| d.calendar).unwrap_or_default());
+        kept.own_email = self
+            .loaded
+            .borrow()
+            .accounts
+            .iter()
+            .find(|a| a.id == target.account)
+            .map(|a| a.email.clone())
+            .unwrap_or_default();
         self.show_editor(&ui, form, kept, Some(target), calendar_color);
         if let Some(editing) = self.editing.borrow_mut().as_mut() {
             editing.own = own;
             editing.series = series;
+        }
+    }
+
+    fn calendar_color(&self, target: &Target) -> Color {
+        let loaded = self.loaded.borrow();
+        loaded
+            .calendars
+            .iter()
+            .find(|c| c.account_id == target.account && c.entry.id == target.calendar_id)
+            .and_then(|c| c.entry.background_color.as_deref().and_then(parse_color))
+            .unwrap_or(FALLBACK_COLOR)
+    }
+
+    /// The question about a change was closed without an answer. What came from the
+    /// editor goes back into it as it was saved; a drag is simply dropped.
+    fn ask_cancelled(&self) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        match self.asked.take() {
+            Some(Asked::Create(new)) => {
+                let color = ui
+                    .get_draft_calendars()
+                    .row_data(new.calendar)
+                    .map_or(FALLBACK_COLOR, |c| c.color);
+                self.draft.replace(Some(new.draft));
+                ui.set_editor_new(true);
+                ui.set_draft_calendar(new.calendar as i32);
+                self.show_editor(&ui, new.form, Kept::default(), None, color);
+            }
+            Some(Asked::Form(saved)) => {
+                let Saved {
+                    target,
+                    form,
+                    opened,
+                    kept,
+                    own,
+                    series,
+                    ..
+                } = *saved;
+                let color = self.calendar_color(&target);
+                ui.set_editor_new(false);
+                self.show_editor(&ui, form, kept, Some(target), color);
+                // Still a change to the event as it was first opened.
+                if let Some(editing) = self.editing.borrow_mut().as_mut() {
+                    editing.opened = opened;
+                    editing.own = own;
+                    editing.series = series;
+                }
+            }
+            Some(Asked::Drag(_)) | None => {}
         }
     }
 
@@ -1979,7 +2046,20 @@ impl View {
         let Some(editing) = self.editing.borrow().clone() else {
             return;
         };
-        let after = match editor::fields(&form, &editing.kept, self.zone) {
+        let mut kept = editing.kept.clone();
+        if editing.target.is_none() {
+            // A new event belongs to the account of the calendar chosen for it; the
+            // text the choice is remembered under starts with that account's address.
+            kept.own_email = self
+                .draft
+                .borrow()
+                .as_ref()
+                .and_then(|draft| draft.calendars.get(calendar))
+                .and_then(|(_, _, key)| key.split('\t').next())
+                .unwrap_or_default()
+                .to_owned();
+        }
+        let after = match editor::fields(&form, &kept, self.zone) {
             Ok(after) => after,
             Err(problem) => return ui.set_editor_error(problem.into()),
         };
@@ -1997,13 +2077,25 @@ impl View {
             let Some(draft) = self.draft.take() else {
                 return;
             };
-            self.creating(account, &calendar_id, form, calendar, draft);
-            let _ = self.commands.send(Command::CreateEvent {
+            let invites = after["attendees"]
+                .as_array()
+                .is_some_and(|guests| !guests.is_empty());
+            let new = NewEvent {
                 account,
                 calendar_id,
                 resource: editor::creation(after),
-            });
-            return self.close_editor(&ui);
+                form,
+                calendar,
+                draft,
+            };
+            self.close_editor(&ui);
+            if invites {
+                self.asked.replace(Some(Asked::Create(Box::new(new))));
+                ui.invoke_ask_edit_scope(false, true);
+            } else {
+                self.create(new, false);
+            }
+            return;
         };
         let before = match editor::fields(&editing.opened, &editing.kept, self.zone) {
             Ok(before) => before,
@@ -2025,7 +2117,9 @@ impl View {
             own: editing.own,
             series: editing.series,
         };
-        let (repeating, guests) = (saved.target.occurrence.is_some(), saved.target.guests);
+        // Guests are asked about when the event has some, or gets its first ones now.
+        let repeating = saved.target.occurrence.is_some();
+        let guests = saved.target.guests || saved.changes.get("attendees").is_some();
         if repeating || guests {
             self.asked.replace(Some(Asked::Form(Box::new(saved))));
             ui.invoke_ask_edit_scope(repeating, guests);
@@ -2099,6 +2193,23 @@ impl View {
                 self.all_day.set_row_data(row, bar);
             }
         }
+    }
+
+    /// Sends a new event to be created; with `notify`, its guests get an invitation.
+    fn create(&self, new: NewEvent, notify: bool) {
+        self.creating(
+            new.account,
+            &new.calendar_id,
+            new.form,
+            new.calendar,
+            new.draft,
+        );
+        let _ = self.commands.send(Command::CreateEvent {
+            account: new.account,
+            calendar_id: new.calendar_id,
+            resource: new.resource,
+            notify,
+        });
     }
 
     /// Notes a new event as sent: how to take it back once it exists, and what to show
@@ -2330,12 +2441,17 @@ impl View {
         let resource = event_resource(title, draft.start, draft.end, self.zone);
         let mut form = editor::new_form(draft.start, draft.end, self.zone);
         form.title = title.to_owned();
-        self.creating(account, &calendar_id, form, calendar, draft);
-        let _ = self.commands.send(Command::CreateEvent {
-            account,
-            calendar_id,
-            resource,
-        });
+        self.create(
+            NewEvent {
+                account,
+                calendar_id,
+                resource,
+                form,
+                calendar,
+                draft,
+            },
+            false,
+        );
     }
 
     /// Brings back the event deleted last.
@@ -2596,6 +2712,10 @@ pub fn run() -> Result<()> {
         let view = view.clone();
         move |form, calendar| view.save_editor(from_window(&form), calendar as usize)
     });
+    ui.on_edit_scope_cancelled({
+        let view = view.clone();
+        move || view.ask_cancelled()
+    });
     ui.on_edit_scope_chosen({
         let view = view.clone();
         move |scope, notify| {
@@ -2607,6 +2727,7 @@ pub fn run() -> Result<()> {
             match view.asked.take() {
                 Some(Asked::Drag(drag)) => view.send_drag(drag, scope, notify),
                 Some(Asked::Form(saved)) => view.send_form(*saved, scope, notify),
+                Some(Asked::Create(new)) => view.create(*new, notify),
                 None => {}
             }
         }

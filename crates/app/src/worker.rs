@@ -62,11 +62,13 @@ pub enum Command {
         etag: Option<String>,
         changes: Value,
     },
-    /// Creates an event from a resource the window put together.
+    /// Creates an event from a resource the window put together; with `notify`,
+    /// Google invites its guests.
     CreateEvent {
         account: AccountId,
         calendar_id: String,
         resource: Value,
+        notify: bool,
     },
     /// Undoes a deletion: creates the event again from its saved resource.
     RestoreEvent {
@@ -309,8 +311,11 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
                     account,
                     calendar_id,
                     resource,
+                    notify,
                 } => {
+                    worker.notify.set(notify);
                     let created = worker.insert_event(account, &calendar_id, resource).await;
+                    worker.notify.set(false);
                     // Always answered: on failure the window gives back what was
                     // typed.
                     let (ok, id, etag) = match &created {
@@ -778,7 +783,9 @@ impl Worker {
         let _saving = self.start(|activity| &mut activity.saving);
         let mut store = open_store()?;
         let client = self.account_client(&store, account).await?;
-        let created = client.insert_event(calendar_id, &resource).await?;
+        let created = client
+            .insert_event(calendar_id, &resource, self.notify.get())
+            .await?;
         store.apply_event(account, calendar_id, &created)?;
         let text = |name: &str| created[name].as_str().unwrap_or_default().to_owned();
         Ok((text("id"), text("etag")))
