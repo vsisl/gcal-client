@@ -48,15 +48,26 @@ pub async fn sync_account(
         .await;
         match fetched {
             Ok((events, full)) => {
-                store.apply_events(
+                let applied = store.apply_events(
                     account,
                     id,
                     &events.items,
                     events.sync_token.as_deref(),
                     full,
-                )?;
-                report.calendars_synced += 1;
-                report.events_changed += events.items.len();
+                );
+                match applied {
+                    Ok(()) => {
+                        report.calendars_synced += 1;
+                        report.events_changed += events.items.len();
+                    }
+                    // An event in a shape the model does not understand. Nothing of this
+                    // batch was saved (so nothing is half-applied), and the other
+                    // calendars must still sync.
+                    Err(StoreError::Json(error)) => report
+                        .failed_calendars
+                        .push((id.clone(), format!("unreadable event: {error}"))),
+                    Err(error) => return Err(error.into()),
+                }
             }
             // Without a working sign-in or network nothing else will succeed either.
             Err(error @ (ApiError::Auth(_) | ApiError::Http(_))) => return Err(error.into()),
@@ -243,6 +254,44 @@ mod tests {
 
         sync_account(&client, &mut store, account).await.unwrap();
         assert_eq!(stored_ids(&store), ["fresh"]);
+    }
+
+    #[tokio::test]
+    async fn an_event_the_model_cannot_read_fails_its_calendar_only() {
+        let server = MockServer::start().await;
+        let client = client(&server).await;
+        let mut store = Store::open_in_memory().unwrap();
+        let account = store.add_account("me@example.com").unwrap();
+
+        mount_calendar_list(
+            &server,
+            json!({"items": [{"id": "odd", "summary": "A"}, {"id": "good", "summary": "B"}]}),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/calendars/odd/events"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [event("fine"), {"id": "x", "start": {"date": "not a date"}}],
+                "nextSyncToken": "t"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/calendars/good/events"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": [event("e")]})))
+            .mount(&server)
+            .await;
+
+        let report = sync_account(&client, &mut store, account).await.unwrap();
+        assert_eq!(report.calendars_synced, 1);
+        assert_eq!(report.failed_calendars[0].0, "odd");
+        // Nothing of the odd calendar was kept, and its token was not advanced.
+        assert_eq!(stored_ids(&store), ["e"]);
+        let odd = &store.calendars().unwrap()[0];
+        assert_eq!(
+            (odd.entry.id.as_str(), &odd.events_sync_token),
+            ("odd", &None)
+        );
     }
 
     #[tokio::test]
