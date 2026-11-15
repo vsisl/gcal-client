@@ -217,10 +217,14 @@ impl Worker {
             .client(config, refresh_token.clone())
             .with_access_token(tokens.access_token, tokens.expires_at);
         let email = client.account_email().await?;
-        vault.save(&email, &refresh_token).await?;
 
         let _syncing = self.start(|activity| &mut activity.syncing);
+        // The sign-in is saved under the same lock as the account row. Saved before it, a
+        // removal of this very account that was waiting on a running sync would delete the
+        // fresh sign-in and leave an account that can never sync again. The lock is handed
+        // out in order, so that removal now runs first and this account is added after it.
         let _cache = self.cache.lock().await;
+        vault.save(&email, &refresh_token).await?;
         let mut store = open_store()?;
         let account = store.add_account(&email)?;
         self.data_changed();
