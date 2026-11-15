@@ -285,22 +285,22 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
                     resource,
                 } => {
                     let created = worker.insert_event(account, &calendar_id, resource).await;
-                    if created.is_ok() {
+                    if let Ok(id) = &created {
+                        let id = id.clone();
                         let _ = worker
                             .ui
-                            .upgrade_in_event_loop(|ui| ui.invoke_event_created());
+                            .upgrade_in_event_loop(move |ui| ui.invoke_event_created(id.into()));
                     }
-                    created
+                    created.map(|_| ())
                 }
                 Command::RestoreEvent {
                     account,
                     calendar_id,
                     resource,
-                } => {
-                    worker
-                        .insert_event(account, &calendar_id, restorable(resource))
-                        .await
-                }
+                } => worker
+                    .insert_event(account, &calendar_id, restorable(resource))
+                    .await
+                    .map(|_| ()),
             };
             if let Err(error) = result
                 && !error.is::<Superseded>()
@@ -700,20 +700,21 @@ impl Worker {
         Ok(())
     }
 
-    /// Creates an event at Google and saves what Google made of it.
+    /// Creates an event at Google, saves what Google made of it and returns its
+    /// identifier.
     async fn insert_event(
         &self,
         account: AccountId,
         calendar_id: &str,
         resource: Value,
-    ) -> Result<()> {
+    ) -> Result<String> {
         self.clear_error();
         let _saving = self.start(|activity| &mut activity.saving);
         let mut store = open_store()?;
         let client = self.account_client(&store, account).await?;
         let created = client.insert_event(calendar_id, &resource).await?;
         store.apply_event(account, calendar_id, &created)?;
-        Ok(())
+        Ok(created["id"].as_str().unwrap_or_default().to_owned())
     }
 
     async fn remove_account(&self, email: &str) -> Result<()> {

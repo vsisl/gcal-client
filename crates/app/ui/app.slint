@@ -182,7 +182,9 @@ global Theme {
 component TextButton inherits Rectangle {
     in property <string> text;
     in property <bool> outlined;
-    in property <color> text-color: Theme.text;
+    // The one thing to do next: in the accent colour.
+    in property <bool> filled;
+    in property <color> text-color: filled ? Theme.on-accent : Theme.text;
     callback clicked;
 
     height: 36px;
@@ -190,7 +192,8 @@ component TextButton inherits Rectangle {
     border-radius: self.height / 2;
     border-width: outlined ? 1px : 0px;
     border-color: Theme.line;
-    background: touch.pressed ? Theme.pressed : touch.has-hover ? Theme.hover : transparent;
+    background: filled ? Theme.accent : touch.pressed ? Theme.pressed : touch.has-hover ? Theme.hover : transparent;
+    opacity: filled && touch.has-hover ? 0.9 : 1;
     accessible-role: button;
     accessible-label: root.text;
     accessible-action-default => {
@@ -600,10 +603,12 @@ export component AppWindow inherits Window {
     // A new event: asked for with a day (counted from the first one shown; negative for
     // "about now"), the minute of the day, and whether it is to last all day. Rust fills
     // in the card's properties and shows it.
-    callback draft-requested(int, int, bool);
+    // The last number is its length in minutes, 0 for the usual hour.
+    callback draft-requested(int, int, bool, int);
     // Title and the position of the chosen calendar.
     callback draft-save(string, int);
-    callback event-created();
+    // The worker created an event; its identifier allows taking that back.
+    callback event-created(string);
     in-out property <bool> draft-visible;
     in property <string> draft-when;
     in property <[DraftCalendar]> draft-calendars;
@@ -611,14 +616,27 @@ export component AppWindow inherits Window {
     // Where the new event's ghost is drawn in the day columns; day -1 for none.
     in property <int> draft-day: -1;
     in property <int> draft-min;
+    in property <int> draft-len: 60;
+    // The time being dragged out on empty hours for a new event; day -1 for none.
+    property <int> sel-day: -1;
+    property <int> sel-from;
+    property <int> sel-start;
+    property <int> sel-end;
 
-    function ask-draft(day: int, minute: int, all-day: bool, x: length, y: length) {
+    // Scrolls the hours so that a time of day is on screen, if it is not.
+    public function reveal-minute(minute: int) {
+        if (minute / 60.0 * hour-h < -grid.content-y || (minute + 60) / 60.0 * hour-h > -grid.content-y + grid.height) {
+            grid.content-y = -Math.max(0px, Math.min(hour-h * 24 - grid.height, minute / 60.0 * hour-h - grid.height / 3));
+        }
+    }
+
+    function ask-draft(day: int, minute: int, all-day: bool, length: int, x: length, y: length) {
         if (root.offline) {
             return;
         }
         detail-x = x;
         detail-y = y;
-        root.draft-requested(day, minute, all-day);
+        root.draft-requested(day, minute, all-day, length);
     }
 
     function close-draft() {
@@ -718,7 +736,7 @@ export component AppWindow inherits Window {
                 return accept;
             }
             if (event.text == "c") {
-                root.ask-draft(-1, 0, false, root.width / 2 - 200px, root.height / 3);
+                root.ask-draft(-1, 0, false, 0, root.width / 2 - 200px, root.height / 3);
                 return accept;
             }
             if (event.text == "z" && root.toast != "" && root.toast-undo) {
@@ -1189,7 +1207,7 @@ export component AppWindow inherits Window {
                             width: parent.width - gutter;
                             height: strip-h;
                             clicked => {
-                                root.ask-draft(Math.floor(self.mouse-x / day-w), 0, true, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                root.ask-draft(Math.floor(self.mouse-x / day-w), 0, true, 0, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
                             }
                         }
                         for item in root.all-day: Rectangle {
@@ -1275,8 +1293,31 @@ export component AppWindow inherits Window {
                                 x: gutter;
                                 width: parent.width - gutter;
                                 height: hour-h * 24;
-                                clicked => {
-                                    root.ask-draft(Math.floor(self.mouse-x / day-w), Math.floor(self.mouse-y / (hour-h / 2)) * 30, false, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                // A click is an hour from the half hour clicked; a drag
+                                // marks the time out in quarters of an hour.
+                                pointer-event(event) => {
+                                    if (event.button != PointerEventButton.left) {
+                                        return;
+                                    }
+                                    if (event.kind == PointerEventKind.down && !root.offline) {
+                                        root.sel-day = Math.floor(self.mouse-x / day-w);
+                                        root.sel-from = Math.floor(self.mouse-y / (hour-h / 4)) * 15;
+                                        root.sel-start = root.sel-from;
+                                        root.sel-end = root.sel-from;
+                                    } else if (event.kind == PointerEventKind.up && root.sel-day >= 0) {
+                                        if (root.sel-end - root.sel-start >= 30) {
+                                            root.ask-draft(root.sel-day, root.sel-start, false, root.sel-end - root.sel-start, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                        } else {
+                                            root.ask-draft(root.sel-day, Math.floor(root.sel-from / 30) * 30, false, 0, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                        }
+                                        root.sel-day = -1;
+                                    }
+                                }
+                                moved => {
+                                    if (self.pressed && root.sel-day >= 0) {
+                                        root.sel-start = Math.max(0, Math.min(root.sel-from, Math.round(self.mouse-y / (hour-h / 4)) * 15));
+                                        root.sel-end = Math.min(24 * 60, Math.max(root.sel-from, Math.round(self.mouse-y / (hour-h / 4)) * 15));
+                                    }
                                 }
                             }
 
@@ -1432,7 +1473,18 @@ export component AppWindow inherits Window {
                                 x: gutter + root.draft-day * day-w + 1px;
                                 y: root.draft-min / 60.0 * hour-h;
                                 width: day-w - 10px;
-                                height: hour-h - 1px;
+                                height: root.draft-len / 60.0 * hour-h - 1px;
+                                border-radius: 4px;
+                                background: Theme.accent;
+                                opacity: 0.6;
+                            }
+
+                            // The time being dragged out for a new event.
+                            if root.sel-day >= 0 && root.sel-end - root.sel-start >= 15: Rectangle {
+                                x: gutter + root.sel-day * day-w + 1px;
+                                y: root.sel-start / 60.0 * hour-h;
+                                width: day-w - 10px;
+                                height: (root.sel-end - root.sel-start) / 60.0 * hour-h - 1px;
                                 border-radius: 4px;
                                 background: Theme.accent;
                                 opacity: 0.6;
@@ -1482,7 +1534,7 @@ export component AppWindow inherits Window {
                             // An empty part of the cell: a click starts an all-day event.
                             TouchArea {
                                 clicked => {
-                                    root.ask-draft(i, 0, true, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                    root.ask-draft(i, 0, true, 0, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
                                 }
                             }
 
@@ -1980,24 +2032,37 @@ export component AppWindow inherits Window {
 
             draft := VerticalLayout {
                 padding: 16px;
+                padding-top: 8px;
                 spacing: 10px;
 
+                HorizontalLayout {
+                    alignment: end;
+                    TextButton {
+                        text: "✕";
+                        height: 32px;
+                        width: 32px;
+                        accessible-label: @tr("Close");
+                        clicked => {
+                            root.close-draft();
+                        }
+                    }
+                }
+
+                // The title: a line to write on, as on the web.
                 Rectangle {
                     height: 40px;
-                    border-radius: 4px;
-                    background: Theme.hover;
 
                     if draft-title.text == "": Text {
-                        x: 12px;
+                        x: 2px;
                         text: @tr("Add title");
-                        font-size: 18px;
+                        font-size: 20px;
                         color: Theme.text-dim;
                         vertical-alignment: center;
                     }
                     draft-title := TextInput {
-                        x: 12px;
-                        width: parent.width - 24px;
-                        font-size: 18px;
+                        x: 2px;
+                        width: parent.width - 4px;
+                        font-size: 20px;
                         color: Theme.text;
                         vertical-alignment: center;
                         single-line: true;
@@ -2017,74 +2082,38 @@ export component AppWindow inherits Window {
                             reject
                         }
                     }
+
+                    Rectangle {
+                        y: parent.height - self.height;
+                        height: draft-title.has-focus ? 2px : 1px;
+                        background: draft-title.has-focus ? Theme.accent : Theme.line;
+                    }
                 }
 
                 Text {
                     text: root.draft-when;
-                    font-size: 13px;
+                    font-size: 14px;
                     color: Theme.text;
                     wrap: word-wrap;
                 }
 
                 // Which calendar it goes into, of all accounts.
-                Flickable {
-                    height: Math.min(5, root.draft-calendars.length) * 30px;
-                    interactive: false;
-                    content-height: root.draft-calendars.length * 30px;
-
-                    for calendar[i] in root.draft-calendars: Rectangle {
-                        y: i * 30px;
-                        height: 30px;
-                        border-radius: 4px;
-                        background: root.draft-calendar == i ? Theme.selected : choose.has-hover ? Theme.hover : transparent;
-                        accessible-role: list-item;
-                        accessible-label: "\{calendar.name}, \{calendar.account}";
-                        accessible-action-default => {
-                            root.draft-calendar = i;
-                        }
-
-                        choose := TouchArea {
-                            clicked => {
-                                root.draft-calendar = i;
-                            }
-                        }
-
-                        Rectangle {
-                            x: 8px;
-                            y: (parent.height - self.height) / 2;
-                            width: 12px;
-                            height: 12px;
-                            border-radius: 6px;
-                            background: calendar.color;
-                        }
-
-                        Text {
-                            x: 28px;
-                            width: parent.width - 36px;
-                            height: parent.height;
-                            text: calendar.name == calendar.account ? calendar.name : "\{calendar.name} · \{calendar.account}";
-                            font-size: 13px;
-                            color: Theme.text;
-                            vertical-alignment: center;
-                            overflow: elide;
-                        }
+                Choice {
+                    options: root.editor-calendars;
+                    current: root.draft-calendar;
+                    chosen(i) => {
+                        root.draft-calendar = i;
                     }
                 }
 
                 HorizontalLayout {
                     alignment: end;
-                    spacing: 4px;
-                    TextButton {
-                        text: @tr("Cancel");
-                        height: 32px;
-                        clicked => {
-                            root.close-draft();
-                        }
-                    }
-
+                    spacing: 8px;
+                    padding-top: 4px;
                     TextButton {
                         text: @tr("More options");
-                        height: 32px;
+                        height: 36px;
+                        text-color: Theme.accent;
                         clicked => {
                             root.editor-from-draft(draft-title.text, root.draft-calendar);
                         }
@@ -2092,9 +2121,8 @@ export component AppWindow inherits Window {
 
                     TextButton {
                         text: @tr("Save");
-                        height: 32px;
-                        outlined: true;
-                        text-color: Theme.accent;
+                        height: 36px;
+                        filled: true;
                         clicked => {
                             root.draft-save(draft-title.text, root.draft-calendar);
                             root.close-draft();
@@ -2339,8 +2367,7 @@ export component AppWindow inherits Window {
                         TextButton {
                             text: @tr("Save");
                             height: 32px;
-                            outlined: true;
-                            text-color: Theme.accent;
+                            filled: true;
                             clicked => {
                                 root.editor-save(root.editor, root.draft-calendar);
                             }

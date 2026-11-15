@@ -748,6 +748,8 @@ enum UndoKind {
     /// Create the event again from the resource it had. For a series this brings back
     /// the series, not the changes that had been made to single occurrences.
     Recreate(serde_json::Value),
+    /// Delete an event that was just created.
+    Delete(String),
     /// Give an event some of its fields back.
     Patch {
         event_id: String,
@@ -767,8 +769,15 @@ struct Draft {
     calendars: Vec<(AccountId, String, String)>,
 }
 
-/// When a new event starts and ends: an hour from the time clicked, or the whole day.
-fn draft_times(day: NaiveDate, minute: i32, all_day: bool, zone: Tz) -> (EventTime, EventTime) {
+/// When a new event starts and ends: `length` minutes from the time clicked, or the
+/// whole day.
+fn draft_times(
+    day: NaiveDate,
+    minute: i32,
+    all_day: bool,
+    length: i32,
+    zone: Tz,
+) -> (EventTime, EventTime) {
     if all_day {
         return (
             EventTime::AllDay(day),
@@ -784,7 +793,7 @@ fn draft_times(day: NaiveDate, minute: i32, all_day: bool, zone: Tz) -> (EventTi
         .unwrap_or_else(|| local_day_start(day, zone));
     (
         EventTime::Timed(start),
-        EventTime::Timed(start + Duration::hours(1)),
+        EventTime::Timed(start + Duration::minutes(i64::from(length))),
     )
 }
 
@@ -831,6 +840,8 @@ struct View {
     /// A change to a repeating event while the window asks how much of the series it is
     /// meant for.
     asked: RefCell<Option<Asked>>,
+    /// Where the event being created goes, to take the creation back.
+    creating: RefCell<Option<(AccountId, String)>>,
     /// The event the editor is open for.
     editing: RefCell<Option<Editing>>,
     /// Hides the message about the last change after a while.
@@ -1522,6 +1533,7 @@ impl View {
                 return;
             };
             let _ = self.store.set_setting(NEW_EVENT_CALENDAR, &key);
+            self.creating.replace(Some((account, calendar_id.clone())));
             let _ = self.commands.send(Command::CreateEvent {
                 account,
                 calendar_id,
@@ -1621,6 +1633,19 @@ impl View {
         }
     }
 
+    /// The worker has created the event that was asked for last: say so, and offer to
+    /// take it back.
+    fn event_created(&self, id: &str) {
+        let undo = self.creating.take().map(|(account, calendar_id)| Undo {
+            account,
+            calendar_id,
+            kind: UndoKind::Delete(id.to_owned()),
+        });
+        let can_undo = undo.is_some();
+        self.undo.replace(undo);
+        self.show_toast("Event saved", can_undo);
+    }
+
     /// The worker has answered a change. `occurrence` is the event it was made to, if
     /// that was one occurrence of a series.
     fn change_finished(&self, changed: bool, occurrence: &str) {
@@ -1681,7 +1706,8 @@ impl View {
 
     /// Opens the card for a new event. `day` counts from the first day shown; a negative
     /// one means "about now" (the `c` key).
-    fn open_draft(&self, day: i32, minute: i32, all_day: bool) {
+    fn open_draft(&self, day: i32, minute: i32, all_day: bool, length: i32) {
+        let length = if length > 0 { length } else { 60 };
         let Some(ui) = self.ui.upgrade() else { return };
         let (first, days) = self.range();
         let has_columns = !matches!(self.span.get(), Span::Month | Span::Schedule);
@@ -1699,7 +1725,13 @@ impl View {
         } else {
             (i64::from(day), minute)
         };
-        let (start, end) = draft_times(first + Duration::days(day), minute, all_day, self.zone);
+        let (start, end) = draft_times(
+            first + Duration::days(day),
+            minute,
+            all_day,
+            length,
+            self.zone,
+        );
 
         let loaded = self.loaded.borrow();
         let emails: HashMap<AccountId, &str> = loaded
@@ -1768,6 +1800,11 @@ impl View {
         let ghost = has_columns && !all_day;
         ui.set_draft_day(if ghost { day as i32 } else { -1 });
         ui.set_draft_min(minute);
+        ui.set_draft_len(length);
+        if ghost {
+            // "About now" may be below the hours on screen.
+            ui.invoke_reveal_minute(minute);
+        }
         ui.set_detail_visible(false);
         ui.set_draft_visible(true);
     }
@@ -1782,6 +1819,7 @@ impl View {
         };
         // Remembered for the next new event; failing to remember is no reason not to save.
         let _ = self.store.set_setting(NEW_EVENT_CALENDAR, &key);
+        self.creating.replace(Some((account, calendar_id.clone())));
         let _ = self.commands.send(Command::CreateEvent {
             account,
             calendar_id,
@@ -1807,6 +1845,15 @@ impl View {
                 account,
                 calendar_id,
                 resource,
+            },
+            UndoKind::Delete(event_id) => Command::DeleteEvent {
+                account,
+                calendar_id,
+                deletion: Deletion::Event {
+                    event_id,
+                    etag: None,
+                },
+                notify: false,
             },
             UndoKind::Patch { event_id, changes } => Command::PatchEvent {
                 account,
@@ -1849,6 +1896,7 @@ pub fn run() -> Result<()> {
         undo: RefCell::default(),
         asked: RefCell::default(),
         editing: RefCell::default(),
+        creating: RefCell::default(),
         toast_timer: Timer::default(),
         commands: commands.clone(),
         all_day: Rc::default(),
@@ -1955,7 +2003,7 @@ pub fn run() -> Result<()> {
     });
     ui.on_draft_requested({
         let view = view.clone();
-        move |day, minute, all_day| view.open_draft(day, minute, all_day)
+        move |day, minute, all_day, length| view.open_draft(day, minute, all_day, length)
     });
     ui.on_draft_save({
         let view = view.clone();
@@ -1963,7 +2011,7 @@ pub fn run() -> Result<()> {
     });
     ui.on_event_created({
         let view = view.clone();
-        move || view.show_toast("Event saved", false)
+        move |id| view.event_created(&id)
     });
     ui.on_undo({
         let view = view.clone();
@@ -2592,7 +2640,7 @@ mod tests {
     fn a_new_event_lasts_an_hour_from_the_time_clicked_or_the_whole_day() {
         let zone = chrono_tz::Europe::Prague;
         let day = date("2026-11-17");
-        let (start, end) = draft_times(day, 9 * 60 + 30, false, zone);
+        let (start, end) = draft_times(day, 9 * 60 + 30, false, 60, zone);
         assert_eq!(
             start,
             EventTime::Timed("2026-11-17T08:30:00Z".parse().unwrap())
@@ -2610,7 +2658,7 @@ mod tests {
             })
         );
 
-        let (start, end) = draft_times(day, 0, true, zone);
+        let (start, end) = draft_times(day, 0, true, 60, zone);
         assert_eq!(
             event_resource("Trip", start, end, zone),
             serde_json::json!({
@@ -2621,7 +2669,7 @@ mod tests {
         );
 
         // 02:30 does not exist on the night clocks go forward.
-        let (start, _) = draft_times(date("2027-03-28"), 150, false, zone);
+        let (start, _) = draft_times(date("2027-03-28"), 150, false, 60, zone);
         assert!(matches!(start, EventTime::Timed(_)));
     }
 
