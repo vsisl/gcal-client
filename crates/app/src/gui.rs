@@ -279,6 +279,86 @@ struct Target {
     etag: Option<String>,
     /// Set when the instance is one occurrence of a series.
     occurrence: Option<Occurrence>,
+    /// Whether it can be dragged to another time.
+    movable: bool,
+}
+
+/// Whether the event can be moved and resized by dragging. Not yet: repeating events
+/// (which need the "this / following / all" question) and events with guests (who
+/// would have to be told); never the special kinds of entry (birthdays, ...).
+fn can_move(event: &Event, calendar: &CalendarListEntry) -> bool {
+    calendar.is_writable()
+        && matches!(event.event_type.as_deref(), None | Some("default"))
+        && !event.is_recurring_master()
+        && event.recurring_event_id.is_none()
+        && event.attendees.is_empty()
+}
+
+/// An instant moved by whole days and minutes on the local clock, so that a move across
+/// a change of the clocks keeps the time of day.
+fn shift(instant: DateTime<Utc>, days: i64, minutes: i64, zone: Tz) -> DateTime<Utc> {
+    let by = Duration::days(days) + Duration::minutes(minutes);
+    let local = instant.with_timezone(&zone).naive_local() + by;
+    zone.from_local_datetime(&local)
+        .earliest()
+        .map(|moved| moved.with_timezone(&Utc))
+        // A local time the clocks skip: the same distance in real time instead.
+        .unwrap_or(instant + by)
+}
+
+/// Start and end of an event dragged by `days` and `minutes`; its length stays.
+fn moved_times(
+    start: EventTime,
+    end: EventTime,
+    days: i64,
+    minutes: i64,
+    zone: Tz,
+) -> (EventTime, EventTime) {
+    match (start, end) {
+        (EventTime::AllDay(first), EventTime::AllDay(last)) => (
+            EventTime::AllDay(first + Duration::days(days)),
+            EventTime::AllDay(last + Duration::days(days)),
+        ),
+        (EventTime::Timed(from), EventTime::Timed(to)) => {
+            let moved = shift(from, days, minutes, zone);
+            (
+                EventTime::Timed(moved),
+                EventTime::Timed(moved + (to - from)),
+            )
+        }
+        unchanged => unchanged,
+    }
+}
+
+/// The end of a timed event whose lower edge was dragged by `minutes`; never less than
+/// a quarter of an hour after the start. `None` for all-day events.
+fn resized_end(start: EventTime, end: EventTime, minutes: i64, zone: Tz) -> Option<EventTime> {
+    let (EventTime::Timed(from), EventTime::Timed(to)) = (start, end) else {
+        return None;
+    };
+    let dragged = shift(to, 0, minutes, zone);
+    Some(EventTime::Timed(dragged.max(from + Duration::minutes(15))))
+}
+
+/// The fields to send for new times of an event, keeping the time zone each end had.
+fn time_changes(
+    resource: &serde_json::Value,
+    start: EventTime,
+    end: EventTime,
+) -> serde_json::Value {
+    let field = |name: &str, time: EventTime| match time {
+        EventTime::AllDay(day) => serde_json::json!({ "date": day.to_string() }),
+        EventTime::Timed(instant) => {
+            let mut field = serde_json::json!({
+                "dateTime": instant.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            });
+            if let Some(zone) = resource[name]["timeZone"].as_str() {
+                field["timeZone"] = zone.into();
+            }
+            field
+        }
+    };
+    serde_json::json!({ "start": field("start", start), "end": field("end", end) })
 }
 
 /// Which occurrence of which series an instance on screen is.
@@ -623,6 +703,15 @@ impl View {
             MonthLayout::default()
         };
 
+        let movable = |index: usize| {
+            let instance = &instances[index];
+            can_move(instance.event, &calendars[instance.key].entry)
+        };
+        // An event drawn as several blocks (it crosses midnight) is not resized by one.
+        let mut blocks: HashMap<usize, u32> = HashMap::new();
+        for block in &layout.timed {
+            *blocks.entry(block.index).or_default() += 1;
+        }
         let title = |index: usize| -> SharedString {
             instances[index]
                 .event
@@ -694,6 +783,8 @@ impl View {
                         end_min: block.end_min,
                         col: block.col,
                         cols: block.cols,
+                        movable: movable(block.index),
+                        resizable: movable(block.index) && blocks[&block.index] == 1,
                         color,
                         text_color: text_color_on(color),
                     }
@@ -713,6 +804,7 @@ impl View {
                         first_day: bar.first_day,
                         last_day: bar.last_day,
                         row: bar.row,
+                        movable: movable(bar.index),
                         color,
                         text_color: text_color_on(color),
                     }
@@ -809,6 +901,7 @@ impl View {
                     event_id: instance.event.id.clone(),
                     etag: instance.event.etag.clone(),
                     occurrence: occurrence_of(instance.event, instance.start),
+                    movable: can_move(instance.event, &calendar.entry),
                 }
             })
             .collect();
@@ -947,6 +1040,135 @@ impl View {
             deletion,
             notify,
         });
+    }
+
+    /// Gives the event behind an instance new times, worked out by `change` from its
+    /// present ones. The undo is prepared from the cache before anything is sent.
+    fn change_times(
+        &self,
+        instance: usize,
+        change: impl Fn(EventTime, EventTime) -> Option<(EventTime, EventTime)>,
+    ) -> bool {
+        let Some(target) = self.targets.borrow().get(instance).cloned() else {
+            return false;
+        };
+        if !target.movable {
+            return false;
+        }
+        let resource =
+            match self
+                .store
+                .event_json(target.account, &target.calendar_id, &target.event_id)
+            {
+                Ok(Some(resource)) => resource,
+                Ok(None) => return false,
+                Err(error) => {
+                    self.show_error(&error.into());
+                    return false;
+                }
+            };
+        let Ok(event) = serde_json::from_value::<Event>(resource.clone()) else {
+            return false;
+        };
+        let (Some(start), Some(end)) = (event.start_time(), event.end_time()) else {
+            return false;
+        };
+        let Some((new_start, new_end)) = change(start, end).filter(|new| *new != (start, end))
+        else {
+            return false;
+        };
+        self.undo.replace(Some(Undo {
+            account: target.account,
+            calendar_id: target.calendar_id.clone(),
+            kind: UndoKind::Patch {
+                event_id: target.event_id.clone(),
+                changes: serde_json::json!({ "start": resource["start"], "end": resource["end"] }),
+            },
+        }));
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_toast(SharedString::new());
+        }
+        let _ = self.commands.send(Command::ChangeEvent {
+            account: target.account,
+            calendar_id: target.calendar_id,
+            event_id: target.event_id,
+            etag: target.etag,
+            changes: time_changes(&resource, new_start, new_end),
+        });
+        true
+    }
+
+    /// An event was dragged by days and minutes. It is drawn at its new place at once,
+    /// where that is simple, rather than jumping back until Google has answered.
+    fn move_event(&self, instance: usize, days: i32, minutes: i32) {
+        let zone = self.zone;
+        let sent = self.change_times(instance, |start, end| {
+            Some(moved_times(start, end, days.into(), minutes.into(), zone))
+        });
+        if !sent {
+            return;
+        }
+        let shown_days = self.range().1 as i32;
+        let on_screen = |day: i32| (0..shown_days).contains(&day);
+        let blocks: Vec<usize> = (0..self.timed.row_count())
+            .filter(|row| {
+                self.timed
+                    .row_data(*row)
+                    .is_some_and(|b| b.instance == instance as i32)
+            })
+            .collect();
+        if let [row] = blocks[..]
+            && let Some(mut block) = self.timed.row_data(row)
+        {
+            let (start, end) = (block.start_min + minutes, block.end_min + minutes);
+            if start >= 0 && end <= 24 * 60 && on_screen(block.day + days) {
+                block.day += days;
+                block.start_min = start;
+                block.end_min = end;
+                self.timed.set_row_data(row, block);
+            }
+        }
+        for row in 0..self.all_day.row_count() {
+            if let Some(mut bar) = self.all_day.row_data(row)
+                && bar.instance == instance as i32
+                && on_screen(bar.first_day + days)
+                && on_screen(bar.last_day + days)
+            {
+                bar.first_day += days;
+                bar.last_day += days;
+                self.all_day.set_row_data(row, bar);
+            }
+        }
+    }
+
+    /// The lower edge of an event's block was dragged by minutes.
+    fn resize_event(&self, instance: usize, minutes: i32) {
+        let zone = self.zone;
+        let sent = self.change_times(instance, |start, end| {
+            Some((start, resized_end(start, end, minutes.into(), zone)?))
+        });
+        if !sent {
+            return;
+        }
+        for row in 0..self.timed.row_count() {
+            if let Some(mut block) = self.timed.row_data(row)
+                && block.instance == instance as i32
+            {
+                block.end_min = (block.end_min + minutes).clamp(block.start_min + 15, 24 * 60);
+                self.timed.set_row_data(row, block);
+            }
+        }
+    }
+
+    /// The worker has answered a move or resize.
+    fn change_finished(&self, changed: bool) {
+        if changed {
+            self.show_toast("Event saved", true);
+        } else {
+            // A dialog says why. Put the event back where it is.
+            self.undo.take();
+            self.refresh();
+        }
     }
 
     /// The worker has answered a deletion: offer to undo it, for a while. `occurrence`
@@ -1193,6 +1415,18 @@ pub fn run() -> Result<()> {
             };
             view.delete_event(instance as usize, scope, notify);
         }
+    });
+    ui.on_event_moved({
+        let view = view.clone();
+        move |instance, days, minutes| view.move_event(instance as usize, days, minutes)
+    });
+    ui.on_event_resized({
+        let view = view.clone();
+        move |instance, minutes| view.resize_event(instance as usize, minutes)
+    });
+    ui.on_change_finished({
+        let view = view.clone();
+        move |changed| view.change_finished(changed)
     });
     ui.on_delete_finished({
         let view = view.clone();
@@ -1462,6 +1696,115 @@ mod tests {
     }
 
     #[test]
+    fn only_plain_events_in_writable_calendars_can_be_dragged() {
+        let calendar = |role: &str| -> CalendarListEntry {
+            serde_json::from_value(serde_json::json!({"id": "c", "accessRole": role})).unwrap()
+        };
+        let event = |extra: serde_json::Value| -> Event {
+            let mut value = serde_json::json!({"id": "e"});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(value).unwrap()
+        };
+        let owner = calendar("owner");
+        assert!(can_move(&event(serde_json::json!({})), &owner));
+        assert!(can_move(
+            &event(serde_json::json!({"eventType": "default"})),
+            &owner
+        ));
+        assert!(!can_move(
+            &event(serde_json::json!({})),
+            &calendar("reader")
+        ));
+        for other in [
+            serde_json::json!({"recurrence": ["RRULE:FREQ=DAILY"]}),
+            serde_json::json!({"recurringEventId": "m"}),
+            serde_json::json!({"attendees": [{"email": "a@example.com"}]}),
+            serde_json::json!({"eventType": "birthday"}),
+        ] {
+            assert!(!can_move(&event(other), &owner));
+        }
+    }
+
+    #[test]
+    fn a_dragged_event_keeps_its_length_and_its_time_of_day() {
+        let zone: Tz = "Europe/Prague".parse().unwrap();
+        let instant = |text: &str| text.parse::<DateTime<Utc>>().unwrap();
+        let timed = |text: &str| EventTime::Timed(instant(text));
+        // A day later and half an hour down.
+        assert_eq!(
+            moved_times(
+                timed("2026-11-16T09:00:00Z"),
+                timed("2026-11-16T10:00:00Z"),
+                1,
+                30,
+                zone
+            ),
+            (timed("2026-11-17T09:30:00Z"), timed("2026-11-17T10:30:00Z"))
+        );
+        // Across the end of summer time (25 October 2026): still 10:00 on the clock.
+        assert_eq!(
+            moved_times(
+                timed("2026-10-24T08:00:00Z"),
+                timed("2026-10-24T09:00:00Z"),
+                1,
+                0,
+                zone
+            ),
+            (timed("2026-10-25T09:00:00Z"), timed("2026-10-25T10:00:00Z"))
+        );
+        // All-day events move by days only.
+        let day = |d: u32| EventTime::AllDay(NaiveDate::from_ymd_opt(2026, 11, d).unwrap());
+        assert_eq!(
+            moved_times(day(16), day(18), -2, 45, zone),
+            (day(14), day(16))
+        );
+
+        // The lower edge: down, up, and never above a quarter of an hour.
+        let (start, end) = (timed("2026-11-16T09:00:00Z"), timed("2026-11-16T10:00:00Z"));
+        assert_eq!(
+            resized_end(start, end, 30, zone),
+            Some(timed("2026-11-16T10:30:00Z"))
+        );
+        assert_eq!(
+            resized_end(start, end, -30, zone),
+            Some(timed("2026-11-16T09:30:00Z"))
+        );
+        assert_eq!(
+            resized_end(start, end, -120, zone),
+            Some(timed("2026-11-16T09:15:00Z"))
+        );
+        assert_eq!(resized_end(day(16), day(17), 30, zone), None);
+    }
+
+    #[test]
+    fn new_times_are_sent_in_the_zone_the_event_had() {
+        let instant = |text: &str| EventTime::Timed(text.parse::<DateTime<Utc>>().unwrap());
+        let resource = serde_json::json!({
+            "start": {"dateTime": "2026-11-16T10:00:00+01:00", "timeZone": "Europe/Prague"},
+            "end": {"dateTime": "2026-11-16T11:00:00+01:00"}
+        });
+        assert_eq!(
+            time_changes(
+                &resource,
+                instant("2026-11-17T09:30:00Z"),
+                instant("2026-11-17T10:30:00Z")
+            ),
+            serde_json::json!({
+                "start": {"dateTime": "2026-11-17T09:30:00Z", "timeZone": "Europe/Prague"},
+                "end": {"dateTime": "2026-11-17T10:30:00Z"}
+            })
+        );
+        let day = |d: u32| EventTime::AllDay(NaiveDate::from_ymd_opt(2026, 11, d).unwrap());
+        assert_eq!(
+            time_changes(&serde_json::json!({}), day(16), day(17)),
+            serde_json::json!({"start": {"date": "2026-11-16"}, "end": {"date": "2026-11-17"}})
+        );
+    }
+
+    #[test]
     fn a_deletion_is_planned_with_its_way_back() {
         use serde_json::json;
         let instant = |text: &str| EventTime::Timed(text.parse::<DateTime<Utc>>().unwrap());
@@ -1471,6 +1814,7 @@ mod tests {
             event_id: event_id.into(),
             etag: Some("\"own\"".into()),
             occurrence,
+            movable: false,
         };
         let series = json!({
             "id": "m", "etag": "\"series\"",

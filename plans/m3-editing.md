@@ -42,7 +42,9 @@ The rest of M2 is parked in `plans/m2-remaining.md`.
    and time row that can be edited, calendar drop-down, "More options" and "Save" —
    which comes with the pickers of slice 7. Drag to set the length is also open.)*
 5. **Drag to move and resize** in the day columns, 15-minute steps; all-day bars move by
-   days. Optimistic draw, rolled back on failure.
+   days. Optimistic draw, rolled back on failure. *(done for plain events; repeating
+   ones come with slice 6. Open: dragging on empty time to set a new event's length;
+   dragging between the all-day strip and the hours; the month view.)*
 6. **Recurring events**: "this event / this and following / all events" for delete, move
    and edit. Pure logic for splitting a series goes in `crates/core` with tests.
 7. **Full editor** (`e` or "More options"): title, dates and times, all-day, time zone,

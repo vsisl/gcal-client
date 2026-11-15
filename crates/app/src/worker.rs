@@ -44,7 +44,16 @@ pub enum Command {
         deletion: Deletion,
         notify: bool,
     },
-    /// Changes fields of an event; used to take back a deletion inside a series.
+    /// Changes fields of an event as the user asked in the window (moving it, say),
+    /// only if it still is the version the window showed.
+    ChangeEvent {
+        account: AccountId,
+        calendar_id: String,
+        event_id: String,
+        etag: Option<String>,
+        changes: Value,
+    },
+    /// Changes fields of an event to take an earlier change back.
     PatchEvent {
         account: AccountId,
         calendar_id: String,
@@ -183,7 +192,8 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
             // the status line, where it is easily missed.
             let failure = match command {
                 Command::DeleteEvent { .. } => Some("The event was not deleted."),
-                Command::PatchEvent { .. } => Some("The event could not be brought back."),
+                Command::ChangeEvent { .. } => Some("The event was not changed."),
+                Command::PatchEvent { .. } => Some("The change could not be taken back."),
                 Command::CreateEvent { .. } => Some("The event was not saved."),
                 Command::RestoreEvent { .. } => Some("The event could not be brought back."),
                 _ => None,
@@ -212,6 +222,23 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
                         .upgrade_in_event_loop(move |ui| ui.invoke_delete_finished(ok, id.into()));
                     deleted.map(|_| ())
                 }
+                Command::ChangeEvent {
+                    account,
+                    calendar_id,
+                    event_id,
+                    etag,
+                    changes,
+                } => {
+                    let changed = worker
+                        .patch_event(account, &calendar_id, &event_id, changes, etag.as_deref())
+                        .await;
+                    // The window drew the change already and takes it back on failure.
+                    let ok = changed.is_ok();
+                    let _ = worker
+                        .ui
+                        .upgrade_in_event_loop(move |ui| ui.invoke_change_finished(ok));
+                    changed
+                }
                 Command::PatchEvent {
                     account,
                     calendar_id,
@@ -219,7 +246,7 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
                     changes,
                 } => {
                     worker
-                        .patch_event(account, &calendar_id, &event_id, changes)
+                        .patch_event(account, &calendar_id, &event_id, changes, None)
                         .await
                 }
                 Command::CreateEvent {
@@ -552,14 +579,19 @@ impl Worker {
         calendar_id: &str,
         event_id: &str,
         changes: Value,
+        etag: Option<&str>,
     ) -> Result<()> {
         self.clear_error();
         let saving = self.start(|activity| &mut activity.saving);
         let mut store = open_store()?;
         let client = self.account_client(&store, account).await?;
-        let changed = client
-            .patch_event(calendar_id, event_id, &changes, None, false)
-            .await?;
+        let answer = client
+            .patch_event(calendar_id, event_id, &changes, etag, false)
+            .await;
+        let Some(changed) = self.written(answer).await? else {
+            let _ = self.sync_all().await;
+            bail!("it no longer exists");
+        };
         store.apply_event(account, calendar_id, &changed)?;
         drop(saving);
         let _ = self.sync_all().await;

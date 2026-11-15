@@ -16,6 +16,9 @@ export struct TimedItem {
     // Position among overlapping events: column `col` of `cols`.
     col: int,
     cols: int,
+    // Whether it can be dragged to another time, and by its lower edge to another length.
+    movable: bool,
+    resizable: bool,
     color: color,
     text-color: color,
 }
@@ -26,6 +29,8 @@ export struct AllDayItem {
     first-day: int,
     last-day: int,
     row: int,
+    // Whether it can be dragged to other days.
+    movable: bool,
     color: color,
     text-color: color,
 }
@@ -314,6 +319,11 @@ export component AppWindow inherits Window {
     // with delete-finished, naming the occurrence it removed if it was a single one.
     callback delete-event(int, int, bool);
     callback delete-finished(bool, string);
+    // An event was dragged: by how many days and minutes; or its lower edge, by how
+    // many minutes. The worker answers with change-finished.
+    callback event-moved(int, int, int);
+    callback event-resized(int, int);
+    callback change-finished(bool);
     // The questions asked before deleting a repeating event or one with guests.
     in-out property <bool> delete-ask-visible;
     property <int> delete-scope;
@@ -878,18 +888,49 @@ export component AppWindow inherits Window {
                             }
                         }
                         for item in root.all-day: Rectangle {
-                            x: gutter + item.first-day * day-w + 2px;
+                            // While it is dragged: by how many days, and where the pointer
+                            // went down in the window (the bar moves under the pointer, so
+                            // positions inside it cannot measure the drag).
+                            property <bool> dragging;
+                            property <int> drag-days;
+                            property <length> press-x;
+
+                            x: gutter + (item.first-day + self.drag-days) * day-w + 2px;
                             y: head-h + 2px + item.row * bar-h;
                             width: (item.last-day - item.first-day + 1) * day-w - 8px;
                             height: bar-h - 2px;
                             border-radius: 4px;
                             background: item.color;
+                            opacity: self.dragging ? 0.7 : 1;
                             clip: true;
 
                             TouchArea {
                                 mouse-cursor: pointer;
-                                clicked => {
-                                    root.show-detail(item.instance, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                pointer-event(event) => {
+                                    if (event.button != PointerEventButton.left) {
+                                        return;
+                                    }
+                                    if (event.kind == PointerEventKind.down) {
+                                        parent.press-x = self.absolute-position.x + self.mouse-x;
+                                    } else if (event.kind == PointerEventKind.up) {
+                                        if (parent.dragging) {
+                                            if (parent.drag-days != 0) {
+                                                root.event-moved(item.instance, parent.drag-days, 0);
+                                            }
+                                            parent.dragging = false;
+                                            parent.drag-days = 0;
+                                        } else {
+                                            root.show-detail(item.instance, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                        }
+                                    }
+                                }
+                                moved => {
+                                    if (item.movable && self.pressed) {
+                                        if (parent.dragging || Math.abs(self.absolute-position.x + self.mouse-x - parent.press-x) > 6px) {
+                                            parent.dragging = true;
+                                            parent.drag-days = Math.max(-item.first-day, Math.min(root.day-count - 1 - item.last-day, Math.round((self.absolute-position.x + self.mouse-x - parent.press-x) / day-w)));
+                                        }
+                                    }
                                 }
                             }
 
@@ -962,14 +1003,27 @@ export component AppWindow inherits Window {
                                 property <length> slot-w: (day-w - 10px) / item.cols;
                                 property <string> shown-title: item.title == "" ? @tr("(No title)") : item.title;
 
-                                x: gutter + item.day * day-w + 1px + item.col * slot-w;
-                                y: item.start-min / 60.0 * hour-h;
-                                width: slot-w - 1px;
-                                height: (item.end-min - item.start-min) / 60.0 * hour-h - 1px;
+                                // While it is dragged: by how many days and minutes (in
+                                // quarters of an hour), or by how many minutes its lower
+                                // edge; and where the pointer went down in the window (the
+                                // block moves under the pointer, so positions inside it
+                                // cannot measure the drag).
+                                property <bool> dragging;
+                                property <int> drag-days;
+                                property <int> drag-min;
+                                property <int> grow-min;
+                                property <length> press-x;
+                                property <length> press-y;
+
+                                x: self.dragging ? gutter + (item.day + self.drag-days) * day-w + 1px : gutter + item.day * day-w + 1px + item.col * slot-w;
+                                y: (item.start-min + self.drag-min) / 60.0 * hour-h;
+                                width: self.dragging ? day-w - 10px : slot-w - 1px;
+                                height: (item.end-min - item.start-min + self.grow-min) / 60.0 * hour-h - 1px;
                                 border-radius: 4px;
                                 border-width: 1px;
                                 border-color: Theme.surface;
                                 background: item.color;
+                                opacity: self.dragging || self.grow-min != 0 ? 0.7 : 1;
                                 clip: true;
                                 accessible-role: list-item;
                                 accessible-label: "\{self.shown-title}, \{item.time}";
@@ -979,8 +1033,59 @@ export component AppWindow inherits Window {
 
                                 TouchArea {
                                     mouse-cursor: pointer;
-                                    clicked => {
-                                        root.show-detail(item.instance, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                    pointer-event(event) => {
+                                        if (event.button != PointerEventButton.left) {
+                                            return;
+                                        }
+                                        if (event.kind == PointerEventKind.down) {
+                                            parent.press-x = self.absolute-position.x + self.mouse-x;
+                                            parent.press-y = self.absolute-position.y + self.mouse-y;
+                                        } else if (event.kind == PointerEventKind.up) {
+                                            if (parent.dragging) {
+                                                if (parent.drag-days != 0 || parent.drag-min != 0) {
+                                                    root.event-moved(item.instance, parent.drag-days, parent.drag-min);
+                                                }
+                                                parent.dragging = false;
+                                                parent.drag-days = 0;
+                                                parent.drag-min = 0;
+                                            } else {
+                                                root.show-detail(item.instance, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                            }
+                                        }
+                                    }
+                                    moved => {
+                                        if (item.movable && self.pressed) {
+                                            if (parent.dragging || Math.abs(self.absolute-position.x + self.mouse-x - parent.press-x) > 6px || Math.abs(self.absolute-position.y + self.mouse-y - parent.press-y) > 6px) {
+                                                parent.dragging = true;
+                                                parent.drag-days = Math.max(-item.day, Math.min(root.day-count - 1 - item.day, Math.round((self.absolute-position.x + self.mouse-x - parent.press-x) / day-w)));
+                                                parent.drag-min = Math.max(-item.start-min, Math.min(24 * 60 - item.end-min, Math.round((self.absolute-position.y + self.mouse-y - parent.press-y) / (hour-h / 4)) * 15));
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // The lower edge: dragging it changes when the event ends.
+                                if item.resizable: TouchArea {
+                                    y: parent.height - self.height;
+                                    height: Math.min(8px, parent.height / 3);
+                                    mouse-cursor: ns-resize;
+                                    pointer-event(event) => {
+                                        if (event.button != PointerEventButton.left) {
+                                            return;
+                                        }
+                                        if (event.kind == PointerEventKind.down) {
+                                            parent.press-y = self.absolute-position.y + self.mouse-y;
+                                        } else if (event.kind == PointerEventKind.up) {
+                                            if (parent.grow-min != 0) {
+                                                root.event-resized(item.instance, parent.grow-min);
+                                            }
+                                            parent.grow-min = 0;
+                                        }
+                                    }
+                                    moved => {
+                                        if (self.pressed) {
+                                            parent.grow-min = Math.max(15 - (item.end-min - item.start-min), Math.min(24 * 60 - item.end-min, Math.round((self.absolute-position.y + self.mouse-y - parent.press-y) / (hour-h / 4)) * 15));
+                                        }
                                     }
                                 }
 
@@ -1886,7 +1991,7 @@ export component AppWindow inherits Window {
                     { keys: "s", what: @tr("Settings") },
                     { keys: "Esc", what: @tr("Close event details") },
                     { keys: "Delete", what: @tr("Delete the open event") },
-                    { keys: "z", what: @tr("Undo the deletion") },
+                    { keys: "z", what: @tr("Undo the last change") },
                     { keys: "?", what: @tr("Show or hide this list") },
                 ]: HorizontalLayout {
                     spacing: 12px;
