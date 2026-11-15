@@ -8,7 +8,9 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# "deny" rather than "forbid": the code Slint generates for the interface carries its own
+# allow(unsafe_code), which "forbid" would turn into a build error. Our own code stays safe.
+unsafe_code = "deny"
 
 [profile.release]
 lto = "thin"
