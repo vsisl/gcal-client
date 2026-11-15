@@ -188,17 +188,25 @@ enum Span {
     FourDays,
     /// A list of the coming days' events.
     Schedule,
+    /// Twelve small months, for finding a date; no events.
+    Year,
 }
 
 impl Span {
     /// The order used by the interface's view switcher and the number keys, as on the web.
-    const ALL: [Span; 5] = [
+    const ALL: [Span; 6] = [
         Span::Day,
         Span::Week,
         Span::Month,
         Span::FourDays,
         Span::Schedule,
+        Span::Year,
     ];
+
+    /// Whether the view is the one with a column per day.
+    fn has_columns(self) -> bool {
+        !matches!(self, Span::Month | Span::Schedule | Span::Year)
+    }
 
     /// The first day shown and the number of days, when the user is looking at `anchor`.
     /// The week view snaps to the start of the week, the month view shows the whole weeks
@@ -209,6 +217,11 @@ impl Span {
             Span::FourDays => (anchor, 4),
             Span::Schedule => (anchor, SCHEDULE_DAYS),
             Span::Week => (week_start_of(anchor), 7),
+            Span::Year => {
+                let first = anchor.with_ordinal(1).unwrap_or(anchor);
+                let next = NaiveDate::from_ymd_opt(anchor.year() + 1, 1, 1).unwrap_or(first);
+                (first, (next - first).num_days())
+            }
             Span::Month => {
                 let first = week_start_of(anchor.with_day(1).unwrap_or(anchor));
                 let next_month = (anchor.with_day(1).unwrap_or(anchor)) + Months::new(1);
@@ -224,6 +237,9 @@ impl Span {
             // Lands on the same day of the neighbouring month, or its last day.
             Span::Month if direction < 0 => anchor - Months::new(1),
             Span::Month => anchor + Months::new(1),
+            // The same day a year on, or the last of February for the 29th.
+            Span::Year if direction < 0 => anchor - Months::new(12),
+            Span::Year => anchor + Months::new(12),
             _ => anchor + Duration::days(direction * self.range(anchor).1),
         }
     }
@@ -232,6 +248,7 @@ impl Span {
     fn title(self, anchor: NaiveDate) -> String {
         match self {
             Span::Month => anchor.format("%B %Y").to_string(),
+            Span::Year => anchor.year().to_string(),
             _ => {
                 let (first, days) = self.range(anchor);
                 period_title(first, days)
@@ -977,6 +994,10 @@ struct View {
     commands: UnboundedSender<Command>,
     all_day: Rc<VecModel<AllDayItem>>,
     month_cells: Rc<VecModel<MonthCell>>,
+    /// For each day of the month view, all its events: shown as a list when "N more"
+    /// is chosen.
+    day_lists: RefCell<Vec<Vec<ScheduleRow>>>,
+    year_days: Rc<VecModel<MiniDay>>,
     month_chips: Rc<VecModel<MonthChip>>,
     schedule: Rc<VecModel<ScheduleRow>>,
     sidebar: Rc<VecModel<SidebarRow>>,
@@ -1077,12 +1098,15 @@ impl View {
         let (week_start, days) = self.range();
         let is_month = span == Span::Month;
         let is_schedule = span == Span::Schedule;
+        let is_year = span == Span::Year;
         let today = self.today();
         ui.set_view_index(Span::ALL.iter().position(|s| *s == span).unwrap_or(0) as i32);
         self.drawn_today.set(Some(today));
         ui.set_period_title(span.title(self.anchor.get()).into());
         if is_month {
             ui.set_month_weeks((days / 7) as i32);
+        } else if is_year {
+            self.update_year(ui, today);
         } else if !is_schedule {
             ui.set_day_count(days as i32);
             patch(
@@ -1135,7 +1159,9 @@ impl View {
         patch(&self.sidebar, sidebar);
 
         let from = local_day_start(week_start, self.zone);
-        let to = local_day_start(week_start + Duration::days(days), self.zone);
+        // The year shows no events, so none are looked up for it.
+        let shown_days = if is_year { 0 } else { days };
+        let to = local_day_start(week_start + Duration::days(shown_days), self.zone);
         let singles = self
             .store
             .single_events_for_range(from.timestamp() - 86_400, to.timestamp() + 86_400)?;
@@ -1151,7 +1177,7 @@ impl View {
         }));
         let spans: Vec<_> = instances.iter().map(|i| (i.start, i.end)).collect();
         // Only one of the views is on screen; the models of the others are emptied.
-        let layout = if is_month || is_schedule {
+        let layout = if !span.has_columns() {
             WeekLayout::default()
         } else {
             layout_days(&spans, week_start, days, self.zone)
@@ -1278,6 +1304,39 @@ impl View {
         );
         ui.set_all_day_rows(layout.all_day_rows);
 
+        // Every event of each day of the month view, for the list behind "N more".
+        let mut day_lists: Vec<Vec<ScheduleRow>> = Vec::new();
+        if is_month {
+            day_lists.resize(days as usize, Vec::new());
+            for entry in schedule(&spans, week_start, days, self.zone) {
+                let day = week_start + Duration::days(i64::from(entry.day));
+                let time = match (entry.part, spans[entry.index]) {
+                    (DayPart::Whole, (EventTime::Timed(start), EventTime::Timed(end))) => {
+                        format!("{} – {}", clock(start, self.zone), clock(end, self.zone))
+                    }
+                    (DayPart::Starts, (EventTime::Timed(start), _)) => clock(start, self.zone),
+                    (DayPart::Ends, (_, EventTime::Timed(end))) => {
+                        format!("Until {}", clock(end, self.zone))
+                    }
+                    _ => "All day".to_owned(),
+                };
+                if let Some(list) = day_lists.get_mut(entry.day as usize) {
+                    list.push(ScheduleRow {
+                        instance: entry.index as i32,
+                        first_of_day: list.is_empty(),
+                        day_number: day.day().to_string().into(),
+                        day_name: day.format("%A").to_string().into(),
+                        today: day == today,
+                        time: time.into(),
+                        title: title(entry.index),
+                        color: color(entry.index),
+                    });
+                }
+            }
+        }
+        self.day_lists.replace(day_lists);
+        ui.set_day_list_visible(false);
+
         let shown_month = self.anchor.get().month();
         patch(
             &self.month_cells,
@@ -1395,7 +1454,7 @@ impl View {
         let now = Utc::now().with_timezone(&self.zone);
         let (first, days) = self.range();
         let offset = (now.date_naive() - first).num_days();
-        let has_columns = !matches!(self.span.get(), Span::Month | Span::Schedule);
+        let has_columns = self.span.get().has_columns();
         if has_columns && (0..days).contains(&offset) {
             ui.set_now_day(offset as i32);
             ui.set_now_min((now.hour() * 60 + now.minute()) as i32);
@@ -1438,7 +1497,7 @@ impl View {
         let (shown_first, shown_days) = self.range();
         let today = self.today();
         // Marking every day of a month or of the schedule would say nothing.
-        let marks_range = !matches!(self.span.get(), Span::Month | Span::Schedule);
+        let marks_range = self.span.get().has_columns();
         ui.set_mini_title(month.format("%B %Y").to_string().into());
         patch(
             &self.mini_days,
@@ -1455,6 +1514,44 @@ impl View {
                 })
                 .collect(),
         );
+    }
+
+    /// Draws the year: twelve months of six weeks each, in the week's order.
+    fn update_year(&self, ui: &AppWindow, today: NaiveDate) {
+        let year = self.anchor.get().year();
+        let mut names = Vec::with_capacity(12);
+        let mut days = Vec::with_capacity(12 * MINI_MONTH_DAYS as usize);
+        for month in 1..=12 {
+            let Some(first_of_month) = NaiveDate::from_ymd_opt(year, month, 1) else {
+                continue;
+            };
+            names.push(SharedString::from(first_of_month.format("%B").to_string()));
+            let (first, _) = Span::Month.range(first_of_month);
+            for offset in 0..MINI_MONTH_DAYS {
+                let day = first + Duration::days(offset);
+                days.push(MiniDay {
+                    label: day.day().to_string().into(),
+                    today: day == today,
+                    dim: day.month() != month,
+                    shown: false,
+                });
+            }
+        }
+        ui.set_year_months(ModelRc::from(Rc::new(VecModel::from(names))));
+        patch(&self.year_days, days);
+    }
+
+    /// Opens the day view on a day picked in the year: `cell` counts the days of all
+    /// twelve months' grids.
+    fn pick_year_day(&self, cell: i64) {
+        let month = (cell / MINI_MONTH_DAYS) as u32 + 1;
+        let Some(first_of_month) = NaiveDate::from_ymd_opt(self.anchor.get().year(), month, 1)
+        else {
+            return;
+        };
+        let (first, _) = Span::Month.range(first_of_month);
+        self.span.set(Span::Day);
+        self.show(first + Duration::days(cell % MINI_MONTH_DAYS));
     }
 
     /// Pages the small month back (-1) or forward (1) without moving the main view.
@@ -1950,7 +2047,7 @@ impl View {
         let length = if length > 0 { length } else { 60 };
         let Some(ui) = self.ui.upgrade() else { return };
         let (first, days) = self.range();
-        let has_columns = !matches!(self.span.get(), Span::Month | Span::Schedule);
+        let has_columns = self.span.get().has_columns();
         let (day, minute) = if day < 0 {
             // The next half hour, today if today is on screen.
             let now = Utc::now().with_timezone(&self.zone);
@@ -2144,6 +2241,8 @@ pub fn run() -> Result<()> {
         commands: commands.clone(),
         all_day: Rc::default(),
         month_cells: Rc::default(),
+        day_lists: RefCell::default(),
+        year_days: Rc::default(),
         month_chips: Rc::default(),
         schedule: Rc::default(),
         sidebar: Rc::default(),
@@ -2152,6 +2251,26 @@ pub fn run() -> Result<()> {
     ui.set_timed(ModelRc::from(view.timed.clone()));
     ui.set_all_day(ModelRc::from(view.all_day.clone()));
     ui.set_month_cells(ModelRc::from(view.month_cells.clone()));
+    ui.set_year_days(ModelRc::from(view.year_days.clone()));
+    ui.on_day_list_requested({
+        let view = view.clone();
+        move |cell| {
+            let rows = view.day_lists.borrow().get(cell as usize).cloned();
+            if let (Some(rows), Some(ui)) = (rows, view.ui.upgrade()) {
+                let title = rows
+                    .first()
+                    .map(|row| format!("{}, {}", row.day_name, row.day_number))
+                    .unwrap_or_default();
+                ui.set_day_list_title(title.into());
+                ui.set_day_list(ModelRc::from(Rc::new(VecModel::from(rows))));
+                ui.set_day_list_visible(true);
+            }
+        }
+    });
+    ui.on_year_pick({
+        let view = view.clone();
+        move |cell| view.pick_year_day(i64::from(cell))
+    });
     ui.set_month_chips(ModelRc::from(view.month_chips.clone()));
     ui.set_schedule(ModelRc::from(view.schedule.clone()));
     ui.set_sidebar(ModelRc::from(view.sidebar.clone()));
@@ -2545,6 +2664,17 @@ mod tests {
         assert_eq!(Span::Month.step(date("2026-11-18"), 1), date("2026-12-18"));
         // There is no 31 November.
         assert_eq!(Span::Month.step(date("2026-12-31"), -1), date("2026-11-30"));
+        assert_eq!(Span::Year.step(date("2026-11-18"), 1), date("2027-11-18"));
+        assert_eq!(Span::Year.step(date("2028-02-29"), -1), date("2027-02-28"));
+        assert_eq!(
+            Span::Year.range(date("2026-11-18")),
+            (date("2026-01-01"), 365)
+        );
+        assert_eq!(
+            Span::Year.range(date("2028-03-01")),
+            (date("2028-01-01"), 366)
+        );
+        assert_eq!(Span::Year.title(date("2026-11-18")), "2026");
     }
 
     #[test]
