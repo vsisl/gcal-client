@@ -36,9 +36,14 @@ Made by the owner; do not reopen them without being asked.
 - Commit dead ends and their fixes too (what was tried, the error, what replaced it), so
   the history shows the path. Never squash.
 - Ask before pushing. Pull requests are merged with a merge commit.
-- A milestone or a larger change goes through a pull request: CI must be green, an
-  independent review is run (so far with Codex) and posted as a comment on the pull
-  request, and its findings are fixed or filed as issues before merging.
+- Everything reaches `main` through a pull request, and every pull request gets a Codex
+  review before it is merged, however small it is:
+  1. CI must be green.
+  2. Run a Codex review of the pull request's diff (read-only; Codex has no network
+     access, so it only writes the review).
+  3. Post the review, as Codex wrote it, as a comment on the pull request.
+  4. Fix each finding on the branch, or file it as a GitHub issue if it is to wait, and
+     answer on the pull request with what was done about each.
 
 **Secrets and real data**
 - Never print, paste or commit the contents of `~/.config/gcal-client/client.toml` or
