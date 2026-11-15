@@ -501,6 +501,10 @@ export component AppWindow inherits Window {
     property <[string]> view-labels: [@tr("Day"), @tr("Week"), @tr("Month"), @tr("{} days", root.custom-days), @tr("Schedule"), @tr("Year")];
     property <[string]> view-keys: ["D", "W", "M", "X", "A", "Y"];
     property <bool> view-menu-visible;
+    function pick-view(index: int) {
+        root.view-menu-visible = false;
+        root.set-view(index);
+    }
     property <length> view-menu-x;
     in-out property <int> custom-days-choice: 2;
     callback custom-days-chosen(int);
@@ -864,12 +868,23 @@ export component AppWindow inherits Window {
                 return accept;
             }
             if (root.view-menu-visible) {
+                // Escape, or the key or number of a view; nothing else gets through.
                 if (event.text == Key.Escape) {
                     root.view-menu-visible = false;
-                    return accept;
+                } else if (event.text == "d" || event.text == "1") {
+                    root.pick-view(0);
+                } else if (event.text == "w" || event.text == "2") {
+                    root.pick-view(1);
+                } else if (event.text == "m" || event.text == "3") {
+                    root.pick-view(2);
+                } else if (event.text == "x" || event.text == "4") {
+                    root.pick-view(3);
+                } else if (event.text == "a" || event.text == "5") {
+                    root.pick-view(4);
+                } else if (event.text == "y" || event.text == "6") {
+                    root.pick-view(5);
                 }
-                // A view's key picks it, as with the menu closed.
-                root.view-menu-visible = false;
+                return accept;
             }
             if (event.text == Key.Escape && root.day-list-visible && !root.detail-visible) {
                 root.day-list-visible = false;
@@ -1858,9 +1873,17 @@ export component AppWindow inherits Window {
                         }
                     }
                     // The year: twelve small months, four in a row. A day opens that day.
-                    if root.is-year: year := Rectangle {
+                    if root.is-year: Flickable {
+                        interactive: false;
+                        content-height: year.height;
+
+                    year := Rectangle {
+                        // Three rows of months fill the height; in a low window they
+                        // keep the height six weeks need, and the wheel scrolls.
                         property <length> month-w: self.width / 4;
-                        property <length> month-h: self.height / 3;
+                        property <length> month-h: Math.max(main.height / 3, 46px + 6 * 14px + 8px);
+                        width: main.width;
+                        height: 3 * self.month-h;
                         property <length> cell: Math.max(14px, Math.min((self.month-w - 32px) / 7, (self.month-h - 44px) / 7));
 
                         for name[m] in root.year-months: Rectangle {
@@ -1925,6 +1948,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
+                    }
                     }
                     // The schedule: the coming days' events as a list.
                     Flickable {

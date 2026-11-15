@@ -125,17 +125,18 @@ fn typed_date(text: &str, today: NaiveDate) -> Option<NaiveDate> {
         "yesterday" => return Some(today - Duration::days(1)),
         _ => {}
     }
-    if let Ok(date) = NaiveDate::parse_from_str(&text, "%Y-%m-%d") {
-        return Some(date);
-    }
-    // Day first, as in most of the world; the separator may be a dot, slash or dash.
     let parts: Vec<&str> = text
         .split(['.', '/', '-', ' '])
         .filter(|part| !part.is_empty())
         .collect();
     let number = |part: &&str| part.parse::<u32>().ok();
-    match parts.as_slice() {
+    let date = match parts.as_slice() {
         [day, month] => NaiveDate::from_ymd_opt(today.year(), number(month)?, number(day)?),
+        // A year of four digits in front: year, month, day.
+        [year, month, day] if year.len() == 4 => {
+            NaiveDate::from_ymd_opt(year.parse().ok()?, number(month)?, number(day)?)
+        }
+        // Else day first, as in most of the world.
         [day, month, year] => {
             let year = year.parse::<i32>().ok()?;
             // "26" means 2026.
@@ -147,7 +148,18 @@ fn typed_date(text: &str, today: NaiveDate) -> Option<NaiveDate> {
             NaiveDate::from_ymd_opt(year, number(month)?, number(day)?)
         }
         _ => None,
-    }
+    }?;
+    // Only what the calendar can show; see `shown_dates`.
+    (date == shown_dates(date)).then_some(date)
+}
+
+/// The day nearest to `day` that the calendar shows: nothing before 1900 or after 2200.
+/// Dates near the limits of what the date type can hold would overflow when the views
+/// work out the days around them.
+fn shown_dates(day: NaiveDate) -> NaiveDate {
+    let first = NaiveDate::from_ymd_opt(1900, 1, 1).unwrap_or_default();
+    let last = NaiveDate::from_ymd_opt(2200, 12, 31).unwrap_or_default();
+    day.clamp(first, last)
 }
 
 /// How dates and times are shown, as chosen in the settings.
@@ -338,8 +350,22 @@ fn own_zone_text(event: &Event, start: EventTime, end: EventTime, shown_in: Tz) 
     if offset(own, start) == offset(shown_in, start) && offset(own, end) == offset(shown_in, end) {
         return String::new();
     }
+    // The day is said wherever it is not the one the main line names: the start's when
+    // it falls on another day there, the end's when the event crosses midnight there.
+    let day = |at: DateTime<Utc>| at.with_timezone(&own).format("%-d %b ").to_string();
+    let date = |zone: Tz, at: DateTime<Utc>| at.with_timezone(&zone).date_naive();
+    let start_day = if date(own, start) == date(shown_in, start) {
+        String::new()
+    } else {
+        day(start)
+    };
+    let end_day = if date(own, end) == date(own, start) {
+        String::new()
+    } else {
+        day(end)
+    };
     format!(
-        "{} – {} in {}",
+        "{start_day}{} – {end_day}{} in {}",
         clock(start, own),
         clock(end, own),
         own.name().replace('_', " ")
@@ -1578,9 +1604,18 @@ impl View {
     }
 
     fn show(&self, anchor: NaiveDate) {
+        let anchor = shown_dates(anchor);
         self.anchor.set(anchor);
         self.mini_month.set(anchor);
         self.refresh();
+    }
+
+    /// Changes the view and remembers it: the app opens on the view it was closed with.
+    fn set_span(&self, span: Span) {
+        self.span.set(span);
+        if let Some(index) = Span::ALL.iter().position(|s| *s == span) {
+            let _ = self.store.set_setting(LAST_VIEW, &index.to_string());
+        }
     }
 
     /// Draws the sidebar's small month: always six weeks, so its height never changes.
@@ -1643,7 +1678,7 @@ impl View {
             return;
         };
         let (first, _) = Span::Month.range(first_of_month);
-        self.span.set(Span::Day);
+        self.set_span(Span::Day);
         self.show(first + Duration::days(cell % MINI_MONTH_DAYS));
     }
 
@@ -2334,7 +2369,7 @@ impl View {
     /// Opens the day view on the day of a cell of the month grid.
     fn open_day(&self, cell: i64) {
         let day = self.range().0 + Duration::days(cell);
-        self.span.set(Span::Day);
+        self.set_span(Span::Day);
         self.show(day);
     }
 }
@@ -2618,9 +2653,7 @@ pub fn run() -> Result<()> {
         let view = view.clone();
         move |index| {
             if let Some(span) = Span::ALL.get(index as usize) {
-                view.span.set(*span);
-                // The app opens on the view it was closed with.
-                let _ = view.store.set_setting(LAST_VIEW, &index.to_string());
+                view.set_span(*span);
                 view.refresh();
             }
         }
@@ -2747,6 +2780,18 @@ mod tests {
         let read = |text: &str| typed_date(text, today);
         assert_eq!(read("2026-11-17"), Some(date("2026-11-17")));
         assert_eq!(read(" 17.11.2026 "), Some(date("2026-11-17")));
+        // Day first with any separator, also with a short year; year first only with
+        // four digits.
+        assert_eq!(read("17-11-26"), Some(date("2026-11-17")));
+        assert_eq!(read("17-11-2026"), Some(date("2026-11-17")));
+        assert_eq!(read("2026/11/17"), Some(date("2026-11-17")));
+        assert_eq!(read("2026.1.5"), Some(date("2026-01-05")));
+        // Outside what the calendar shows.
+        assert_eq!(read("31.12.262142"), None);
+        assert_eq!(read("1.1.1899"), None);
+        assert_eq!(read("31.12.2200"), Some(date("2200-12-31")));
+        assert_eq!(shown_dates(NaiveDate::MAX), date("2200-12-31"));
+        assert_eq!(shown_dates(NaiveDate::MIN), date("1900-01-01"));
         assert_eq!(read("17/11/26"), Some(date("2026-11-17")));
         assert_eq!(read("1. 2."), Some(date("2026-02-01")));
         assert_eq!(read("Tomorrow"), Some(date("2026-11-16")));
@@ -2904,9 +2949,16 @@ mod tests {
             own_zone_text(&event("Asia/Tokyo"), start, end, prague),
             "10:00 – 11:00 in Asia/Tokyo"
         );
+        // There it is still the evening before, which is said.
         assert_eq!(
             own_zone_text(&event("America/New_York"), start, end, prague),
-            "20:00 – 21:00 in America/New York"
+            "16 Nov 20:00 – 21:00 in America/New York"
+        );
+        // Across midnight there: both days.
+        let late_end = EventTime::Timed("2026-11-17T06:00:00Z".parse().unwrap());
+        assert_eq!(
+            own_zone_text(&event("America/New_York"), start, late_end, prague),
+            "16 Nov 20:00 – 17 Nov 1:00 in America/New York"
         );
         // The same clock under another name, no zone at all, or nonsense: nothing.
         assert_eq!(
