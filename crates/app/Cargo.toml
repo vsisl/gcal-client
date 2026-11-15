@@ -8,12 +8,28 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# Starts Slint's embedded test server (when SLINT_MCP_PORT is set) so the interface can be
+# driven and screenshotted automatically. Never enabled in release builds.
+ui-testing = ["slint/mcp"]
+
 [dependencies]
 anyhow = "1.0.104"
+chrono = "0.4.45"
+chrono-tz = "0.10.4"
 dirs = "7.0.0"
+gcal-core = { version = "0.1.0", path = "../core" }
 gcal-google = { version = "0.1.0", path = "../google" }
 gcal-store = { version = "0.1.0", path = "../store" }
 gcal-sync = { version = "0.1.0", path = "../sync" }
+iana-time-zone = "0.1.65"
 oo7 = "0.7.1"
 open = "5.4.5"
-tokio = { version = "1.54.1", features = ["rt", "macros"] }
+slint = "1.18"
+tokio = { version = "1.54.1", features = ["rt", "macros", "sync", "time"] }
+
+[build-dependencies]
+slint-build = "1.18"
+
+[dev-dependencies]
+serde_json = "1.0.154"

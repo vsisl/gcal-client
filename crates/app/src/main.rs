@@ -1,9 +1,11 @@
 //! The desktop application.
 //!
-//! Until the window exists (later in M1) this is a small command-line front end to the
-//! pieces underneath: sign in, sync, and show what is cached.
+//! Started without arguments it opens the window. The commands below are a small
+//! command-line front end to the same pieces, kept for diagnosing sign-in and sync.
 
+mod gui;
 mod vault;
+mod worker;
 
 use std::path::PathBuf;
 
@@ -15,7 +17,8 @@ use vault::Vault;
 /// Name shown to users. Kept in one place because the public name is not final.
 pub const APP_NAME: &str = "gcal-client";
 
-const USAGE: &str = "usage: gcal-client <command>
+const USAGE: &str = "usage: gcal-client [command]
+  (no command)     open the calendar window
   login            sign in to a Google account in your browser, then sync it
   sync             fetch changes for every signed-in account
   accounts         list signed-in accounts and their calendars
@@ -28,7 +31,7 @@ fn config_path() -> Result<PathBuf> {
         .join("client.toml"))
 }
 
-fn open_store() -> Result<Store> {
+pub(crate) fn open_store() -> Result<Store> {
     let dir = dirs::data_dir()
         .context("no data folder on this system")?
         .join(APP_NAME);
@@ -36,7 +39,7 @@ fn open_store() -> Result<Store> {
     Ok(Store::open(&dir.join("cache.db"))?)
 }
 
-fn load_config() -> Result<ClientConfig> {
+pub(crate) fn load_config() -> Result<ClientConfig> {
     let path = config_path()?;
     ClientConfig::load(&path).context("the Google sign-in key is missing or invalid (see README)")
 }
@@ -154,20 +157,27 @@ async fn logout(email: &str) -> Result<()> {
     Ok(())
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    match args.as_slice() {
-        ["login"] => login().await,
-        ["sync"] => sync().await,
-        ["accounts"] => accounts(),
-        ["logout", email] => logout(email).await,
-        _ => {
-            eprintln!("{USAGE}");
-            std::process::exit(2);
-        }
+    if args.is_empty() {
+        return gui::run();
     }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        match args.as_slice() {
+            ["login"] => login().await,
+            ["sync"] => sync().await,
+            ["accounts"] => accounts(),
+            ["logout", email] => logout(email).await,
+            _ => {
+                eprintln!("{USAGE}");
+                std::process::exit(2);
+            }
+        }
+    })
 }
 
 #[cfg(test)]
