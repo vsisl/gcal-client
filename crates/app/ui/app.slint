@@ -204,6 +204,8 @@ export component AppWindow inherits Window {
     callback open-link(string);
     in property <EventDetail> detail;
     in-out property <bool> detail-visible;
+    // The list of keyboard shortcuts, opened with "?".
+    property <bool> help-visible;
     // Where the event was clicked; the details open next to it.
     property <length> detail-x;
     property <length> detail-y;
@@ -241,8 +243,16 @@ export component AppWindow inherits Window {
             if (event.modifiers.control || event.modifiers.alt || event.modifiers.meta) {
                 return reject;
             }
+            if (event.text == Key.Escape && root.help-visible) {
+                root.help-visible = false;
+                return accept;
+            }
             if (event.text == Key.Escape && root.detail-visible) {
                 root.detail-visible = false;
+                return accept;
+            }
+            if (event.text == "?") {
+                root.help-visible = !root.help-visible;
                 return accept;
             }
             if (event.text == "t") {
@@ -1060,6 +1070,74 @@ export component AppWindow inherits Window {
                     font-size: 12px;
                     color: Theme.text-dim;
                     wrap: word-wrap;
+                }
+            }
+        }
+
+        // Keyboard shortcuts. Like the details card, an overlay that takes no focus, so
+        // the shortcuts it lists keep working while it is open.
+        if root.help-visible: TouchArea {
+            clicked => {
+                root.help-visible = false;
+            }
+        }
+        if root.help-visible: Rectangle {
+            width: Math.min(380px, root.width - 24px);
+            height: Math.min(shortcuts.preferred-height, root.height - 24px);
+            background: Theme.surface;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.line;
+            drop-shadow-blur: 24px;
+            drop-shadow-offset-y: 6px;
+            drop-shadow-color: #00000040;
+            clip: true;
+            accessible-role: groupbox;
+            accessible-label: @tr("Keyboard shortcuts");
+
+            TouchArea { }
+
+            shortcuts := VerticalLayout {
+                padding: 20px;
+                spacing: 6px;
+
+                Text {
+                    text: @tr("Keyboard shortcuts");
+                    font-size: 18px;
+                    color: Theme.text;
+                }
+
+                Rectangle {
+                    height: 6px;
+                }
+
+                for line in [
+                    { keys: "t", what: @tr("Today") },
+                    { keys: "j / n", what: @tr("Next period") },
+                    { keys: "k / p", what: @tr("Previous period") },
+                    { keys: "d / 1", what: @tr("Day view") },
+                    { keys: "w / 2", what: @tr("Week view") },
+                    { keys: "m / 3", what: @tr("Month view") },
+                    { keys: "x / 4", what: @tr("4 days view") },
+                    { keys: "a / 5", what: @tr("Schedule view") },
+                    { keys: "r", what: @tr("Refresh") },
+                    { keys: "Esc", what: @tr("Close event details") },
+                    { keys: "?", what: @tr("Show or hide this list") },
+                ]: HorizontalLayout {
+                    spacing: 12px;
+                    Text {
+                        width: 70px;
+                        text: line.keys;
+                        font-size: 13px;
+                        font-weight: 600;
+                        color: Theme.text;
+                    }
+
+                    Text {
+                        text: line.what;
+                        font-size: 13px;
+                        color: Theme.text;
+                    }
                 }
             }
         }
