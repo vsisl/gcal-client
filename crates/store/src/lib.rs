@@ -91,6 +91,9 @@ impl Store {
 
     fn prepare(mut conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "foreign_keys", true)?;
+        // The window and the background sync each hold a connection; wait for the other
+        // to finish writing instead of failing at once.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // Write-ahead logging lets the UI read while a sync is writing.
         let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
         let done: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
