@@ -69,3 +69,14 @@ unless said otherwise.
   They show nowhere but pile up; drop occurrences whose series is not in the cache.
 - Open: the new-event card and details only reach events on screen; `c` late in the
   evening creates an event below the visible hours without scrolling to it.
+
+## After the review of PR 4
+
+The Codex review (a comment on the pull request) had 15 findings; all were dealt with on
+the branch. What stayed open is in GitHub issues:
+
+- #5 a split whose second half may or may not have been created (timeout);
+- #6 undo after deleting a whole series that had changed occurrences;
+- #7 unchanged occurrences are written without a version check;
+- #8 edge cases of repeat rules;
+- #9 tests for a failing or slow Google, and for gestures the test server cannot make.
