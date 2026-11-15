@@ -58,7 +58,7 @@ pub struct EventDateTime {
 }
 
 /// A start or end with the all-day/timed distinction made explicit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventTime {
     AllDay(NaiveDate),
     Timed(DateTime<Utc>),
