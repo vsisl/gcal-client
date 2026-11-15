@@ -53,10 +53,14 @@ pub struct WeekLayout {
 /// The instant a local calendar day begins in `zone`.
 pub fn local_day_start(day: NaiveDate, zone: Tz) -> DateTime<Utc> {
     let midnight = day.and_time(NaiveTime::MIN);
-    zone.from_local_datetime(&midnight)
-        .earliest()
-        // Midnight does not exist on days when clocks jump forward at 00:00; the day then
-        // starts at the first instant that does.
+    // Midnight does not exist on days when clocks jump forward at 00:00 (Havana, Cairo, the
+    // Azores); the day then starts at the first time that does. Zones shift in steps of a
+    // quarter of an hour or more.
+    (0..=8)
+        .find_map(|step| {
+            zone.from_local_datetime(&(midnight + Duration::minutes(15 * step)))
+                .earliest()
+        })
         .unwrap_or_else(|| zone.from_utc_datetime(&midnight))
         .with_timezone(&Utc)
 }
@@ -374,6 +378,16 @@ mod tests {
         assert_eq!(
             (layout.all_day[0].first_day, layout.all_day[0].last_day),
             (1, 3)
+        );
+    }
+
+    #[test]
+    fn day_starts_after_the_gap_when_clocks_jump_forward_at_midnight() {
+        // Havana, 8 March 2026: 00:00 becomes 01:00 (UTC-4), which is 05:00 UTC.
+        let day: NaiveDate = "2026-03-08".parse().unwrap();
+        assert_eq!(
+            local_day_start(day, chrono_tz::America::Havana),
+            "2026-03-08T05:00:00Z".parse::<DateTime<Utc>>().unwrap()
         );
     }
 
