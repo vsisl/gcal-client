@@ -329,6 +329,18 @@ impl Store {
         for item in items {
             save_event(&tx, account, calendar_id, item)?;
         }
+        // Google goes on listing the deleted occurrences of a series that is itself
+        // gone. They are kept only to be left out of their series; without one they
+        // would pile up for nothing.
+        tx.execute(
+            "DELETE FROM events WHERE account_id = ?1 AND calendar_id = ?2
+             AND recurring_event_id IS NOT NULL
+             AND json_extract(json, '$.status') = 'cancelled'
+             AND recurring_event_id NOT IN (
+                 SELECT id FROM events
+                 WHERE account_id = ?1 AND calendar_id = ?2 AND is_master = 1)",
+            params![account, calendar_id],
+        )?;
         tx.execute(
             "UPDATE calendars SET events_sync_token = ?3 WHERE account_id = ?1 AND id = ?2",
             params![account, calendar_id, sync_token],
@@ -481,6 +493,59 @@ fn save_event(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn deleted_occurrences_are_kept_only_while_their_series_exists() {
+        let mut store = Store::open_in_memory().unwrap();
+        let account = store.add_account("me@example.com").unwrap();
+        store
+            .apply_calendar_list(account, &[json!({"id": "c", "summary": "C"})], None, true)
+            .unwrap();
+        let series = json!({
+            "id": "m", "start": {"dateTime": "2026-11-16T10:00:00Z"},
+            "end": {"dateTime": "2026-11-16T11:00:00Z"}, "recurrence": ["RRULE:FREQ=DAILY"]
+        });
+        let deleted = |series: &str| {
+            json!({
+                "id": format!("{series}_20261117T100000Z"), "status": "cancelled",
+                "recurringEventId": series,
+                "originalStartTime": {"dateTime": "2026-11-17T10:00:00Z"}
+            })
+        };
+        // The occurrence arrives before its series, as it may; one of a series that is
+        // not there is dropped.
+        store
+            .apply_events(
+                account,
+                "c",
+                &[deleted("m"), deleted("gone"), series],
+                None,
+                true,
+            )
+            .unwrap();
+        let ids = |store: &Store| {
+            let mut ids: Vec<_> = store
+                .recurring_events()
+                .unwrap()
+                .into_iter()
+                .map(|e| e.event.id)
+                .collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(ids(&store), ["m", "m_20261117T100000Z"]);
+        // The series is deleted; Google lists its deleted occurrence once more.
+        store
+            .apply_events(
+                account,
+                "c",
+                &[json!({"id": "m", "status": "cancelled"}), deleted("m")],
+                None,
+                false,
+            )
+            .unwrap();
+        assert!(ids(&store).is_empty());
+    }
 
     const HOUR: i64 = 3600;
     /// 2026-11-16T00:00:00Z
