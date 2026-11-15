@@ -278,6 +278,9 @@ export component AppWindow inherits Window {
         keys.focus();
     }
     callback undo();
+    // Something the user must read before going on (a change that was refused, say).
+    // Shown as a dialog until dismissed; empty when there is none.
+    in-out property <string> notice;
 
     function show-detail(instance: int, x: length, y: length) {
         detail-instance = instance;
@@ -312,6 +315,13 @@ export component AppWindow inherits Window {
         key-pressed(event) => {
             if (event.modifiers.control || event.modifiers.alt || event.modifiers.meta) {
                 return reject;
+            }
+            if (root.notice != "") {
+                // The dialog is all there is until it is dismissed.
+                if (event.text == Key.Escape || event.text == Key.Return) {
+                    root.notice = "";
+                }
+                return accept;
             }
             if (event.text == Key.Escape && root.help-visible) {
                 root.help-visible = false;
@@ -728,6 +738,16 @@ export component AppWindow inherits Window {
                             width: 1px;
                             height: strip-h;
                             background: Theme.line;
+                        }
+                        // Empty part of the strip: a click starts an all-day event.
+                        TouchArea {
+                            x: gutter;
+                            y: head-h;
+                            width: parent.width - gutter;
+                            height: strip-h;
+                            clicked => {
+                                root.ask-draft(Math.floor(self.mouse-x / day-w), 0, true, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                            }
                         }
                         for item in root.all-day: Rectangle {
                             x: gutter + item.first-day * day-w + 2px;
@@ -1453,6 +1473,51 @@ export component AppWindow inherits Window {
                         text-color: #8ab4f8;
                         clicked => {
                             root.undo();
+                        }
+                    }
+                }
+            }
+        }
+
+        // A message that must be read: dims the window and waits for "OK".
+        if root.notice != "": Rectangle {
+            background: #00000066;
+            TouchArea { }
+        }
+        if root.notice != "": Rectangle {
+            width: Math.min(440px, root.width - 24px);
+            height: Math.min(notice-box.preferred-height, root.height - 24px);
+            background: Theme.card;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.line;
+            drop-shadow-blur: 24px;
+            drop-shadow-offset-y: 6px;
+            drop-shadow-color: #00000040;
+            clip: true;
+            accessible-role: groupbox;
+            accessible-label: root.notice;
+
+            notice-box := VerticalLayout {
+                padding: 24px;
+                padding-bottom: 12px;
+                spacing: 16px;
+
+                Text {
+                    text: root.notice;
+                    font-size: 14px;
+                    color: Theme.text;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    TextButton {
+                        text: @tr("OK");
+                        height: 32px;
+                        text-color: Theme.accent;
+                        clicked => {
+                            root.notice = "";
                         }
                     }
                 }

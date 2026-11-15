@@ -145,6 +145,14 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
             // A sync tells the window itself, and only when it changed something: every
             // reload closes an open details card and forgets the series' occurrences.
             let reload = !matches!(command, Command::SyncAll);
+            // A change the user asked for and did not get is said in a dialog, not in
+            // the status line, where it is easily missed.
+            let failure = match command {
+                Command::DeleteEvent { .. } => Some("The event was not deleted."),
+                Command::CreateEvent { .. } => Some("The event was not saved."),
+                Command::RestoreEvent { .. } => Some("The event could not be brought back."),
+                _ => None,
+            };
             let result = match command {
                 Command::AddAccount => worker.add_account().await,
                 Command::SyncAll => worker.sync_all().await,
@@ -191,7 +199,15 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
             if let Err(error) = result
                 && !error.is::<Superseded>()
             {
-                worker.activity.borrow_mut().error = Some(format!("{error:#}"));
+                match failure {
+                    Some(what) => {
+                        let notice = format!("{what}\n\n{}", sentence(&format!("{error:#}")));
+                        let _ = worker
+                            .ui
+                            .upgrade_in_event_loop(move |ui| ui.set_notice(notice.into()));
+                    }
+                    None => worker.activity.borrow_mut().error = Some(format!("{error:#}")),
+                }
             }
             worker.publish();
             if reload {
@@ -400,7 +416,7 @@ impl Worker {
                 // fetch the new version so the user sees what they would be deleting.
                 let _ = self.sync_all().await;
                 bail!(
-                    "the event was changed elsewhere and has not been deleted; check it and try again"
+                    "it was changed somewhere else in the meantime. The calendar now shows its current version; delete it again if you still want to"
                 );
             }
             Err(error) => return Err(error.into()),
@@ -439,6 +455,19 @@ impl Worker {
         let _ = store.compact();
         Ok(())
     }
+}
+
+/// An error message as a sentence of its own: capitalised, with a full stop.
+fn sentence(text: &str) -> String {
+    let mut letters = text.chars();
+    let Some(first) = letters.next() else {
+        return String::new();
+    };
+    let mut sentence: String = first.to_uppercase().chain(letters).collect();
+    if !sentence.ends_with(['.', '!', '?']) {
+        sentence.push('.');
+    }
+    sentence
 }
 
 /// A deleted event's resource in the form it can be created from again: without what
@@ -492,6 +521,16 @@ mod tests {
                 "reminders": {"useDefault": true}
             })
         );
+    }
+
+    #[test]
+    fn an_error_is_shown_as_a_sentence() {
+        assert_eq!(
+            sentence("network error: timed out"),
+            "Network error: timed out."
+        );
+        assert_eq!(sentence("Done."), "Done.");
+        assert_eq!(sentence(""), "");
     }
 
     #[test]
