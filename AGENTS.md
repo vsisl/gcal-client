@@ -1,6 +1,6 @@
 # gcal-client
 
-Google Calendar native client, behaves just like Google calendar web interface but supports multiple Google accounts 
+Google Calendar native desktop client, behaves just like Google calendar web interface but supports multiple Google accounts 
 natively, just like the mobile Google Calendar app does.
 
 Written in Rust with Slint, GPLv3, Linux first. It is open source: every user signs in with

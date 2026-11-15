@@ -1,6 +1,6 @@
 # gcal-client
 
-Google Calendar native client, behaves just like Google calendar web interface but supports multiple Google accounts 
+Google Calendar native desktop client, behaves just like Google calendar web interface but supports multiple Google accounts 
 natively, just like the mobile Google Calendar app does.
 
 Several accounts (for example personal and work) are shown in one view, with the web
