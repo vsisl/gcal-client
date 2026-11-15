@@ -261,8 +261,11 @@ impl Store {
         for item in items {
             let event: Event = serde_json::from_value(item.clone())?;
             if event.status == EventStatus::Cancelled && event.recurring_event_id.is_none() {
+                // If it was a series, its changed occurrences go with it; left behind, they
+                // would keep showing as events of their own.
                 tx.execute(
-                    "DELETE FROM events WHERE account_id = ?1 AND calendar_id = ?2 AND id = ?3",
+                    "DELETE FROM events WHERE account_id = ?1 AND calendar_id = ?2
+                     AND (id = ?3 OR recurring_event_id = ?3)",
                     params![account, calendar_id, event.id],
                 )?;
                 continue;
@@ -502,6 +505,27 @@ mod tests {
         assert!(ids(&store, DAY, DAY + 24 * HOUR).is_empty());
         assert_eq!(ids(&store, DAY + 24 * HOUR, DAY + 48 * HOUR), ["keep"]);
         assert_eq!(store.event_count(account).unwrap(), 1);
+    }
+
+    #[test]
+    fn deleting_a_series_removes_its_changed_occurrences_too() {
+        let (mut store, account) = store_with_calendar();
+        let mut master = timed("m", "2026-11-02T10:00:00Z", "2026-11-02T11:00:00Z");
+        master["recurrence"] = json!(["RRULE:FREQ=DAILY"]);
+        let mut moved = timed("m_1", "2026-11-16T15:00:00Z", "2026-11-16T16:00:00Z");
+        moved["recurringEventId"] = json!("m");
+        moved["originalStartTime"] = json!({"dateTime": "2026-11-16T10:00:00Z"});
+        let other = timed("other", "2026-11-16T12:00:00Z", "2026-11-16T13:00:00Z");
+        store
+            .apply_events(account, "cal", &[master, moved, other], Some("t1"), true)
+            .unwrap();
+
+        // Google reports the deleted series as its master alone, cancelled.
+        let cancelled = json!({"id": "m", "status": "cancelled"});
+        store
+            .apply_events(account, "cal", &[cancelled], Some("t2"), false)
+            .unwrap();
+        assert_eq!(ids(&store, DAY, DAY + 24 * HOUR), ["other"]);
     }
 
     #[test]
