@@ -11,7 +11,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use gcal_core::{Event, EventTime};
 use gcal_google::{
-    ApiError, ClientConfig, Endpoints, GoogleClient, HttpClient, SCOPE_CALENDAR, TokenSet,
+    ApiError, AuthError, ClientConfig, Endpoints, GoogleClient, HttpClient, SCOPE_CALENDAR,
+    TokenSet,
 };
 use gcal_store::{AccountId, Store};
 use gcal_sync::{Progress, SyncError, SyncReport};
@@ -148,6 +149,9 @@ struct Activity {
     syncing: u32,
     /// Changes being sent to Google.
     saving: u32,
+    /// Google could not be reached at the last sync. The window then shows what it has
+    /// and lets nothing be changed.
+    offline: bool,
     /// How far the running sync has come, in words; empty when there is nothing to say.
     progress: String,
     /// The latest failure, shown until the user starts something new.
@@ -350,7 +354,9 @@ impl Worker {
                 (StatusKind::Idle, String::new())
             }
         };
+        let offline = self.activity.borrow().offline;
         let _ = self.ui.upgrade_in_event_loop(move |ui| {
+            ui.set_offline(offline);
             ui.set_status_kind(kind);
             ui.set_status_detail(detail.into());
         });
@@ -457,6 +463,7 @@ impl Worker {
 
         // One account failing (say, an expired sign-in) must not stop the others.
         let mut problems = Vec::new();
+        let (mut reached, mut unreachable) = (false, false);
         for account in accounts {
             let Some(refresh_token) = vault.load(&account.email).await? else {
                 problems.push(format!("{}: not signed in", account.email));
@@ -464,6 +471,15 @@ impl Worker {
             };
             let client = self.client(config.clone(), refresh_token);
             let result = self.sync_account(&client, &mut store, account.id).await;
+            if let Err(error) = &result
+                && no_connection(error)
+            {
+                // Being offline is a state, shown by a banner, not a failure to report
+                // every few minutes; and nothing was fetched that would need drawing.
+                unreachable = true;
+                continue;
+            }
+            reached |= result.is_ok();
             problems.extend(sync_problem(&account.email, &result));
             // Redrawing closes an open details card and costs time, so the window is only
             // told when there is something new to show. A failed run may have saved part
@@ -476,6 +492,7 @@ impl Worker {
                 self.data_changed();
             }
         }
+        self.activity.borrow_mut().offline = unreachable && !reached;
         if !problems.is_empty() {
             bail!("{}", problems.join("; "));
         }
@@ -713,6 +730,17 @@ impl Worker {
         let _ = store.compact();
         Ok(())
     }
+}
+
+/// Whether a sync failed because Google could not be reached at all (no network, no
+/// name resolution, a timeout), as opposed to Google answering with an error.
+fn no_connection(error: &SyncError) -> bool {
+    let network = match error {
+        SyncError::Api(ApiError::Http(network)) => network,
+        SyncError::Api(ApiError::Auth(AuthError::Http(network))) => network,
+        _ => return false,
+    };
+    network.is_connect() || network.is_timeout() || network.is_request()
 }
 
 /// Finds the identifier Google gives the occurrence of a series that would start at

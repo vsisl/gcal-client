@@ -30,6 +30,8 @@ slint::include_modules!();
 /// push changes to a public web server, so a desktop app has to ask.)
 const SYNC_INTERVAL: StdDuration = StdDuration::from_secs(5 * 60);
 /// The setting that remembers which calendar the previous new event went to.
+/// How often to look for Google again while it cannot be reached.
+const OFFLINE_RETRY: StdDuration = StdDuration::from_secs(30);
 const NEW_EVENT_CALENDAR: &str = "new_event_calendar";
 /// Setting: light or dark, as the number the window uses (0 as the desktop, 1 light,
 /// 2 dark).
@@ -1683,6 +1685,18 @@ pub fn run() -> Result<()> {
                 view.refresh();
             } else if let Some(ui) = view.ui.upgrade() {
                 view.update_now(&ui);
+            }
+        }
+    });
+
+    // Without a connection, look for one more often than the usual sync does.
+    let retry_timer = Timer::default();
+    retry_timer.start(TimerMode::Repeated, OFFLINE_RETRY, {
+        let commands = commands.clone();
+        let ui = ui.as_weak();
+        move || {
+            if ui.upgrade().is_some_and(|ui| ui.get_offline()) {
+                let _ = commands.send(Command::SyncAll);
             }
         }
     });

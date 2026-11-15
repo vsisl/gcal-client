@@ -343,6 +343,9 @@ export component AppWindow inherits Window {
             root.delete-event(root.detail-instance, root.delete-scope, root.delete-notify);
         }
     }
+    // Google cannot be reached: the calendar shows what was fetched last and nothing
+    // can be changed (no changes are kept for later).
+    in property <bool> offline;
     // The questions asked before deleting a repeating event or one with guests.
     in-out property <bool> delete-ask-visible;
     property <int> delete-scope;
@@ -350,6 +353,9 @@ export component AppWindow inherits Window {
 
     // Deletes the event of the open details card, asking first where there is a choice.
     function ask-delete() {
+        if (root.offline) {
+            return;
+        }
         if (root.detail.repeating || root.detail.notify-guests) {
             root.delete-scope = 0;
             root.delete-notify = root.detail.notify-guests;
@@ -378,6 +384,9 @@ export component AppWindow inherits Window {
     in property <int> draft-min;
 
     function ask-draft(day: int, minute: int, all-day: bool, x: length, y: length) {
+        if (root.offline) {
+            return;
+        }
         detail-x = x;
         detail-y = y;
         root.draft-requested(day, minute, all-day);
@@ -641,6 +650,40 @@ export component AppWindow inherits Window {
                     background: Theme.accent;
                     accessible-role: progress-indicator;
                     accessible-label: status.text;
+                }
+            }
+
+            if root.offline: Rectangle {
+                height: 36px;
+                background: Theme.pressed;
+                accessible-role: groupbox;
+                accessible-label: offline-text.text;
+
+                HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 8px;
+                    spacing: 12px;
+
+                    offline-text := Text {
+                        text: @tr("No connection to Google. You see what was fetched last; changes can't be made until the connection is back.");
+                        font-size: 13px;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        TextButton {
+                            text: @tr("Try again");
+                            height: 28px;
+                            text-color: Theme.accent;
+                            clicked => {
+                                root.sync-now();
+                            }
+                        }
+                    }
                 }
             }
 
@@ -945,7 +988,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 moved => {
-                                    if (item.movable && self.pressed) {
+                                    if (item.movable && !root.offline && self.pressed) {
                                         if (parent.dragging || Math.abs(self.absolute-position.x + self.mouse-x - parent.press-x) > 6px) {
                                             parent.dragging = true;
                                             parent.drag-days = Math.max(-item.first-day, Math.min(root.day-count - 1 - item.last-day, Math.round((self.absolute-position.x + self.mouse-x - parent.press-x) / day-w)));
@@ -1074,7 +1117,7 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                     moved => {
-                                        if (item.movable && self.pressed) {
+                                        if (item.movable && !root.offline && self.pressed) {
                                             if (parent.dragging || Math.abs(self.absolute-position.x + self.mouse-x - parent.press-x) > 6px || Math.abs(self.absolute-position.y + self.mouse-y - parent.press-y) > 6px) {
                                                 parent.dragging = true;
                                                 parent.drag-days = Math.max(-item.day, Math.min(root.day-count - 1 - item.day, Math.round((self.absolute-position.x + self.mouse-x - parent.press-x) / day-w)));
@@ -1085,7 +1128,7 @@ export component AppWindow inherits Window {
                                 }
 
                                 // The lower edge: dragging it changes when the event ends.
-                                if item.resizable: TouchArea {
+                                if item.resizable && !root.offline: TouchArea {
                                     y: parent.height - self.height;
                                     height: Math.min(8px, parent.height / 3);
                                     mouse-cursor: ns-resize;
@@ -1467,7 +1510,7 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     alignment: end;
                     spacing: 4px;
-                    if root.detail.can-delete: TextButton {
+                    if root.detail.can-delete && !root.offline: TextButton {
                         text: @tr("Delete");
                         height: 32px;
                         text-color: Theme.danger;
