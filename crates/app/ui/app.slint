@@ -47,6 +47,8 @@ export struct EventDetail {
     link: string,
     // Whether the app can delete it itself.
     can-delete: bool,
+    // Whether it can be changed in the editor.
+    can-edit: bool,
     // One occurrence of a series: deleting asks how much of the series.
     repeating: bool,
     // The account invited guests, who can be told about a deletion.
@@ -108,6 +110,25 @@ export struct DraftCalendar {
     name: string,
     account: string,
     color: color,
+}
+
+// The editor's fields. Dates are typed as 2026-11-17 and times as 9:30; the choices
+// are positions in the lists the editor shows.
+export struct EditorForm {
+    title: string,
+    all-day: bool,
+    start-date: string,
+    end-date: string,
+    start-time: string,
+    end-time: string,
+    repeat: int,
+    location: string,
+    description: string,
+    // 0 is the calendar's colour.
+    color: int,
+    reminder: int,
+    visibility: int,
+    busy: bool,
 }
 
 export struct DayHeader {
@@ -190,6 +211,191 @@ component TextButton inherits Rectangle {
             root.clicked();
         }
     }
+}
+
+// A box to type in, with a hint while it is empty.
+component Field inherits Rectangle {
+    in property <string> hint;
+    in property <string> value;
+    in property <bool> multiline;
+    in property <length> text-size: 14px;
+    in property <bool> take-focus;
+    callback edited(string);
+
+    height: multiline ? 96px : 36px;
+    border-radius: 4px;
+    background: Theme.hover;
+    clip: true;
+
+    if input.text == "": Text {
+        x: 10px;
+        y: root.multiline ? 8px : 0px;
+        height: root.multiline ? 20px : parent.height;
+        text: root.hint;
+        font-size: root.text-size;
+        color: Theme.text-dim;
+        vertical-alignment: center;
+    }
+    input := TextInput {
+        x: 10px;
+        y: root.multiline ? 8px : 0px;
+        width: parent.width - 20px;
+        height: parent.height - 2 * self.y;
+        text: root.value;
+        font-size: root.text-size;
+        color: Theme.text;
+        single-line: !root.multiline;
+        wrap: root.multiline ? word-wrap : no-wrap;
+        vertical-alignment: root.multiline ? top : center;
+        accessible-label: root.hint;
+        init => {
+            if (root.take-focus) {
+                self.focus();
+                // Typing goes on after what is there already.
+                self.set-selection-offsets(self.text.character-count, self.text.character-count);
+            }
+        }
+        edited => {
+            root.edited(self.text);
+        }
+    }
+}
+
+// One of several choices, shown as a line that opens into the list of them.
+component Choice inherits VerticalLayout {
+    in property <[string]> options;
+    in property <int> current;
+    callback chosen(int);
+    property <bool> open;
+
+    Rectangle {
+        height: 36px;
+        border-radius: 4px;
+        background: head-touch.has-hover ? Theme.pressed : Theme.hover;
+        accessible-role: combobox;
+        accessible-label: head.text;
+        accessible-action-default => {
+            root.open = !root.open;
+        }
+
+        head-touch := TouchArea {
+            clicked => {
+                root.open = !root.open;
+            }
+        }
+
+        head := Text {
+            x: 10px;
+            width: parent.width - 36px;
+            height: parent.height;
+            text: root.options[root.current];
+            font-size: 14px;
+            color: Theme.text;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        Text {
+            x: parent.width - 24px;
+            height: parent.height;
+            text: root.open ? "▴" : "▾";
+            font-size: 12px;
+            color: Theme.text-dim;
+            vertical-alignment: center;
+        }
+    }
+
+    if root.open: VerticalLayout {
+        for option[i] in root.options: Rectangle {
+            height: 30px;
+            border-radius: 4px;
+            background: i == root.current ? Theme.selected : option-touch.has-hover ? Theme.hover : transparent;
+            accessible-role: list-item;
+            accessible-label: option;
+            accessible-action-default => {
+                root.chosen(i);
+                root.open = false;
+            }
+
+            option-touch := TouchArea {
+                clicked => {
+                    root.chosen(i);
+                    root.open = false;
+                }
+            }
+
+            Text {
+                x: 22px;
+                width: parent.width - 30px;
+                height: parent.height;
+                text: option;
+                font-size: 13px;
+                color: Theme.text;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+    }
+}
+
+// A tick box with its text.
+component CheckRow inherits Rectangle {
+    in property <string> text;
+    in property <bool> checked;
+    callback toggled;
+
+    height: 36px;
+    border-radius: 4px;
+    background: touch.has-hover ? Theme.hover : transparent;
+    accessible-role: checkbox;
+    accessible-label: root.text;
+    accessible-checked: root.checked;
+    accessible-action-default => {
+        root.toggled();
+    }
+
+    touch := TouchArea {
+        clicked => {
+            root.toggled();
+        }
+    }
+
+    Rectangle {
+        x: 8px;
+        y: (parent.height - self.height) / 2;
+        width: 18px;
+        height: 18px;
+        border-radius: 3px;
+        border-width: 2px;
+        border-color: root.checked ? Theme.accent : Theme.text-dim;
+        background: root.checked ? Theme.accent : transparent;
+    }
+
+    Text {
+        x: 40px;
+        height: parent.height;
+        text: root.text;
+        font-size: 14px;
+        color: Theme.text;
+        vertical-alignment: center;
+    }
+}
+
+// A line of the editor: what it is about, then the control.
+component EditorRow inherits HorizontalLayout {
+    in property <string> label;
+    spacing: 12px;
+
+    Text {
+        width: 96px;
+        height: 36px;
+        text: root.label;
+        font-size: 13px;
+        color: Theme.text-dim;
+        vertical-alignment: center;
+    }
+
+    @children
 }
 
 // One choice of several, with a radio button in front.
@@ -302,6 +508,29 @@ export component AppWindow inherits Window {
     in-out property <bool> detail-visible;
     // The list of keyboard shortcuts, opened with "?".
     property <bool> help-visible;
+    // The editor: all of an event's fields. Rust fills `editor` and shows it; "Save"
+    // hands the form back, with the calendar chosen for a new event.
+    in-out property <EditorForm> editor;
+    in-out property <bool> editor-visible;
+    in property <bool> editor-new;
+    // The event repeats, or reminds, in a way the lists do not offer: one more choice
+    // keeps that as it is.
+    in property <bool> editor-custom-repeat;
+    in property <bool> editor-custom-reminder;
+    in property <string> editor-calendar-name;
+    in property <[string]> editor-calendars;
+    // The calendar's colour, then Google's event colours.
+    in property <[color]> editor-colors;
+    // Why the form cannot be saved as it is.
+    in property <string> editor-error;
+    callback editor-requested(int);
+    callback editor-from-draft(string, int);
+    callback editor-save(EditorForm, int);
+    changed editor-visible => {
+        if (!root.editor-visible) {
+            keys.focus();
+        }
+    }
     // The settings card, opened with "s" or its button.
     property <bool> settings-visible;
     // Light or dark: 0 as the desktop, 1 light, 2 dark. Rust sets the remembered choice
@@ -432,6 +661,15 @@ export component AppWindow inherits Window {
 
     keys := FocusScope {
         key-pressed(event) => {
+            if (root.editor-visible) {
+                // Keys its fields did not take. Everything else waits until it closes.
+                if (event.text == Key.Escape) {
+                    root.editor-visible = false;
+                } else if (event.modifiers.control && (event.text == "s" || event.text == Key.Return)) {
+                    root.editor-save(root.editor, root.draft-calendar);
+                }
+                return accept;
+            }
             if (event.modifiers.control || event.modifiers.alt || event.modifiers.meta) {
                 return reject;
             }
@@ -473,6 +711,10 @@ export component AppWindow inherits Window {
             }
             if ((event.text == Key.Delete || event.text == Key.Backspace) && root.detail-visible && root.detail.can-delete) {
                 root.ask-delete();
+                return accept;
+            }
+            if (event.text == "e" && root.detail-visible && root.detail.can-edit && !root.offline) {
+                root.editor-requested(root.detail-instance);
                 return accept;
             }
             if (event.text == "c") {
@@ -1510,6 +1752,13 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     alignment: end;
                     spacing: 4px;
+                    if root.detail.can-edit && !root.offline: TextButton {
+                        text: @tr("Edit");
+                        height: 32px;
+                        clicked => {
+                            root.editor-requested(root.detail-instance);
+                        }
+                    }
                     if root.detail.can-delete && !root.offline: TextButton {
                         text: @tr("Delete");
                         height: 32px;
@@ -1834,6 +2083,14 @@ export component AppWindow inherits Window {
                     }
 
                     TextButton {
+                        text: @tr("More options");
+                        height: 32px;
+                        clicked => {
+                            root.editor-from-draft(draft-title.text, root.draft-calendar);
+                        }
+                    }
+
+                    TextButton {
                         text: @tr("Save");
                         height: 32px;
                         outlined: true;
@@ -1841,6 +2098,252 @@ export component AppWindow inherits Window {
                         clicked => {
                             root.draft-save(draft-title.text, root.draft-calendar);
                             root.close-draft();
+                        }
+                    }
+                }
+            }
+        }
+
+        // The editor. Its fields take the keyboard; what they leave reaches the
+        // window's key handler, which knows the editor is open.
+        if root.editor-visible: Rectangle {
+            background: #00000066;
+            TouchArea { }
+        }
+        if root.editor-visible: Rectangle {
+            width: Math.min(560px, root.width - 24px);
+            height: Math.min(editor-form.preferred-height, root.height - 24px);
+            background: Theme.card;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.line;
+            drop-shadow-blur: 24px;
+            drop-shadow-offset-y: 6px;
+            drop-shadow-color: #00000040;
+            clip: true;
+            accessible-role: groupbox;
+            accessible-label: root.editor-new ? @tr("New event") : @tr("Edit event");
+
+            TouchArea { }
+
+            Flickable {
+                interactive: false;
+                content-height: editor-form.preferred-height;
+
+                editor-form := VerticalLayout {
+                    padding: 20px;
+                    padding-bottom: 12px;
+                    spacing: 8px;
+
+                    Field {
+                        height: 44px;
+                        hint: @tr("Add title");
+                        text-size: 18px;
+                        take-focus: true;
+                        value: root.editor.title;
+                        edited(text) => {
+                            root.editor.title = text;
+                        }
+                    }
+
+                    EditorRow {
+                        label: @tr("Starts");
+                        Field {
+                            hint: "2026-11-17";
+                            value: root.editor.start-date;
+                            edited(text) => {
+                                root.editor.start-date = text;
+                            }
+                        }
+
+                        if !root.editor.all-day: Field {
+                            width: 110px;
+                            hint: "9:30";
+                            value: root.editor.start-time;
+                            edited(text) => {
+                                root.editor.start-time = text;
+                            }
+                        }
+                    }
+
+                    EditorRow {
+                        label: @tr("Ends");
+                        Field {
+                            hint: "2026-11-17";
+                            value: root.editor.end-date;
+                            edited(text) => {
+                                root.editor.end-date = text;
+                            }
+                        }
+
+                        if !root.editor.all-day: Field {
+                            width: 110px;
+                            hint: "10:30";
+                            value: root.editor.end-time;
+                            edited(text) => {
+                                root.editor.end-time = text;
+                            }
+                        }
+                    }
+
+                    EditorRow {
+                        label: "";
+                        CheckRow {
+                            text: @tr("All day");
+                            checked: root.editor.all-day;
+                            toggled => {
+                                root.editor.all-day = !root.editor.all-day;
+                            }
+                        }
+                    }
+
+                    EditorRow {
+                        label: @tr("Repeats");
+                        Choice {
+                            options: root.editor-custom-repeat ? [@tr("Does not repeat"), @tr("Daily"), @tr("Weekly on the same weekday"), @tr("Monthly on the same day"), @tr("Annually on the same date"), @tr("Every weekday (Monday to Friday)"), @tr("As it repeats now")] : [@tr("Does not repeat"), @tr("Daily"), @tr("Weekly on the same weekday"), @tr("Monthly on the same day"), @tr("Annually on the same date"), @tr("Every weekday (Monday to Friday)")];
+                            current: root.editor.repeat;
+                            chosen(i) => {
+                                root.editor.repeat = i;
+                            }
+                        }
+                    }
+
+                    EditorRow {
+                        label: @tr("Where");
+                        Field {
+                            hint: @tr("Add location");
+                            value: root.editor.location;
+                            edited(text) => {
+                                root.editor.location = text;
+                            }
+                        }
+                    }
+
+                    EditorRow {
+                        label: @tr("Description");
+                        Field {
+                            multiline: true;
+                            hint: @tr("Add description");
+                            value: root.editor.description;
+                            edited(text) => {
+                                root.editor.description = text;
+                            }
+                        }
+                    }
+
+                    EditorRow {
+                        label: @tr("Calendar");
+                        if root.editor-new: Choice {
+                            options: root.editor-calendars;
+                            current: root.draft-calendar;
+                            chosen(i) => {
+                                root.draft-calendar = i;
+                            }
+                        }
+                        if !root.editor-new: Text {
+                            height: 36px;
+                            text: root.editor-calendar-name;
+                            font-size: 14px;
+                            color: Theme.text;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+
+                    EditorRow {
+                        label: @tr("Colour");
+                        HorizontalLayout {
+                            alignment: start;
+                            spacing: 6px;
+                            for swatch[i] in root.editor-colors: Rectangle {
+                                width: 28px;
+                                height: 36px;
+                                accessible-role: list-item;
+                                accessible-label: i == 0 ? @tr("Calendar colour") : @tr("Colour {}", i);
+                                accessible-item-selected: root.editor.color == i;
+                                accessible-action-default => {
+                                    root.editor.color = i;
+                                }
+
+                                Rectangle {
+                                    y: (parent.height - self.height) / 2;
+                                    width: 24px;
+                                    height: 24px;
+                                    border-radius: 12px;
+                                    background: swatch;
+                                    border-width: root.editor.color == i ? 3px : 0px;
+                                    border-color: Theme.text;
+                                }
+
+                                TouchArea {
+                                    clicked => {
+                                        root.editor.color = i;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    EditorRow {
+                        label: @tr("Reminder");
+                        Choice {
+                            options: root.editor-custom-reminder ? [@tr("The calendar's usual reminders"), @tr("None"), @tr("When it starts"), @tr("5 minutes before"), @tr("10 minutes before"), @tr("15 minutes before"), @tr("30 minutes before"), @tr("1 hour before"), @tr("1 day before"), @tr("As it reminds now")] : [@tr("The calendar's usual reminders"), @tr("None"), @tr("When it starts"), @tr("5 minutes before"), @tr("10 minutes before"), @tr("15 minutes before"), @tr("30 minutes before"), @tr("1 hour before"), @tr("1 day before")];
+                            current: root.editor.reminder;
+                            chosen(i) => {
+                                root.editor.reminder = i;
+                            }
+                        }
+                    }
+
+                    EditorRow {
+                        label: @tr("Visibility");
+                        Choice {
+                            options: [@tr("The calendar's default"), @tr("Public"), @tr("Private")];
+                            current: root.editor.visibility;
+                            chosen(i) => {
+                                root.editor.visibility = i;
+                            }
+                        }
+                    }
+
+                    EditorRow {
+                        label: @tr("Shown as");
+                        Choice {
+                            options: [@tr("Busy"), @tr("Free")];
+                            current: root.editor.busy ? 0 : 1;
+                            chosen(i) => {
+                                root.editor.busy = i == 0;
+                            }
+                        }
+                    }
+
+                    if root.editor-error != "": Text {
+                        text: root.editor-error;
+                        font-size: 13px;
+                        color: Theme.danger;
+                        wrap: word-wrap;
+                    }
+
+                    HorizontalLayout {
+                        alignment: end;
+                        spacing: 4px;
+                        padding-top: 4px;
+                        TextButton {
+                            text: @tr("Cancel");
+                            height: 32px;
+                            clicked => {
+                                root.editor-visible = false;
+                            }
+                        }
+
+                        TextButton {
+                            text: @tr("Save");
+                            height: 32px;
+                            outlined: true;
+                            text-color: Theme.accent;
+                            clicked => {
+                                root.editor-save(root.editor, root.draft-calendar);
+                            }
                         }
                     }
                 }
@@ -2051,6 +2554,8 @@ export component AppWindow inherits Window {
                     { keys: "a / 5", what: @tr("Schedule view") },
                     { keys: "r", what: @tr("Refresh") },
                     { keys: "c", what: @tr("Create an event") },
+                    { keys: "e", what: @tr("Edit the open event") },
+                    { keys: "Ctrl+S", what: @tr("Save in the editor") },
                     { keys: "s", what: @tr("Settings") },
                     { keys: "Esc", what: @tr("Close event details") },
                     { keys: "Delete", what: @tr("Delete the open event") },

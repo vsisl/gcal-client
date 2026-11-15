@@ -20,6 +20,7 @@ use gcal_core::{CalendarListEntry, Event, EventTime};
 use gcal_store::{Account, AccountId, Store, StoredCalendar};
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
+use crate::editor::{self, Form, Kept};
 use crate::open_store;
 use crate::worker::{self, Command, Deletion, Edit};
 use tokio::sync::mpsc::UnboundedSender;
@@ -566,6 +567,175 @@ fn plan_deletion(
     ))
 }
 
+/// A change to a repeating event that waits for "this, following or all?".
+enum Asked {
+    Drag(Drag),
+    Form(Box<Saved>),
+}
+
+/// The editor while it is open: the event it is for (`None` for a new one), and the
+/// form as it was opened, to tell what the user changed.
+#[derive(Clone)]
+struct Editing {
+    target: Option<Target>,
+    opened: Form,
+    kept: Kept,
+}
+
+/// What the editor was closed with.
+struct Saved {
+    target: Target,
+    form: Form,
+    opened: Form,
+    kept: Kept,
+    /// The fields the user changed, with their new values.
+    changes: serde_json::Value,
+    /// All fields as the form was opened, and as it was saved.
+    before: serde_json::Value,
+    after: serde_json::Value,
+}
+
+fn to_window(form: &Form) -> EditorForm {
+    EditorForm {
+        title: form.title.as_str().into(),
+        all_day: form.all_day,
+        start_date: form.start_date.as_str().into(),
+        end_date: form.end_date.as_str().into(),
+        start_time: form.start_time.as_str().into(),
+        end_time: form.end_time.as_str().into(),
+        repeat: form.repeat as i32,
+        location: form.location.as_str().into(),
+        description: form.description.as_str().into(),
+        color: form.color as i32,
+        reminder: form.reminder as i32,
+        visibility: form.visibility as i32,
+        busy: form.busy,
+    }
+}
+
+fn from_window(form: &EditorForm) -> Form {
+    Form {
+        title: form.title.to_string(),
+        all_day: form.all_day,
+        start_date: form.start_date.to_string(),
+        end_date: form.end_date.to_string(),
+        start_time: form.start_time.to_string(),
+        end_time: form.end_time.to_string(),
+        repeat: form.repeat.max(0) as usize,
+        location: form.location.to_string(),
+        description: form.description.to_string(),
+        color: form.color.max(0) as usize,
+        reminder: form.reminder.max(0) as usize,
+        visibility: form.visibility.max(0) as usize,
+        busy: form.busy,
+    }
+}
+
+/// What to send for the editor's changes to `saved.target` and how to take them back,
+/// if that is offered. `Ok(None)` when there is nothing to send.
+fn plan_form(
+    saved: &Saved,
+    scope: Scope,
+    own: Option<serde_json::Value>,
+    series: Option<serde_json::Value>,
+    zone: Tz,
+) -> Result<Option<(Edit, Option<UndoKind>)>, String> {
+    let target = &saved.target;
+    let Some(occurrence) = &target.occurrence else {
+        let Some(own) = own else { return Ok(None) };
+        return Ok(Some((
+            Edit::Event {
+                event_id: target.event_id.clone(),
+                etag: target.etag.clone(),
+                changes: saved.changes.clone(),
+            },
+            Some(UndoKind::Patch {
+                event_id: target.event_id.clone(),
+                changes: editor::inverse(&saved.changes, &own),
+            }),
+        )));
+    };
+    if scope == Scope::This {
+        // One occurrence cannot repeat differently from its series.
+        let mut changes = saved.changes.clone();
+        if let Some(changes) = changes.as_object_mut() {
+            changes.remove("recurrence");
+            if changes.is_empty() {
+                return Ok(None);
+            }
+        }
+        let Some(resource) = (if occurrence.changed { own } else { series }) else {
+            return Ok(None);
+        };
+        // What it had comes from the event, except its times, which are its own.
+        let mut was = editor::inverse(&changes, &resource);
+        for time in ["start", "end"] {
+            if changes.get(time).is_some() {
+                was[time] = saved.before[time].clone();
+            }
+        }
+        return Ok(Some((
+            Edit::Occurrence {
+                series_id: occurrence.series_id.clone(),
+                original_start: occurrence.original_start,
+                known_id: occurrence.changed.then(|| target.event_id.clone()),
+                changes,
+            },
+            Some(UndoKind::Occurrence(was)),
+        )));
+    }
+    let Some(resource) = series else {
+        return Ok(None);
+    };
+    let Ok(master) = serde_json::from_value::<Event>(resource.clone()) else {
+        return Ok(None);
+    };
+    // The rule the form keeps is the series' own, also when a changed occurrence
+    // (which has none) was opened.
+    let kept = Kept {
+        recurrence: master.recurrence.clone(),
+        ..saved.kept.clone()
+    };
+    if scope == Scope::Following && master.start_time() != Some(occurrence.original_start) {
+        let earlier = occurrences_before(&master, occurrence.original_start);
+        let days = (editor::start_day(&saved.form)? - editor::start_day(&saved.opened)?).num_days();
+        return Ok(Some((
+            Edit::Following {
+                series_id: master.id.clone(),
+                etag: master.etag.clone(),
+                recurrence: end_series_before(&master.recurrence, occurrence.original_start),
+                resource: editor::following_series(
+                    &resource,
+                    &saved.changes,
+                    &saved.after,
+                    earlier,
+                    days,
+                ),
+            },
+            None,
+        )));
+    }
+    let changes = editor::for_series(
+        &saved.changes,
+        &saved.form,
+        &saved.opened,
+        &kept,
+        &master,
+        zone,
+    )?;
+    Ok(Some((
+        Edit::Event {
+            event_id: master.id.clone(),
+            etag: master.etag,
+            changes: changes.clone(),
+        },
+        Some(UndoKind::Patch {
+            event_id: master.id,
+            changes: editor::inverse(&changes, &resource),
+        }),
+    )))
+}
+
 /// What undoing a deletion needs.
 struct Undo {
     account: AccountId,
@@ -658,9 +828,11 @@ struct View {
     draft: RefCell<Option<Draft>>,
     /// The event deleted last, while its deletion can still be undone.
     undo: RefCell<Option<Undo>>,
-    /// A drag of a repeating event while the window asks how much of the series it is
+    /// A change to a repeating event while the window asks how much of the series it is
     /// meant for.
-    asked: Cell<Option<Drag>>,
+    asked: RefCell<Option<Asked>>,
+    /// The event the editor is open for.
+    editing: RefCell<Option<Editing>>,
     /// Hides the message about the last change after a while.
     toast_timer: Timer,
     commands: UnboundedSender<Command>,
@@ -1004,6 +1176,7 @@ impl View {
                     // Anything in a calendar this account may write to. Should Google
                     // refuse a particular entry, it says why.
                     can_delete: calendar.entry.is_writable(),
+                    can_edit: can_move(event, &calendar.entry),
                     repeating: event.is_recurring_master() || event.recurring_event_id.is_some(),
                     notify_guests: event.has_guests_to_notify(),
                 }
@@ -1030,7 +1203,11 @@ impl View {
         // What they described may have moved or gone.
         ui.set_detail_visible(false);
         ui.set_delete_ask_visible(false);
-        self.asked.set(None);
+        // A drag refers to an instance on screen, which may now be another one. An
+        // edit from the editor carries its event with it and stays.
+        if matches!(*self.asked.borrow(), Some(Asked::Drag(_))) {
+            self.asked.take();
+        }
         Ok(())
     }
 
@@ -1173,7 +1350,7 @@ impl View {
             return;
         }
         if target.occurrence.is_some() {
-            self.asked.set(Some(drag));
+            self.asked.replace(Some(Asked::Drag(drag)));
             if let Some(ui) = self.ui.upgrade() {
                 ui.invoke_ask_edit_scope();
             }
@@ -1206,6 +1383,14 @@ impl View {
         let Some((edit, undo)) = plan_drag(&target, scope, drag, own, series, self.zone) else {
             return;
         };
+        self.send_edit(&target, edit, undo);
+        if scope == Scope::This {
+            self.draw_drag(drag);
+        }
+    }
+
+    /// Sends a change to Google and remembers how to take it back.
+    fn send_edit(&self, target: &Target, edit: Edit, undo: Option<UndoKind>) {
         self.undo.replace(undo.map(|kind| Undo {
             account: target.account,
             calendar_id: target.calendar_id.clone(),
@@ -1216,11 +1401,180 @@ impl View {
         }
         let _ = self.commands.send(Command::EditEvent {
             account: target.account,
-            calendar_id: target.calendar_id,
+            calendar_id: target.calendar_id.clone(),
             edit,
         });
-        if scope == Scope::This {
-            self.draw_drag(drag);
+    }
+
+    /// The cached resources of an event and of the series it belongs to, if any.
+    fn resources(
+        &self,
+        target: &Target,
+    ) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>)> {
+        let cached = |id: &str| {
+            self.store
+                .event_json(target.account, &target.calendar_id, id)
+        };
+        let own = cached(&target.event_id)?;
+        let series = match &target.occurrence {
+            Some(occurrence) => cached(&occurrence.series_id)?,
+            None => None,
+        };
+        Ok((own, series))
+    }
+
+    /// Opens the editor for the event behind an instance on screen.
+    fn open_editor(&self, instance: usize) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let Some(target) = self.targets.borrow().get(instance).cloned() else {
+            return;
+        };
+        if !target.movable {
+            return;
+        }
+        let (own, series) = match self.resources(&target) {
+            Ok(resources) => resources,
+            Err(error) => return self.show_error(&error),
+        };
+        // An unchanged occurrence is described by its series.
+        let changed = target.occurrence.as_ref().is_none_or(|o| o.changed);
+        let Some(resource) = (if changed { own } else { series }) else {
+            return;
+        };
+        let (form, kept) = editor::form_of(&resource, target.start, target.end, self.zone);
+        let detail = self.details.borrow().get(instance).cloned();
+        let calendar_color = {
+            let loaded = self.loaded.borrow();
+            loaded
+                .calendars
+                .iter()
+                .find(|c| c.account_id == target.account && c.entry.id == target.calendar_id)
+                .and_then(|c| c.entry.background_color.as_deref().and_then(parse_color))
+                .unwrap_or(FALLBACK_COLOR)
+        };
+        ui.set_editor_new(false);
+        ui.set_editor_calendar_name(detail.map(|d| d.calendar).unwrap_or_default());
+        self.show_editor(&ui, form, kept, Some(target), calendar_color);
+    }
+
+    /// Opens the editor for the new event of the quick card, with what was typed there.
+    fn open_editor_for_draft(&self, title: &str, calendar: usize) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let Some((start, end)) = self.draft.borrow().as_ref().map(|d| (d.start, d.end)) else {
+            return;
+        };
+        let mut form = editor::new_form(start, end, self.zone);
+        form.title = title.to_owned();
+        let color = ui
+            .get_draft_calendars()
+            .row_data(calendar)
+            .map_or(FALLBACK_COLOR, |c| c.color);
+        ui.set_editor_new(true);
+        ui.set_draft_calendar(calendar as i32);
+        ui.set_draft_visible(false);
+        self.show_editor(&ui, form, Kept::default(), None, color);
+    }
+
+    fn show_editor(
+        &self,
+        ui: &AppWindow,
+        form: Form,
+        kept: Kept,
+        target: Option<Target>,
+        calendar_color: Color,
+    ) {
+        let colors: Vec<Color> = std::iter::once(calendar_color)
+            .chain(EVENT_COLORS.iter().map(|(_, value)| rgb(*value)))
+            .collect();
+        ui.set_editor_colors(ModelRc::from(Rc::new(VecModel::from(colors))));
+        ui.set_editor_custom_repeat(form.repeat == editor::REPEAT_CUSTOM);
+        ui.set_editor_custom_reminder(form.reminder == editor::REMINDER_CUSTOM);
+        ui.set_editor_error(SharedString::new());
+        ui.set_editor(to_window(&form));
+        self.editing.replace(Some(Editing {
+            target,
+            opened: form,
+            kept,
+        }));
+        ui.set_detail_visible(false);
+        ui.set_editor_visible(true);
+    }
+
+    /// "Save" in the editor: checks the form and sends what changed. For a repeating
+    /// event it first asks how much of the series is meant.
+    fn save_editor(&self, form: Form, calendar: usize) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let Some(editing) = self.editing.borrow().clone() else {
+            return;
+        };
+        let after = match editor::fields(&form, &editing.kept, self.zone) {
+            Ok(after) => after,
+            Err(problem) => return ui.set_editor_error(problem.into()),
+        };
+        let Some(target) = editing.target.clone() else {
+            // A new event.
+            let Some((account, calendar_id, key)) = self
+                .draft
+                .borrow()
+                .as_ref()
+                .and_then(|draft| draft.calendars.get(calendar).cloned())
+            else {
+                return;
+            };
+            let _ = self.store.set_setting(NEW_EVENT_CALENDAR, &key);
+            let _ = self.commands.send(Command::CreateEvent {
+                account,
+                calendar_id,
+                resource: editor::creation(after),
+            });
+            self.draft.take();
+            return self.close_editor(&ui);
+        };
+        let before = match editor::fields(&editing.opened, &editing.kept, self.zone) {
+            Ok(before) => before,
+            Err(problem) => return ui.set_editor_error(problem.into()),
+        };
+        let changes = editor::diff(&before, &after);
+        self.close_editor(&ui);
+        if changes.as_object().is_none_or(|changes| changes.is_empty()) {
+            return;
+        }
+        let saved = Saved {
+            target,
+            form,
+            opened: editing.opened,
+            kept: editing.kept,
+            changes,
+            before,
+            after,
+        };
+        if saved.target.occurrence.is_some() {
+            self.asked.replace(Some(Asked::Form(Box::new(saved))));
+            ui.invoke_ask_edit_scope();
+        } else {
+            self.send_form(saved, Scope::This);
+        }
+    }
+
+    fn close_editor(&self, ui: &AppWindow) {
+        self.editing.take();
+        ui.set_editor_visible(false);
+    }
+
+    /// Sends what the editor changed, for as much of a series as was chosen.
+    fn send_form(&self, saved: Saved, scope: Scope) {
+        let (own, series) = match self.resources(&saved.target) {
+            Ok(resources) => resources,
+            Err(error) => return self.show_error(&error),
+        };
+        match plan_form(&saved, scope, own, series, self.zone) {
+            Ok(Some((edit, undo))) => self.send_edit(&saved.target, edit, undo),
+            Ok(None) => {}
+            Err(problem) => {
+                if let Some(ui) = self.ui.upgrade() {
+                    ui.set_notice(problem.into());
+                }
+            }
         }
     }
 
@@ -1396,6 +1750,17 @@ impl View {
                 .map(|c| (c.account_id, c.entry.id.clone(), key(c)))
                 .collect(),
         }));
+        let names: Vec<SharedString> = rows
+            .iter()
+            .map(|row| {
+                if row.name == row.account {
+                    row.name.clone()
+                } else {
+                    format!("{} · {}", row.name, row.account).into()
+                }
+            })
+            .collect();
+        ui.set_editor_calendars(ModelRc::from(Rc::new(VecModel::from(names))));
         ui.set_draft_calendars(ModelRc::from(Rc::new(VecModel::from(rows))));
         ui.set_draft_calendar(chosen as i32);
         ui.set_draft_when(when_text(start, end, self.zone).into());
@@ -1482,7 +1847,8 @@ pub fn run() -> Result<()> {
         targets: RefCell::default(),
         draft: RefCell::default(),
         undo: RefCell::default(),
-        asked: Cell::new(None),
+        asked: RefCell::default(),
+        editing: RefCell::default(),
         toast_timer: Timer::default(),
         commands: commands.clone(),
         all_day: Rc::default(),
@@ -1556,6 +1922,18 @@ pub fn run() -> Result<()> {
         let view = view.clone();
         move |changed, occurrence| view.change_finished(changed, &occurrence)
     });
+    ui.on_editor_requested({
+        let view = view.clone();
+        move |instance| view.open_editor(instance as usize)
+    });
+    ui.on_editor_from_draft({
+        let view = view.clone();
+        move |title, calendar| view.open_editor_for_draft(&title, calendar as usize)
+    });
+    ui.on_editor_save({
+        let view = view.clone();
+        move |form, calendar| view.save_editor(from_window(&form), calendar as usize)
+    });
     ui.on_edit_scope_chosen({
         let view = view.clone();
         move |scope| {
@@ -1564,8 +1942,10 @@ pub fn run() -> Result<()> {
                 2 => Scope::All,
                 _ => Scope::This,
             };
-            if let Some(drag) = view.asked.take() {
-                view.send_drag(drag, scope);
+            match view.asked.take() {
+                Some(Asked::Drag(drag)) => view.send_drag(drag, scope),
+                Some(Asked::Form(saved)) => view.send_form(*saved, scope),
+                None => {}
             }
         }
     });

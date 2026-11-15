@@ -3,6 +3,7 @@
 //! Started without arguments it opens the window. The commands below are a small
 //! command-line front end to the same pieces, kept for diagnosing sign-in and sync.
 
+mod editor;
 mod gui;
 mod vault;
 mod worker;
