@@ -25,37 +25,40 @@ The rest of M2 is parked in `plans/m2-remaining.md`.
 
 ## Slices, in order
 
-1. **Google client**: `insert_event`, `patch_event`, `delete_event` with `If-Match`,
-   `Changed` / `Gone` errors. *(done, first commit of the branch)*
-2. **Write path**: worker commands `DeleteEvent`, `PatchEvent`, `CreateEvent`; store keeps
-   each event's `etag` and applies a single returned event; the window reloads; status
-   text for failures; `accessRole` in the calendar model.
-3. **Delete** from the details card (and `Delete`/`Backspace` with the card open), with
-   **undo** in a bottom bar (re-insert the saved resource; for a single occurrence,
-   un-cancel it). *(done, including this / this and following / all for series; refused
-   changes are shown in a dialog)*
-4. **Quick create**: click or drag on empty time in the day columns (and a click in a
-   month cell) opens a small card: title, time, calendar picker grouped by account,
-   defaulting to the calendar last created in (stored locally). `c` opens it for "now".
-   *(click, month cell, all-day strip and `c` done. Open, asked for by the user: the
-   card should look as close to the web's as possible — title line, "Event" tab, date
-   and time row that can be edited, calendar drop-down, "More options" and "Save" —
-   which comes with the pickers of slice 7. Drag to set the length is also open.)*
-5. **Drag to move and resize** in the day columns, 15-minute steps; all-day bars move by
-   days. Optimistic draw, rolled back on failure. *(done for plain events; repeating
-   ones come with slice 6. Open: dragging on empty time to set a new event's length;
-   dragging between the all-day strip and the hours; the month view.)*
-6. **Recurring events**: "this event / this and following / all events" for delete, move
-   and edit. Pure logic for splitting a series goes in `crates/core` with tests.
-7. **Full editor** (`e` or "More options"): title, dates and times, all-day, time zone,
-   repeat (presets plus custom), location, description (light markup, preview), calendar,
-   colour, reminders, visibility, busy/free. Needs the Material component set for
-   pickers and menus.
-8. **Offline banner** and disabling of all editing controls when Google cannot be reached.
-9. **Testing against Google without the user**: done with a test account the user
-   added; see the end of this file.
-10. End of milestone: checks, walk-through on real accounts, pull request, Codex review,
-   then make the repository public (ask first).
+All built on the branch `m3-editing` and tested against Google with the test account
+unless said otherwise.
+
+1. **Google client**: insert, patch, delete with `If-Match`; `Changed` / `Gone`. *Done.*
+2. **Write path**: worker commands, single-event apply in the store, failures in a
+   dialog. *Done.*
+3. **Delete** anything in a writable calendar, with undo; this / this and following /
+   all for series; optional cancellation e-mails for one's own guests. *Done. The
+   e-mail option has not been tried (the test account has nobody to write to).*
+4. **Quick create**: click, drag out a time, month cell, all-day strip, `c`; card styled
+   after the web's; undo. *Done. Dragging out a time is untried by the scripts.*
+5. **Drag to move and resize**, 15-minute steps, all-day bars by days. *Done. The
+   resize handle is untried by the scripts.*
+6. **Repeating events**: this / this and following / all for delete, drag and the
+   editor. *Done. No undo after a split ("this and following" edit).*
+7. **Editor** (`e`, "Edit", "More options"): title, dates and times, all-day, repeat
+   presets, location, description, calendar (new events), colour, reminder,
+   visibility, busy/free. Sends only what changed. *Done.*
+8. **Offline banner**, editing off while Google cannot be reached. *Done.*
+9. **Tests against Google without the user**: `tools/e2e`. *Done.*
+10. End of milestone: checks, pull request, Codex review, then make the repository
+    public (ask first).
+
+## Left out of M3 on purpose, for later
+
+- Date and time pickers (dates and times are typed), custom repeat rules, the
+  description's formatting toolbar and preview (an edited description is saved as
+  plain text; an untouched one keeps its formatting).
+- Changing an event's time zone; moving an event to another calendar.
+- Editing or dragging events that have guests (M4, with notifications).
+- Dragging in the month view, and between the all-day strip and the hours.
+- Undo after "this and following" edits.
+- The editor uses this app's own controls; the Material component set named in the
+  design was not needed and is not a dependency.
 
 ## Found while testing against Google (2026-11-15)
 

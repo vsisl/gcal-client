@@ -4,7 +4,10 @@ A native desktop calendar that works with Google Calendar and shows several Goog
 (for example personal and work) in one view. It aims to behave like the Google Calendar web
 interface, including its keyboard shortcuts.
 
-**Status:** early development, not usable yet. `gcal-client` is a working name.
+**Status:** early development. Viewing (day, week, month, 4 days, schedule) and editing
+(create, change, move, delete, repeating events, undo) work; guests, reminders on the
+desktop, tasks and packaging are still to come. To sign in you currently need your own
+Google Cloud key. `gcal-client` is a working name.
 
 Not affiliated with or endorsed by Google. Google Calendar is a trademark of Google LLC.
 
@@ -25,6 +28,12 @@ Then:
 ```sh
 cargo run -p gcal-client
 ```
+
+## Testing
+
+`cargo test` runs the unit tests and the tests against a mock of Google's API. The window
+itself is tested end to end against a real test account with the scripts in
+[tools/e2e](tools/e2e); the header of `e2e.py` says how to run them safely.
 
 ## Layout
 
