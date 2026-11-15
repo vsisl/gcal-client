@@ -9,7 +9,7 @@ use anyhow::Result;
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Timelike, Utc};
 use chrono_tz::Tz;
 use gcal_core::recurrence::expand;
-use gcal_core::week::{DAYS, layout_week, local_day_start};
+use gcal_core::week::{layout_days, local_day_start};
 use gcal_core::{CalendarListEntry, Event, EventTime};
 use gcal_store::{Account, AccountId, Store, StoredCalendar, StoredEvent};
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
@@ -87,15 +87,45 @@ fn week_start_of(day: NaiveDate) -> NaiveDate {
     day - Duration::days(i64::from(day.weekday().num_days_from_monday()))
 }
 
-/// "November 2026", or "Nov – Dec 2026" / "Dec 2026 – Jan 2027" when the week straddles.
-fn period_title(week_start: NaiveDate) -> String {
-    let last = week_start + Duration::days(DAYS - 1);
-    if week_start.month() == last.month() {
-        week_start.format("%B %Y").to_string()
-    } else if week_start.year() == last.year() {
-        format!("{} – {}", week_start.format("%b"), last.format("%b %Y"))
+/// How many days the grid shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Span {
+    Day,
+    FourDays,
+    Week,
+}
+
+impl Span {
+    /// The order used by the interface's view switcher.
+    const ALL: [Span; 3] = [Span::Day, Span::FourDays, Span::Week];
+
+    fn days(self) -> i64 {
+        match self {
+            Span::Day => 1,
+            Span::FourDays => 4,
+            Span::Week => 7,
+        }
+    }
+
+    /// The first day shown when the user is looking at `anchor`: the week view snaps to
+    /// the start of the week, the others begin on the day itself.
+    fn first_day(self, anchor: NaiveDate) -> NaiveDate {
+        match self {
+            Span::Week => week_start_of(anchor),
+            Span::Day | Span::FourDays => anchor,
+        }
+    }
+}
+
+/// "November 2026", or "Nov – Dec 2026" / "Dec 2026 – Jan 2027" when the days straddle.
+fn period_title(first: NaiveDate, days: i64) -> String {
+    let last = first + Duration::days(days - 1);
+    if first.month() == last.month() {
+        first.format("%B %Y").to_string()
+    } else if first.year() == last.year() {
+        format!("{} – {}", first.format("%b"), last.format("%b %Y"))
     } else {
-        format!("{} – {}", week_start.format("%b %Y"), last.format("%b %Y"))
+        format!("{} – {}", first.format("%b %Y"), last.format("%b %Y"))
     }
 }
 
@@ -135,7 +165,9 @@ struct View {
     store: Store,
     loaded: RefCell<Loaded>,
     zone: Tz,
-    week_start: Cell<NaiveDate>,
+    /// The day the user is looking at; which days are shown follows from it and `span`.
+    anchor: Cell<NaiveDate>,
+    span: Cell<Span>,
     /// The date the day headers were last drawn for, to notice midnight passing.
     drawn_today: Cell<Option<NaiveDate>>,
     days: Rc<VecModel<DayHeader>>,
@@ -145,6 +177,10 @@ struct View {
 }
 
 impl View {
+    fn first_day(&self) -> NaiveDate {
+        self.span.get().first_day(self.anchor.get())
+    }
+
     fn today(&self) -> NaiveDate {
         Utc::now().with_timezone(&self.zone).date_naive()
     }
@@ -183,13 +219,17 @@ impl View {
     }
 
     fn try_refresh(&self, ui: &AppWindow) -> Result<()> {
-        let week_start = self.week_start.get();
+        let week_start = self.first_day();
+        let span = self.span.get();
+        let days = span.days();
         let today = self.today();
+        ui.set_day_count(days as i32);
+        ui.set_view_index(Span::ALL.iter().position(|s| *s == span).unwrap_or(0) as i32);
         self.drawn_today.set(Some(today));
-        ui.set_period_title(period_title(week_start).into());
+        ui.set_period_title(period_title(week_start, days).into());
         patch(
             &self.days,
-            (0..DAYS)
+            (0..days)
                 .map(|offset| {
                     let day = week_start + Duration::days(offset);
                     DayHeader {
@@ -239,7 +279,7 @@ impl View {
             .collect();
 
         let from = local_day_start(week_start, self.zone);
-        let to = local_day_start(week_start + Duration::days(DAYS), self.zone);
+        let to = local_day_start(week_start + Duration::days(days), self.zone);
         let singles = self
             .store
             .single_events_for_range(from.timestamp() - 86_400, to.timestamp() + 86_400)?;
@@ -254,7 +294,7 @@ impl View {
             to,
         );
         let spans: Vec<_> = instances.iter().map(|i| (i.start, i.end)).collect();
-        let layout = layout_week(&spans, week_start, self.zone);
+        let layout = layout_days(&spans, week_start, days, self.zone);
 
         let title = |index: usize| -> SharedString {
             instances[index]
@@ -320,8 +360,8 @@ impl View {
     /// Moves the current-time line.
     fn update_now(&self, ui: &AppWindow) {
         let now = Utc::now().with_timezone(&self.zone);
-        let offset = (now.date_naive() - self.week_start.get()).num_days();
-        if (0..DAYS).contains(&offset) {
+        let offset = (now.date_naive() - self.first_day()).num_days();
+        if (0..self.span.get().days()).contains(&offset) {
             ui.set_now_day(offset as i32);
             ui.set_now_min((now.hour() * 60 + now.minute()) as i32);
         } else {
@@ -329,9 +369,14 @@ impl View {
         }
     }
 
-    fn show_week(&self, week_start: NaiveDate) {
-        self.week_start.set(week_start);
+    fn show(&self, anchor: NaiveDate) {
+        self.anchor.set(anchor);
         self.refresh();
+    }
+
+    /// Moves one screenful back (-1) or forward (1).
+    fn step(&self, direction: i64) {
+        self.show(self.anchor.get() + Duration::days(direction * self.span.get().days()));
     }
 }
 
@@ -343,7 +388,8 @@ pub fn run() -> Result<()> {
         store: open_store()?,
         loaded: RefCell::default(),
         zone,
-        week_start: Cell::new(week_start_of(Utc::now().with_timezone(&zone).date_naive())),
+        anchor: Cell::new(Utc::now().with_timezone(&zone).date_naive()),
+        span: Cell::new(Span::Week),
         drawn_today: Cell::new(None),
         days: Rc::default(),
         timed: Rc::default(),
@@ -359,15 +405,24 @@ pub fn run() -> Result<()> {
 
     ui.on_go_today({
         let view = view.clone();
-        move || view.show_week(week_start_of(view.today()))
+        move || view.show(view.today())
     });
     ui.on_go_previous({
         let view = view.clone();
-        move || view.show_week(view.week_start.get() - Duration::days(DAYS))
+        move || view.step(-1)
     });
     ui.on_go_next({
         let view = view.clone();
-        move || view.show_week(view.week_start.get() + Duration::days(DAYS))
+        move || view.step(1)
+    });
+    ui.on_set_view({
+        let view = view.clone();
+        move |index| {
+            if let Some(span) = Span::ALL.get(index as usize) {
+                view.span.set(*span);
+                view.refresh();
+            }
+        }
     });
     ui.on_data_changed({
         let view = view.clone();
@@ -431,9 +486,18 @@ mod tests {
 
     #[test]
     fn period_title_names_both_months_when_the_week_straddles() {
-        assert_eq!(period_title(date("2026-11-16")), "November 2026");
-        assert_eq!(period_title(date("2026-11-30")), "Nov – Dec 2026");
-        assert_eq!(period_title(date("2026-12-28")), "Dec 2026 – Jan 2027");
+        assert_eq!(period_title(date("2026-11-16"), 7), "November 2026");
+        assert_eq!(period_title(date("2026-11-30"), 7), "Nov – Dec 2026");
+        assert_eq!(period_title(date("2026-12-28"), 7), "Dec 2026 – Jan 2027");
+        assert_eq!(period_title(date("2026-11-30"), 1), "November 2026");
+    }
+
+    #[test]
+    fn only_the_week_view_snaps_to_the_start_of_the_week() {
+        let wednesday = date("2026-11-18");
+        assert_eq!(Span::Week.first_day(wednesday), date("2026-11-16"));
+        assert_eq!(Span::FourDays.first_day(wednesday), wednesday);
+        assert_eq!(Span::Day.first_day(wednesday), wednesday);
     }
 
     #[test]

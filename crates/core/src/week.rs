@@ -1,4 +1,5 @@
-//! Where each event instance goes in a week view, in the viewer's time zone.
+//! Where each event instance goes in a grid of consecutive days (the day, 4-day and week
+//! views), in the viewer's time zone.
 //!
 //! Follows the web interface: events with a clock time are blocks in the day columns, split
 //! at midnight, and overlapping ones share the column's width; all-day events and events
@@ -9,7 +10,6 @@ use chrono_tz::Tz;
 
 use crate::model::EventTime;
 
-pub const DAYS: i64 = 7;
 const MINUTES_PER_DAY: i64 = 24 * 60;
 /// Shorter events are laid out as if they lasted this long, so their title stays readable.
 const MIN_BLOCK_MINUTES: i64 = 15;
@@ -17,7 +17,7 @@ const MIN_BLOCK_MINUTES: i64 = 15;
 /// A block in a day column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimedBlock {
-    /// Index of the instance in the slice given to [`layout_week`].
+    /// Index of the instance in the slice given to [`layout_days`].
     pub index: usize,
     /// 0 for the first day of the week.
     pub day: i32,
@@ -65,10 +65,11 @@ pub fn local_day_start(day: NaiveDate, zone: Tz) -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
-/// Lays out instances given as `(start, end)` for the week starting on `week_start`.
-pub fn layout_week(
+/// Lays out instances given as `(start, end)` for the `days` days starting on `week_start`.
+pub fn layout_days(
     spans: &[(EventTime, EventTime)],
     week_start: NaiveDate,
+    days: i64,
     zone: Tz,
 ) -> WeekLayout {
     let mut timed = Vec::new();
@@ -80,7 +81,7 @@ pub fn layout_week(
             (EventTime::Timed(start), EventTime::Timed(end))
                 if end - start < Duration::hours(24) =>
             {
-                split_timed(index, start, end, week_start, zone, &mut timed);
+                split_timed(index, start, end, week_start, days, zone, &mut timed);
                 continue;
             }
             (EventTime::Timed(start), EventTime::Timed(end)) => {
@@ -99,16 +100,16 @@ pub fn layout_week(
         };
         let first = (first - week_start).num_days();
         let past_last = (past_last - week_start).num_days();
-        if past_last <= 0 || first >= DAYS {
+        if past_last <= 0 || first >= days {
             continue;
         }
         bars.push(AllDayBar {
             index,
             first_day: first.max(0) as i32,
-            last_day: (past_last.min(DAYS) - 1) as i32,
+            last_day: (past_last.min(days) - 1) as i32,
             row: 0,
             continues_before: first < 0,
-            continues_after: past_last > DAYS,
+            continues_after: past_last > days,
         });
     }
 
@@ -127,6 +128,7 @@ fn split_timed(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     week_start: NaiveDate,
+    days: i64,
     zone: Tz,
     out: &mut Vec<TimedBlock>,
 ) {
@@ -140,7 +142,7 @@ fn split_timed(
         let end_min = (local_end - day_begin).num_minutes().min(MINUTES_PER_DAY);
         // The part after midnight of an event ending exactly at midnight is empty.
         let is_empty_tail = day > local_start.date() && end_min <= 0;
-        if (0..DAYS).contains(&offset) && !is_empty_tail {
+        if (0..days).contains(&offset) && !is_empty_tail {
             let start_min = start_min.min(MINUTES_PER_DAY - MIN_BLOCK_MINUTES);
             out.push(TimedBlock {
                 index,
@@ -239,9 +241,10 @@ mod tests {
     #[test]
     fn timed_event_lands_on_its_local_day_and_minutes() {
         // 23:30 UTC on Monday is 00:30 on Tuesday in Prague (UTC+1 in November).
-        let layout = layout_week(
+        let layout = layout_days(
             &[timed("2026-11-16T23:30:00Z", "2026-11-17T00:30:00Z")],
             monday(),
+            7,
             PRAGUE,
         );
         assert_eq!(
@@ -259,12 +262,13 @@ mod tests {
 
     #[test]
     fn event_across_midnight_is_split_and_one_ending_at_midnight_is_not() {
-        let layout = layout_week(
+        let layout = layout_days(
             &[
                 timed("2026-11-17T21:00:00Z", "2026-11-18T01:00:00Z"), // 22:00-02:00 local
                 timed("2026-11-19T21:00:00Z", "2026-11-19T23:00:00Z"), // 22:00-24:00 local
             ],
             monday(),
+            7,
             PRAGUE,
         );
         let parts: Vec<_> = layout
@@ -281,9 +285,10 @@ mod tests {
     #[test]
     fn parts_outside_the_week_are_dropped() {
         // Sunday 23:00 to Monday 01:00 local: only Monday's part is in the week.
-        let layout = layout_week(
+        let layout = layout_days(
             &[timed("2026-11-15T22:00:00Z", "2026-11-16T00:00:00Z")],
             monday(),
+            7,
             PRAGUE,
         );
         assert_eq!(layout.timed.len(), 1);
@@ -299,7 +304,7 @@ mod tests {
 
     #[test]
     fn overlapping_events_share_the_width_and_later_ones_reuse_columns() {
-        let layout = layout_week(
+        let layout = layout_days(
             &[
                 timed("2026-11-16T09:00:00Z", "2026-11-16T11:00:00Z"),
                 timed("2026-11-16T10:00:00Z", "2026-11-16T12:00:00Z"),
@@ -307,6 +312,7 @@ mod tests {
                 timed("2026-11-16T14:00:00Z", "2026-11-16T15:00:00Z"),
             ],
             monday(),
+            7,
             PRAGUE,
         );
         let columns: Vec<_> = layout
@@ -321,9 +327,10 @@ mod tests {
 
     #[test]
     fn very_short_events_get_a_minimum_height() {
-        let layout = layout_week(
+        let layout = layout_days(
             &[timed("2026-11-16T09:00:00Z", "2026-11-16T09:00:00Z")],
             monday(),
+            7,
             PRAGUE,
         );
         assert_eq!(layout.timed[0].end_min - layout.timed[0].start_min, 15);
@@ -331,7 +338,7 @@ mod tests {
 
     #[test]
     fn all_day_events_become_bars_clipped_to_the_week() {
-        let layout = layout_week(
+        let layout = layout_days(
             &[
                 all_day("2026-11-17", "2026-11-18"),
                 all_day("2026-11-14", "2026-11-18"),
@@ -339,6 +346,7 @@ mod tests {
                 all_day("2026-11-09", "2026-11-16"), // ends before the week
             ],
             monday(),
+            7,
             PRAGUE,
         );
         let bars: Vec<_> = layout
@@ -369,9 +377,10 @@ mod tests {
     #[test]
     fn timed_event_of_a_day_or_longer_goes_to_the_all_day_strip() {
         // Tuesday 10:00 to Thursday 10:00 local.
-        let layout = layout_week(
+        let layout = layout_days(
             &[timed("2026-11-17T09:00:00Z", "2026-11-19T09:00:00Z")],
             monday(),
+            7,
             PRAGUE,
         );
         assert!(layout.timed.is_empty());

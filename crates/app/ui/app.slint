@@ -107,6 +107,10 @@ export component AppWindow inherits Window {
     in property <StatusKind> status-kind: StatusKind.idle;
     in property <string> status-detail;
     in property <[DayHeader]> days;
+    // Number of day columns: 1, 4 or 7.
+    in property <int> day-count: 7;
+    // Which entry of the view switcher is active: 0 day, 1 four days, 2 week.
+    in property <int> view-index: 2;
     in property <[TimedItem]> timed;
     in property <[AllDayItem]> all-day;
     in property <int> all-day-rows;
@@ -120,6 +124,7 @@ export component AppWindow inherits Window {
     callback go-today();
     callback go-previous();
     callback go-next();
+    callback set-view(int);
     callback add-account();
     callback remove-account(string);
     callback sync-now();
@@ -131,7 +136,7 @@ export component AppWindow inherits Window {
     property <length> head-h: 80px;
     property <length> bar-h: 22px;
     property <length> strip-h: Math.max(1, root.all-day-rows) * bar-h + 6px;
-    property <length> day-w: (main.width - gutter) / 7;
+    property <length> day-w: (main.width - gutter) / root.day-count;
 
     public function scroll-to-hour(hour: int) {
         grid.content-y = -hour * hour-h;
@@ -152,6 +157,18 @@ export component AppWindow inherits Window {
             }
             if (event.text == "k" || event.text == "p") {
                 root.go-previous();
+                return accept;
+            }
+            if (event.text == "d" || event.text == "1") {
+                root.set-view(0);
+                return accept;
+            }
+            if (event.text == "x" || event.text == "4") {
+                root.set-view(1);
+                return accept;
+            }
+            if (event.text == "w" || event.text == "2") {
+                root.set-view(2);
                 return accept;
             }
             if (event.text == "r") {
@@ -224,6 +241,18 @@ export component AppWindow inherits Window {
                     horizontal-alignment: right;
                     overflow: elide;
                     max-width: 420px;
+                }
+
+                for label[index] in [@tr("Day"), @tr("4 days"), @tr("Week")]: VerticalLayout {
+                    alignment: center;
+                    TextButton {
+                        text: label;
+                        outlined: root.view-index == index;
+                        text-color: root.view-index == index ? Theme.accent : Theme.text;
+                        clicked => {
+                            root.set-view(index);
+                        }
+                    }
                 }
 
                 VerticalLayout {
@@ -392,7 +421,7 @@ export component AppWindow inherits Window {
                     }
 
                     // All-day strip.
-                    for d in 7: Rectangle {
+                    for d in root.day-count: Rectangle {
                         x: gutter + d * day-w;
                         y: head-h;
                         width: 1px;
@@ -454,7 +483,7 @@ export component AppWindow inherits Window {
                             font-size: 10px;
                             color: Theme.text-dim;
                         }
-                        for d in 7: Rectangle {
+                        for d in root.day-count: Rectangle {
                             x: gutter + d * day-w;
                             y: 0;
                             width: 1px;
