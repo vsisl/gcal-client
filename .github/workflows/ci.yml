@@ -1,7 +1,8 @@
 name: CI
 
+# Only pull requests: everything reaches main through one, so a run on every push
+# would check the same commits twice.
 on:
-  push:
   pull_request:
 
 env:
