@@ -551,6 +551,15 @@ export component AppWindow inherits Window {
     }
     // The settings card, opened with "s" or its button.
     property <bool> settings-visible;
+    // The hours' labels beside the day columns, in the clock that was chosen.
+    in property <[string]> hour-labels;
+    // Choices of the settings card: the week's first day (Monday, Sunday, Saturday)
+    // and the clock (24 hours, 12 hours). Rust sets what is remembered and is told of
+    // a new choice.
+    in-out property <int> week-start-choice;
+    in-out property <int> clock-choice;
+    callback week-start-chosen(int);
+    callback clock-chosen(int);
     // Light or dark: 0 as the desktop, 1 light, 2 dark. Rust sets the remembered choice
     // at start and is told of a new one.
     in-out property <int> theme-mode <=> Theme.mode;
@@ -721,7 +730,8 @@ export component AppWindow inherits Window {
     property <length> month-row-h: (main.height - month-names-h) / Math.max(1, root.month-weeks);
 
     public function scroll-to-hour(hour: int) {
-        grid.content-y = -hour * hour-h;
+        // A little above the hour, so that its label is not cut by the edge.
+        grid.content-y = Math.min(0px, -hour * hour-h + 10px);
     }
 
     keys := FocusScope {
@@ -1442,7 +1452,7 @@ export component AppWindow inherits Window {
                                 y: h * hour-h - 7px;
                                 width: gutter - 12px;
                                 horizontal-alignment: right;
-                                text: h == 0 ? "" : "\{h}:00";
+                                text: root.hour-labels[h];
                                 font-size: 10px;
                                 color: Theme.text-dim;
                             }
@@ -2687,6 +2697,11 @@ export component AppWindow inherits Window {
 
             TouchArea { }
 
+            // Taller than a small window when its lists are open: the wheel scrolls it.
+            Flickable {
+                interactive: false;
+                content-height: settings-box.preferred-height;
+
             settings-box := VerticalLayout {
                 padding: 24px;
                 padding-bottom: 12px;
@@ -2715,6 +2730,46 @@ export component AppWindow inherits Window {
                     clicked => {
                         root.theme-mode = i;
                         root.theme-chosen(i);
+                    }
+                }
+
+                Rectangle {
+                    height: 8px;
+                }
+
+                Text {
+                    text: @tr("Week starts on");
+                    font-size: 12px;
+                    font-weight: 500;
+                    color: Theme.text-dim;
+                }
+
+                Choice {
+                    options: [@tr("Monday"), @tr("Sunday"), @tr("Saturday")];
+                    current: root.week-start-choice;
+                    chosen(i) => {
+                        root.week-start-choice = i;
+                        root.week-start-chosen(i);
+                    }
+                }
+
+                Rectangle {
+                    height: 8px;
+                }
+
+                Text {
+                    text: @tr("Time format");
+                    font-size: 12px;
+                    font-weight: 500;
+                    color: Theme.text-dim;
+                }
+
+                Choice {
+                    options: [@tr("13:00"), @tr("1:00pm")];
+                    current: root.clock-choice;
+                    chosen(i) => {
+                        root.clock-choice = i;
+                        root.clock-chosen(i);
                     }
                 }
 
@@ -2781,6 +2836,7 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+            }
             }
         }
 

@@ -37,6 +37,11 @@ const NEW_EVENT_CALENDAR: &str = "new_event_calendar";
 /// Setting: light or dark, as the number the window uses (0 as the desktop, 1 light,
 /// 2 dark).
 const THEME: &str = "theme";
+/// Settings: the first day of the week (0 Monday to 6 Sunday), whether times are shown
+/// on the 12-hour clock (1) and the view that was open last (its place in `Span::ALL`).
+const WEEK_START: &str = "week_start";
+const TWELVE_HOUR: &str = "twelve_hour";
+const LAST_VIEW: &str = "last_view";
 /// Setting: the height of an hour in the day columns, in pixels (the zoom).
 const HOUR_HEIGHT: &str = "hour_height";
 /// How long "Undo" stays on offer after a deletion.
@@ -143,9 +148,35 @@ fn typed_date(text: &str, today: NaiveDate) -> Option<NaiveDate> {
     }
 }
 
-/// The Monday on or before `day`. (The first day of the week becomes a setting in M2.)
+/// How dates and times are shown, as chosen in the settings.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Prefs {
+    /// The first day of the week, counted from Monday (0) to Sunday (6).
+    week_start: u32,
+    twelve_hour: bool,
+}
+
+thread_local! {
+    /// The window's thread is the only one that formats dates for the screen, and it
+    /// does so in dozens of places far from the window's state; the choice is kept
+    /// here for them rather than handed through every one. Tests, each on a thread of
+    /// its own, see the defaults: Monday and the 24-hour clock.
+    static PREFS: Cell<Prefs> = const { Cell::new(Prefs { week_start: 0, twelve_hour: false }) };
+}
+
+fn prefs() -> Prefs {
+    PREFS.with(Cell::get)
+}
+
+/// The first day of the week `day` is in, by the setting.
 fn week_start_of(day: NaiveDate) -> NaiveDate {
-    day - Duration::days(i64::from(day.weekday().num_days_from_monday()))
+    week_start_from(day, prefs().week_start)
+}
+
+/// The day on or before `day` that weeks start on; `first` counts from Monday (0).
+fn week_start_from(day: NaiveDate, first: u32) -> NaiveDate {
+    let into_week = (day.weekday().num_days_from_monday() + 7 - first % 7) % 7;
+    day - Duration::days(i64::from(into_week))
 }
 
 /// Which stretch of days the window shows.
@@ -273,7 +304,24 @@ fn web_link(event: &Event, account_email: &str) -> String {
 
 fn clock(instant: DateTime<Utc>, zone: Tz) -> String {
     let local = instant.with_timezone(&zone);
-    format!("{}:{:02}", local.hour(), local.minute())
+    clock_text(local.hour(), local.minute(), prefs().twelve_hour)
+}
+
+/// A time of day as 14:05, or as the web writes the 12-hour clock: 2:05pm, 2pm.
+fn clock_text(hour: u32, minute: u32, twelve_hour: bool) -> String {
+    if !twelve_hour {
+        return format!("{hour}:{minute:02}");
+    }
+    let half = if hour < 12 { "am" } else { "pm" };
+    let hour = match hour % 12 {
+        0 => 12,
+        hour => hour,
+    };
+    if minute == 0 {
+        format!("{hour}{half}")
+    } else {
+        format!("{hour}:{minute:02}{half}")
+    }
 }
 
 /// Makes `model` equal to `rows` while touching only the rows that differ. Replacing a
@@ -942,6 +990,41 @@ impl View {
 
     fn today(&self) -> NaiveDate {
         Utc::now().with_timezone(&self.zone).date_naive()
+    }
+
+    /// Shows the settings for dates and times in the window: the names of the weekdays
+    /// in the week's order, the hours' labels, and the choices in the settings card.
+    fn apply_prefs(&self) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let Prefs {
+            week_start,
+            twelve_hour,
+        } = prefs();
+        // 2026-11-16 is a Monday.
+        let monday = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap_or_default();
+        let names: Vec<SharedString> = (0..7)
+            .map(|offset| {
+                let day = monday + Duration::days(i64::from(week_start) + offset);
+                SharedString::from(day.format("%a").to_string().to_uppercase())
+            })
+            .collect();
+        ui.set_weekday_names(ModelRc::from(Rc::new(VecModel::from(names))));
+        let hours: Vec<SharedString> = (0..24)
+            .map(|hour| {
+                if hour == 0 {
+                    SharedString::new()
+                } else {
+                    clock_text(hour, 0, twelve_hour).into()
+                }
+            })
+            .collect();
+        ui.set_hour_labels(ModelRc::from(Rc::new(VecModel::from(hours))));
+        ui.set_week_start_choice(match week_start {
+            6 => 1,
+            5 => 2,
+            _ => 0,
+        });
+        ui.set_clock_choice(i32::from(twelve_hour));
     }
 
     /// Re-reads the cache after it changed, then redraws.
@@ -2072,16 +2155,42 @@ pub fn run() -> Result<()> {
     ui.set_month_chips(ModelRc::from(view.month_chips.clone()));
     ui.set_schedule(ModelRc::from(view.schedule.clone()));
     ui.set_sidebar(ModelRc::from(view.sidebar.clone()));
-    // Monday first, like the week view. 2026-11-16 is a Monday.
-    let monday = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap_or_default();
-    ui.set_weekday_names(ModelRc::from(Rc::new(VecModel::from(
-        (0..7)
-            .map(|offset| {
-                let day = monday + Duration::days(offset);
-                SharedString::from(day.format("%a").to_string().to_uppercase())
-            })
-            .collect::<Vec<_>>(),
-    ))));
+    let number =
+        |key: &str| -> Option<u32> { view.store.setting(key).ok().flatten()?.parse().ok() };
+    PREFS.set(Prefs {
+        week_start: number(WEEK_START).filter(|day| *day < 7).unwrap_or(0),
+        twelve_hour: number(TWELVE_HOUR) == Some(1),
+    });
+    view.apply_prefs();
+    if let Some(span) = number(LAST_VIEW).and_then(|index| Span::ALL.get(index as usize)) {
+        view.span.set(*span);
+    }
+    ui.on_week_start_chosen({
+        let view = view.clone();
+        move |choice| {
+            // The list offers Monday, Sunday, Saturday.
+            let week_start = [0, 6, 5].get(choice as usize).copied().unwrap_or(0);
+            PREFS.set(Prefs {
+                week_start,
+                ..prefs()
+            });
+            let _ = view.store.set_setting(WEEK_START, &week_start.to_string());
+            view.apply_prefs();
+            view.refresh();
+        }
+    });
+    ui.on_clock_chosen({
+        let view = view.clone();
+        move |choice| {
+            PREFS.set(Prefs {
+                twelve_hour: choice == 1,
+                ..prefs()
+            });
+            let _ = view.store.set_setting(TWELVE_HOUR, &choice.to_string());
+            view.apply_prefs();
+            view.refresh();
+        }
+    });
 
     let theme = view.store.setting(THEME).ok().flatten();
     ui.set_theme_mode(theme.and_then(|mode| mode.parse().ok()).unwrap_or(0));
@@ -2235,6 +2344,8 @@ pub fn run() -> Result<()> {
         move |index| {
             if let Some(span) = Span::ALL.get(index as usize) {
                 view.span.set(*span);
+                // The app opens on the view it was closed with.
+                let _ = view.store.set_setting(LAST_VIEW, &index.to_string());
                 view.refresh();
             }
         }
@@ -2369,6 +2480,25 @@ mod tests {
         for nonsense in ["", "soon", "31.2.2026", "17", "1.2.3.4", "é.ÿ"] {
             assert_eq!(read(nonsense), None, "{nonsense}");
         }
+    }
+
+    #[test]
+    fn the_week_can_start_on_another_day_and_the_clock_have_twelve_hours() {
+        // Wednesday 18 November 2026.
+        let day = date("2026-11-18");
+        assert_eq!(week_start_from(day, 0), date("2026-11-16"));
+        assert_eq!(week_start_from(day, 6), date("2026-11-15"));
+        assert_eq!(week_start_from(day, 5), date("2026-11-14"));
+        // A day that starts the week is its own week's start.
+        assert_eq!(week_start_from(date("2026-11-15"), 6), date("2026-11-15"));
+        assert_eq!(week_start_from(date("2026-11-15"), 0), date("2026-11-09"));
+
+        assert_eq!(clock_text(14, 5, false), "14:05");
+        assert_eq!(clock_text(0, 0, false), "0:00");
+        assert_eq!(clock_text(14, 5, true), "2:05pm");
+        assert_eq!(clock_text(14, 0, true), "2pm");
+        assert_eq!(clock_text(0, 30, true), "12:30am");
+        assert_eq!(clock_text(12, 0, true), "12pm");
     }
 
     #[test]
