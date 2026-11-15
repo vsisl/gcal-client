@@ -1,9 +1,11 @@
-// The main window: top bar, account sidebar and the merged week view.
+// The main window: top bar, account sidebar and the merged calendar views.
 //
 // Rules carried over from the M0 spikes: list models are patched row by row from Rust
 // (never replaced), and geometry is computed here from a few shared lengths.
 
 export struct TimedItem {
+    // Index for looking up the event's details when it is clicked.
+    instance: int,
     title: string,
     time: string,
     day: int,
@@ -17,12 +19,75 @@ export struct TimedItem {
 }
 
 export struct AllDayItem {
+    instance: int,
     title: string,
     first-day: int,
     last-day: int,
     row: int,
     color: color,
     text-color: color,
+}
+
+export struct EventDetail {
+    title: string,
+    when: string,
+    location: string,
+    description: string,
+    calendar: string,
+    account: string,
+    color: color,
+    // Address of the event in Google's web interface; empty if unknown.
+    link: string,
+}
+
+// A day of the month view.
+export struct MonthCell {
+    // The day's number; the first of a month also names the month.
+    label: string,
+    today: bool,
+    // Belongs to the month before or after the one shown.
+    dim: bool,
+    // How many events did not fit.
+    more: int,
+}
+
+// One line of the month view: a bar across days, or an event within one day.
+export struct MonthChip {
+    instance: int,
+    title: string,
+    // Start time, for events within a day.
+    time: string,
+    week: int,
+    first-day: int,
+    last-day: int,
+    row: int,
+    // Drawn as a bar in the event's colour rather than as plain text.
+    filled: bool,
+    color: color,
+    text-color: color,
+}
+
+// One line of the schedule view: an event on one of the days it touches.
+export struct ScheduleRow {
+    instance: int,
+    // The first line of its day carries the date.
+    first-of-day: bool,
+    day-number: string,
+    day-name: string,
+    today: bool,
+    time: string,
+    title: string,
+    color: color,
+}
+
+// A day of the sidebar's small month.
+export struct MiniDay {
+    label: string,
+    today: bool,
+    // Belongs to the month before or after.
+    dim: bool,
+    // Among the days the main view is showing.
+    shown: bool,
 }
 
 export struct DayHeader {
@@ -33,6 +98,9 @@ export struct DayHeader {
 
 // The sidebar is one flat list: an account row followed by that account's calendars.
 export struct SidebarRow {
+    account-id: int,
+    // Empty on account rows.
+    calendar-id: string,
     is-account: bool,
     text: string,
     email: string,
@@ -55,6 +123,7 @@ global Theme {
     out property <color> text-dim: #70757a;
     out property <color> hover: #f1f3f4;
     out property <color> pressed: #e8eaed;
+    out property <color> selected: #d2e3fc;
     out property <color> accent: #1a73e8;
     out property <color> now: #ea4335;
     out property <color> danger: #d93025;
@@ -107,6 +176,32 @@ export component AppWindow inherits Window {
     in property <StatusKind> status-kind: StatusKind.idle;
     in property <string> status-detail;
     in property <[DayHeader]> days;
+    // Number of day columns: 1, 4 or 7.
+    in property <int> day-count: 7;
+    // Which entry of the view switcher is active: 0 day, 1 week, 2 month, 3 four days,
+    // 4 schedule.
+    in property <int> view-index: 1;
+    property <bool> is-month: root.view-index == 2;
+    property <bool> is-schedule: root.view-index == 4;
+    in property <[ScheduleRow]> schedule;
+    // The sidebar's small month: 42 days, paged on its own, picks the day to show.
+    in property <string> mini-title;
+    in property <[MiniDay]> mini-days;
+    callback mini-step(int);
+    callback mini-pick(int);
+    // The month view: seven names, one cell per day, one chip per line of an event.
+    in property <[string]> weekday-names;
+    in property <[MonthCell]> month-cells;
+    in property <[MonthChip]> month-chips;
+    in property <int> month-weeks: 5;
+    // How many lines of events fit in a cell of the month view.
+    out property <int> month-capacity: Math.max(1, Math.floor((month-row-h - month-number-h) / bar-h));
+    callback month-resized();
+    changed month-capacity => {
+        root.month-resized();
+    }
+    // A cell of the month view was chosen: show that day.
+    callback open-day(int);
     in property <[TimedItem]> timed;
     in property <[AllDayItem]> all-day;
     in property <int> all-day-rows;
@@ -120,6 +215,24 @@ export component AppWindow inherits Window {
     callback go-today();
     callback go-previous();
     callback go-next();
+    callback set-view(int);
+    callback event-clicked(int);
+    callback open-link(string);
+    in property <EventDetail> detail;
+    in-out property <bool> detail-visible;
+    // The list of keyboard shortcuts, opened with "?".
+    property <bool> help-visible;
+    // Where the event was clicked; the details open next to it.
+    property <length> detail-x;
+    property <length> detail-y;
+
+    function show-detail(instance: int, x: length, y: length) {
+        detail-x = x;
+        detail-y = y;
+        root.event-clicked(instance);
+    }
+    // Account, calendar, and whether it should now be shown.
+    callback toggle-calendar(int, string, bool);
     callback add-account();
     callback remove-account(string);
     callback sync-now();
@@ -131,7 +244,11 @@ export component AppWindow inherits Window {
     property <length> head-h: 80px;
     property <length> bar-h: 22px;
     property <length> strip-h: Math.max(1, root.all-day-rows) * bar-h + 6px;
-    property <length> day-w: (main.width - gutter) / 7;
+    property <length> day-w: (main.width - gutter) / root.day-count;
+    property <length> month-names-h: 28px;
+    property <length> month-number-h: 30px;
+    property <length> month-col-w: main.width / 7;
+    property <length> month-row-h: (main.height - month-names-h) / Math.max(1, root.month-weeks);
 
     public function scroll-to-hour(hour: int) {
         grid.content-y = -hour * hour-h;
@@ -141,6 +258,18 @@ export component AppWindow inherits Window {
         key-pressed(event) => {
             if (event.modifiers.control || event.modifiers.alt || event.modifiers.meta) {
                 return reject;
+            }
+            if (event.text == Key.Escape && root.help-visible) {
+                root.help-visible = false;
+                return accept;
+            }
+            if (event.text == Key.Escape && root.detail-visible) {
+                root.detail-visible = false;
+                return accept;
+            }
+            if (event.text == "?") {
+                root.help-visible = !root.help-visible;
+                return accept;
             }
             if (event.text == "t") {
                 root.go-today();
@@ -152,6 +281,26 @@ export component AppWindow inherits Window {
             }
             if (event.text == "k" || event.text == "p") {
                 root.go-previous();
+                return accept;
+            }
+            if (event.text == "d" || event.text == "1") {
+                root.set-view(0);
+                return accept;
+            }
+            if (event.text == "w" || event.text == "2") {
+                root.set-view(1);
+                return accept;
+            }
+            if (event.text == "m" || event.text == "3") {
+                root.set-view(2);
+                return accept;
+            }
+            if (event.text == "x" || event.text == "4") {
+                root.set-view(3);
+                return accept;
+            }
+            if (event.text == "a" || event.text == "5") {
+                root.set-view(4);
                 return accept;
             }
             if (event.text == "r") {
@@ -185,7 +334,7 @@ export component AppWindow inherits Window {
                     TextButton {
                         text: "‹";
                         width: 36px;
-                        accessible-label: @tr("Previous week");
+                        accessible-label: @tr("Previous");
                         clicked => {
                             root.go-previous();
                         }
@@ -197,7 +346,7 @@ export component AppWindow inherits Window {
                     TextButton {
                         text: "›";
                         width: 36px;
-                        accessible-label: @tr("Next week");
+                        accessible-label: @tr("Next");
                         clicked => {
                             root.go-next();
                         }
@@ -224,6 +373,18 @@ export component AppWindow inherits Window {
                     horizontal-alignment: right;
                     overflow: elide;
                     max-width: 420px;
+                }
+
+                for label[index] in [@tr("Day"), @tr("Week"), @tr("Month"), @tr("4 days"), @tr("Schedule")]: VerticalLayout {
+                    alignment: center;
+                    TextButton {
+                        text: label;
+                        outlined: root.view-index == index;
+                        text-color: root.view-index == index ? Theme.accent : Theme.text;
+                        clicked => {
+                            root.set-view(index);
+                        }
+                    }
                 }
 
                 VerticalLayout {
@@ -260,8 +421,107 @@ export component AppWindow inherits Window {
                         alignment: start;
                         padding-top: 8px;
 
+                        // The small month.
+                        Rectangle {
+                            property <length> cell: 30px;
+                            property <length> left: (self.width - 7 * self.cell) / 2;
+                            height: 36px + 7 * self.cell + 12px;
+
+                            Text {
+                                x: parent.left + 8px;
+                                y: 0;
+                                height: 36px;
+                                text: root.mini-title;
+                                font-size: 14px;
+                                font-weight: 500;
+                                color: Theme.text;
+                                vertical-alignment: center;
+                            }
+
+                            TextButton {
+                                x: parent.left + 7 * parent.cell - 60px;
+                                y: 4px;
+                                width: 28px;
+                                height: 28px;
+                                text: "‹";
+                                accessible-label: @tr("Previous month");
+                                clicked => {
+                                    root.mini-step(-1);
+                                }
+                            }
+
+                            TextButton {
+                                x: parent.left + 7 * parent.cell - 30px;
+                                y: 4px;
+                                width: 28px;
+                                height: 28px;
+                                text: "›";
+                                accessible-label: @tr("Next month");
+                                clicked => {
+                                    root.mini-step(1);
+                                }
+                            }
+
+                            for name[d] in root.weekday-names: Text {
+                                x: parent.left + d * parent.cell;
+                                y: 36px;
+                                width: parent.cell;
+                                height: parent.cell;
+                                text: name;
+                                font-size: 9px;
+                                color: Theme.text-dim;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            for day[i] in root.mini-days: Rectangle {
+                                x: parent.left + Math.mod(i, 7) * parent.cell + 2px;
+                                y: 36px + parent.cell + Math.floor(i / 7) * parent.cell + 2px;
+                                width: parent.cell - 4px;
+                                height: parent.cell - 4px;
+                                border-radius: self.height / 2;
+                                background: day.today ? Theme.accent : day.shown ? Theme.selected : pick.has-hover ? Theme.hover : transparent;
+                                accessible-role: button;
+                                accessible-label: day.label;
+                                accessible-action-default => {
+                                    root.mini-pick(i);
+                                }
+
+                                Text {
+                                    text: day.label;
+                                    font-size: 11px;
+                                    color: day.today ? white : day.dim ? Theme.text-dim : Theme.text;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+
+                                pick := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        root.mini-pick(i);
+                                    }
+                                }
+                            }
+                        }
+
                         for row in root.sidebar: Rectangle {
                             height: row.is-account ? 44px : 30px;
+
+                            // A calendar row is one big tick box, drawn under its content.
+                            if !row.is-account: Rectangle {
+                                background: tick.has-hover ? Theme.hover : transparent;
+                                accessible-role: checkbox;
+                                accessible-label: row.text;
+                                accessible-checked: row.shown;
+                                accessible-action-default => {
+                                    tick.clicked();
+                                }
+
+                                tick := TouchArea {
+                                    clicked => {
+                                        root.toggle-calendar(row.account-id, row.calendar-id, !row.shown);
+                                    }
+                                }
+                            }
 
                             if row.is-account: HorizontalLayout {
                                 padding-left: 16px;
@@ -351,182 +611,630 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                // The week.
+                // The calendar.
                 main := Rectangle {
                     horizontal-stretch: 1;
                     clip: true;
 
-                    // Day headers.
-                    for day[d] in root.days: Rectangle {
-                        x: gutter + d * day-w;
-                        y: 0;
-                        width: day-w;
-                        height: head-h;
+                    // The day, 4-day and week views: day columns under an all-day strip.
+                    Rectangle {
+                        visible: !root.is-month && !root.is-schedule;
 
-                        Text {
-                            y: 10px;
-                            width: parent.width;
-                            text: day.weekday;
-                            font-size: 11px;
-                            font-weight: 500;
-                            color: day.today ? Theme.accent : Theme.text-dim;
-                            horizontal-alignment: center;
-                        }
-
-                        Rectangle {
-                            x: (parent.width - self.width) / 2;
-                            y: 28px;
-                            width: 44px;
-                            height: 44px;
-                            border-radius: 22px;
-                            background: day.today ? Theme.accent : transparent;
+                        // Day headers.
+                        for day[d] in root.days: Rectangle {
+                            x: gutter + d * day-w;
+                            y: 0;
+                            width: day-w;
+                            height: head-h;
 
                             Text {
-                                text: day.number;
-                                font-size: 24px;
-                                color: day.today ? white : Theme.text;
+                                y: 10px;
+                                width: parent.width;
+                                text: day.weekday;
+                                font-size: 11px;
+                                font-weight: 500;
+                                color: day.today ? Theme.accent : Theme.text-dim;
+                                horizontal-alignment: center;
+                            }
+
+                            Rectangle {
+                                x: (parent.width - self.width) / 2;
+                                y: 28px;
+                                width: 44px;
+                                height: 44px;
+                                border-radius: 22px;
+                                background: day.today ? Theme.accent : transparent;
+
+                                Text {
+                                    text: day.number;
+                                    font-size: 24px;
+                                    color: day.today ? white : Theme.text;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        // All-day strip.
+                        for d in root.day-count: Rectangle {
+                            x: gutter + d * day-w;
+                            y: head-h;
+                            width: 1px;
+                            height: strip-h;
+                            background: Theme.line;
+                        }
+                        for item in root.all-day: Rectangle {
+                            x: gutter + item.first-day * day-w + 2px;
+                            y: head-h + 2px + item.row * bar-h;
+                            width: (item.last-day - item.first-day + 1) * day-w - 8px;
+                            height: bar-h - 2px;
+                            border-radius: 4px;
+                            background: item.color;
+                            clip: true;
+
+                            TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    root.show-detail(item.instance, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                }
+                            }
+
+                            Text {
+                                x: 8px;
+                                width: parent.width - 12px;
+                                text: item.title == "" ? @tr("(No title)") : item.title;
+                                font-size: 12px;
+                                font-weight: 500;
+                                color: item.text-color;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                        Rectangle {
+                            x: 0;
+                            y: head-h + strip-h;
+                            width: parent.width;
+                            height: 1px;
+                            background: Theme.line;
+                        }
+
+                        // Hour grid.
+                        grid := Flickable {
+                            x: 0;
+                            y: head-h + strip-h + 1px;
+                            width: parent.width;
+                            height: parent.height - self.y;
+                            // Wheel and touchpad scrolling only; pointer drags are for events.
+                            interactive: false;
+                            content-width: self.width;
+                            content-height: hour-h * 24;
+
+                            for h in 24: Rectangle {
+                                x: gutter - 8px;
+                                y: h * hour-h;
+                                width: grid.width - gutter + 8px;
+                                height: 1px;
+                                background: Theme.line;
+                            }
+                            for h in 24: Text {
+                                x: 0;
+                                y: h * hour-h - 7px;
+                                width: gutter - 12px;
+                                horizontal-alignment: right;
+                                text: h == 0 ? "" : "\{h}:00";
+                                font-size: 10px;
+                                color: Theme.text-dim;
+                            }
+                            for d in root.day-count: Rectangle {
+                                x: gutter + d * day-w;
+                                y: 0;
+                                width: 1px;
+                                height: hour-h * 24;
+                                background: Theme.line;
+                            }
+
+                            for item in root.timed: Rectangle {
+                                property <length> slot-w: (day-w - 10px) / item.cols;
+                                property <string> shown-title: item.title == "" ? @tr("(No title)") : item.title;
+
+                                x: gutter + item.day * day-w + 1px + item.col * slot-w;
+                                y: item.start-min / 60.0 * hour-h;
+                                width: slot-w - 1px;
+                                height: (item.end-min - item.start-min) / 60.0 * hour-h - 1px;
+                                border-radius: 4px;
+                                border-width: 1px;
+                                border-color: Theme.surface;
+                                background: item.color;
+                                clip: true;
+                                accessible-role: list-item;
+                                accessible-label: "\{self.shown-title}, \{item.time}";
+                                accessible-action-default => {
+                                    root.show-detail(item.instance, self.absolute-position.x, self.absolute-position.y);
+                                }
+
+                                TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        root.show-detail(item.instance, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                    }
+                                }
+
+                                // Short blocks have room for one line only.
+                                if parent.height <= 34px: Text {
+                                    x: 6px;
+                                    y: 0;
+                                    width: parent.width - 8px;
+                                    height: parent.height;
+                                    text: "\{parent.shown-title}, \{item.time}";
+                                    font-size: parent.height < 16px ? 10px : 12px;
+                                    color: item.text-color;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                if parent.height > 34px: Text {
+                                    x: 6px;
+                                    y: 3px;
+                                    width: parent.width - 8px;
+                                    text: parent.shown-title;
+                                    font-size: 12px;
+                                    font-weight: 500;
+                                    color: item.text-color;
+                                    overflow: elide;
+                                }
+                                if parent.height > 34px: Text {
+                                    x: 6px;
+                                    y: 19px;
+                                    width: parent.width - 8px;
+                                    text: item.time;
+                                    font-size: 11px;
+                                    color: item.text-color;
+                                    overflow: elide;
+                                }
+                            }
+
+                            // Current time.
+                            if root.now-day >= 0: Rectangle {
+                                x: gutter + root.now-day * day-w;
+                                y: root.now-min / 60.0 * hour-h - 1px;
+                                width: day-w;
+                                height: 2px;
+                                background: Theme.now;
+                            }
+                            if root.now-day >= 0: Rectangle {
+                                x: gutter + root.now-day * day-w - 6px;
+                                y: root.now-min / 60.0 * hour-h - 6px;
+                                width: 12px;
+                                height: 12px;
+                                border-radius: 6px;
+                                background: Theme.now;
+                            }
+                        }
+                    }
+
+                    // The month: a row of weekday names, then one row per week.
+                    Rectangle {
+                        visible: root.is-month;
+
+                        for name[d] in root.weekday-names: Text {
+                            x: d * month-col-w;
+                            y: 0;
+                            width: month-col-w;
+                            height: month-names-h;
+                            text: name;
+                            font-size: 11px;
+                            font-weight: 500;
+                            color: Theme.text-dim;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        for cell[i] in root.month-cells: Rectangle {
+                            x: Math.mod(i, 7) * month-col-w;
+                            y: month-names-h + Math.floor(i / 7) * month-row-h;
+                            width: month-col-w;
+                            height: month-row-h;
+
+                            Rectangle {
+                                x: 0;
+                                y: 0;
+                                width: 1px;
+                                height: parent.height;
+                                background: Theme.line;
+                            }
+                            Rectangle {
+                                x: 0;
+                                y: 0;
+                                width: parent.width;
+                                height: 1px;
+                                background: Theme.line;
+                            }
+
+                            // The day's number opens that day.
+                            Rectangle {
+                                x: (parent.width - self.width) / 2;
+                                y: 4px;
+                                width: Math.max(24px, number.preferred-width + 12px);
+                                height: 24px;
+                                border-radius: 12px;
+                                background: cell.today ? Theme.accent : number-touch.has-hover ? Theme.hover : transparent;
+                                accessible-role: button;
+                                accessible-label: cell.label;
+                                accessible-action-default => {
+                                    root.open-day(i);
+                                }
+
+                                number := Text {
+                                    text: cell.label;
+                                    font-size: 12px;
+                                    font-weight: 500;
+                                    color: cell.today ? white : cell.dim ? Theme.text-dim : Theme.text;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+
+                                number-touch := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        root.open-day(i);
+                                    }
+                                }
+                            }
+
+                            // What did not fit, on the cell's last line.
+                            if cell.more > 0: Rectangle {
+                                x: 2px;
+                                y: month-number-h + (root.month-capacity - 1) * bar-h;
+                                width: parent.width - 6px;
+                                height: bar-h - 2px;
+                                border-radius: 4px;
+                                background: more-touch.has-hover ? Theme.hover : transparent;
+                                accessible-role: button;
+                                accessible-label: more.text;
+                                accessible-action-default => {
+                                    root.open-day(i);
+                                }
+
+                                more := Text {
+                                    x: 8px;
+                                    width: parent.width - 12px;
+                                    text: @tr("{} more", cell.more);
+                                    font-size: 12px;
+                                    font-weight: 500;
+                                    color: Theme.text;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+
+                                more-touch := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        root.open-day(i);
+                                    }
+                                }
+                            }
+                        }
+                        for chip in root.month-chips: Rectangle {
+                            property <string> shown-title: chip.title == "" ? @tr("(No title)") : chip.title;
+
+                            x: chip.first-day * month-col-w + 2px;
+                            y: month-names-h + chip.week * month-row-h + month-number-h + chip.row * bar-h;
+                            width: (chip.last-day - chip.first-day + 1) * month-col-w - 6px;
+                            height: bar-h - 2px;
+                            border-radius: 4px;
+                            background: chip.filled ? chip.color : chip-touch.has-hover ? Theme.hover : transparent;
+                            clip: true;
+                            accessible-role: list-item;
+                            accessible-label: chip.time == "" ? self.shown-title : "\{self.shown-title}, \{chip.time}";
+                            accessible-action-default => {
+                                root.show-detail(chip.instance, self.absolute-position.x, self.absolute-position.y);
+                            }
+
+                            chip-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    root.show-detail(chip.instance, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                }
+                            }
+
+                            // Events within a day are a dot in the calendar's colour, the time and the title.
+                            if !chip.filled: Rectangle {
+                                x: 6px;
+                                y: (parent.height - self.height) / 2;
+                                width: 8px;
+                                height: 8px;
+                                border-radius: 4px;
+                                background: chip.color;
+                            }
+                            Text {
+                                x: chip.filled ? 8px : 20px;
+                                width: parent.width - self.x - 4px;
+                                text: chip.filled ? parent.shown-title : "\{chip.time} \{parent.shown-title}";
+                                font-size: 12px;
+                                font-weight: chip.filled ? 500 : 400;
+                                color: chip.filled ? chip.text-color : Theme.text;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                    // The schedule: the coming days' events as a list.
+                    Flickable {
+                        visible: root.is-schedule;
+                        interactive: false;
+                        content-height: agenda.preferred-height;
+
+                        agenda := VerticalLayout {
+                            alignment: start;
+                            padding-top: 8px;
+                            padding-bottom: 16px;
+
+                            for row in root.schedule: Rectangle {
+                                height: 40px;
+                                background: row-touch.has-hover ? Theme.hover : transparent;
+                                accessible-role: list-item;
+                                accessible-label: "\{row.day-number} \{row.day-name}, \{row.time}, \{row.title}";
+                                accessible-action-default => {
+                                    root.show-detail(row.instance, self.absolute-position.x + 200px, self.absolute-position.y);
+                                }
+
+                                if row.first-of-day: Rectangle {
+                                    x: 0;
+                                    y: 0;
+                                    width: parent.width;
+                                    height: 1px;
+                                    background: Theme.line;
+                                }
+
+                                row-touch := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        root.show-detail(row.instance, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                    }
+                                }
+
+                                if row.first-of-day: Rectangle {
+                                    x: 16px;
+                                    y: (parent.height - self.height) / 2;
+                                    width: 32px;
+                                    height: 32px;
+                                    border-radius: 16px;
+                                    background: row.today ? Theme.accent : transparent;
+
+                                    Text {
+                                        text: row.day-number;
+                                        font-size: 18px;
+                                        color: row.today ? white : Theme.text;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                if row.first-of-day: Text {
+                                    x: 56px;
+                                    width: 80px;
+                                    height: parent.height;
+                                    text: row.day-name;
+                                    font-size: 11px;
+                                    font-weight: 500;
+                                    color: row.today ? Theme.accent : Theme.text-dim;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle {
+                                    x: 150px;
+                                    y: (parent.height - self.height) / 2;
+                                    width: 12px;
+                                    height: 12px;
+                                    border-radius: 6px;
+                                    background: row.color;
+                                }
+
+                                Text {
+                                    x: 178px;
+                                    width: 130px;
+                                    height: parent.height;
+                                    text: row.time;
+                                    font-size: 14px;
+                                    color: Theme.text;
+                                    vertical-alignment: center;
+                                }
+
+                                Text {
+                                    x: 316px;
+                                    width: parent.width - self.x - 16px;
+                                    height: parent.height;
+                                    text: row.title == "" ? @tr("(No title)") : row.title;
+                                    font-size: 14px;
+                                    font-weight: 500;
+                                    color: Theme.text;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                            if root.schedule.length == 0: Text {
+                                height: 80px;
+                                text: @tr("Nothing planned in these days.");
+                                font-size: 14px;
+                                color: Theme.text-dim;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
                             }
                         }
                     }
+                }
+            }
+        }
 
-                    // All-day strip.
-                    for d in 7: Rectangle {
-                        x: gutter + d * day-w;
-                        y: head-h;
-                        width: 1px;
-                        height: strip-h;
-                        background: Theme.line;
+        // Event details. An overlay inside the window: we place it ourselves so that it
+        // never leaves the window (M0 finding), and it does not take keyboard focus.
+        if root.detail-visible: TouchArea {
+            // Clicking anywhere else closes it.
+            clicked => {
+                root.detail-visible = false;
+            }
+        }
+        if root.detail-visible: card := Rectangle {
+            property <length> margin: 12px;
+            width: Math.min(420px, root.width - 2 * self.margin);
+            height: Math.min(content.preferred-height, root.height - 2 * self.margin);
+            // Beside the click, shifted back inside the window where it would not fit.
+            x: Math.max(self.margin, Math.min(root.detail-x + 12px, root.width - self.width - self.margin));
+            y: Math.max(self.margin, Math.min(root.detail-y - 24px, root.height - self.height - self.margin));
+            background: Theme.surface;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.line;
+            drop-shadow-blur: 24px;
+            drop-shadow-offset-y: 6px;
+            drop-shadow-color: #00000040;
+            clip: true;
+            accessible-role: groupbox;
+            accessible-label: root.detail.title;
+
+            // Swallows clicks on the card itself.
+            TouchArea { }
+
+            content := VerticalLayout {
+                padding: 16px;
+                padding-top: 8px;
+                spacing: 10px;
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 4px;
+                    if root.detail.link != "": TextButton {
+                        text: @tr("Open in browser");
+                        height: 32px;
+                        clicked => {
+                            root.open-link(root.detail.link);
+                        }
                     }
-                    for item in root.all-day: Rectangle {
-                        x: gutter + item.first-day * day-w + 2px;
-                        y: head-h + 2px + item.row * bar-h;
-                        width: (item.last-day - item.first-day + 1) * day-w - 8px;
-                        height: bar-h - 2px;
-                        border-radius: 4px;
-                        background: item.color;
-                        clip: true;
+                    TextButton {
+                        text: "✕";
+                        height: 32px;
+                        width: 32px;
+                        accessible-label: @tr("Close");
+                        clicked => {
+                            root.detail-visible = false;
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 14px;
+                    Rectangle {
+                        width: 16px;
+                        Rectangle {
+                            y: 6px;
+                            width: 16px;
+                            height: 16px;
+                            border-radius: 4px;
+                            background: root.detail.color;
+                        }
+                    }
+
+                    VerticalLayout {
+                        spacing: 4px;
+                        Text {
+                            text: root.detail.title == "" ? @tr("(No title)") : root.detail.title;
+                            font-size: 20px;
+                            color: Theme.text;
+                            wrap: word-wrap;
+                        }
 
                         Text {
-                            x: 8px;
-                            width: parent.width - 12px;
-                            text: item.title == "" ? @tr("(No title)") : item.title;
-                            font-size: 12px;
-                            font-weight: 500;
-                            color: item.text-color;
-                            vertical-alignment: center;
-                            overflow: elide;
+                            text: root.detail.when;
+                            font-size: 13px;
+                            color: Theme.text;
+                            wrap: word-wrap;
                         }
                     }
-                    Rectangle {
-                        x: 0;
-                        y: head-h + strip-h;
-                        width: parent.width;
-                        height: 1px;
-                        background: Theme.line;
+                }
+
+                if root.detail.location != "": Text {
+                    text: root.detail.location;
+                    font-size: 13px;
+                    color: Theme.text;
+                    wrap: word-wrap;
+                }
+                if root.detail.description != "": Text {
+                    text: root.detail.description;
+                    font-size: 13px;
+                    color: Theme.text;
+                    wrap: word-wrap;
+                    // Long descriptions are cut; the full, formatted text comes with M3.
+                    max-height: 220px;
+                    overflow: elide;
+                }
+                Text {
+                    text: root.detail.calendar == root.detail.account ? root.detail.account : "\{root.detail.calendar} · \{root.detail.account}";
+                    font-size: 12px;
+                    color: Theme.text-dim;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        // Keyboard shortcuts. Like the details card, an overlay that takes no focus, so
+        // the shortcuts it lists keep working while it is open.
+        if root.help-visible: TouchArea {
+            clicked => {
+                root.help-visible = false;
+            }
+        }
+        if root.help-visible: Rectangle {
+            width: Math.min(380px, root.width - 24px);
+            height: Math.min(shortcuts.preferred-height, root.height - 24px);
+            background: Theme.surface;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.line;
+            drop-shadow-blur: 24px;
+            drop-shadow-offset-y: 6px;
+            drop-shadow-color: #00000040;
+            clip: true;
+            accessible-role: groupbox;
+            accessible-label: @tr("Keyboard shortcuts");
+
+            TouchArea { }
+
+            shortcuts := VerticalLayout {
+                padding: 20px;
+                spacing: 6px;
+
+                Text {
+                    text: @tr("Keyboard shortcuts");
+                    font-size: 18px;
+                    color: Theme.text;
+                }
+
+                Rectangle {
+                    height: 6px;
+                }
+
+                for line in [
+                    { keys: "t", what: @tr("Today") },
+                    { keys: "j / n", what: @tr("Next period") },
+                    { keys: "k / p", what: @tr("Previous period") },
+                    { keys: "d / 1", what: @tr("Day view") },
+                    { keys: "w / 2", what: @tr("Week view") },
+                    { keys: "m / 3", what: @tr("Month view") },
+                    { keys: "x / 4", what: @tr("4 days view") },
+                    { keys: "a / 5", what: @tr("Schedule view") },
+                    { keys: "r", what: @tr("Refresh") },
+                    { keys: "Esc", what: @tr("Close event details") },
+                    { keys: "?", what: @tr("Show or hide this list") },
+                ]: HorizontalLayout {
+                    spacing: 12px;
+                    Text {
+                        width: 70px;
+                        text: line.keys;
+                        font-size: 13px;
+                        font-weight: 600;
+                        color: Theme.text;
                     }
 
-                    // Hour grid.
-                    grid := Flickable {
-                        x: 0;
-                        y: head-h + strip-h + 1px;
-                        width: parent.width;
-                        height: parent.height - self.y;
-                        // Wheel and touchpad scrolling only; pointer drags are for events.
-                        interactive: false;
-                        content-width: self.width;
-                        content-height: hour-h * 24;
-
-                        for h in 24: Rectangle {
-                            x: gutter - 8px;
-                            y: h * hour-h;
-                            width: grid.width - gutter + 8px;
-                            height: 1px;
-                            background: Theme.line;
-                        }
-                        for h in 24: Text {
-                            x: 0;
-                            y: h * hour-h - 7px;
-                            width: gutter - 12px;
-                            horizontal-alignment: right;
-                            text: h == 0 ? "" : "\{h}:00";
-                            font-size: 10px;
-                            color: Theme.text-dim;
-                        }
-                        for d in 7: Rectangle {
-                            x: gutter + d * day-w;
-                            y: 0;
-                            width: 1px;
-                            height: hour-h * 24;
-                            background: Theme.line;
-                        }
-
-                        for item in root.timed: Rectangle {
-                            property <length> slot-w: (day-w - 10px) / item.cols;
-                            property <string> shown-title: item.title == "" ? @tr("(No title)") : item.title;
-
-                            x: gutter + item.day * day-w + 1px + item.col * slot-w;
-                            y: item.start-min / 60.0 * hour-h;
-                            width: slot-w - 1px;
-                            height: (item.end-min - item.start-min) / 60.0 * hour-h - 1px;
-                            border-radius: 4px;
-                            border-width: 1px;
-                            border-color: Theme.surface;
-                            background: item.color;
-                            clip: true;
-                            accessible-role: list-item;
-                            accessible-label: "\{self.shown-title}, \{item.time}";
-
-                            // Short blocks have room for one line only.
-                            if parent.height <= 34px: Text {
-                                x: 6px;
-                                y: 0;
-                                width: parent.width - 8px;
-                                height: parent.height;
-                                text: "\{parent.shown-title}, \{item.time}";
-                                font-size: parent.height < 16px ? 10px : 12px;
-                                color: item.text-color;
-                                vertical-alignment: center;
-                                overflow: elide;
-                            }
-                            if parent.height > 34px: Text {
-                                x: 6px;
-                                y: 3px;
-                                width: parent.width - 8px;
-                                text: parent.shown-title;
-                                font-size: 12px;
-                                font-weight: 500;
-                                color: item.text-color;
-                                overflow: elide;
-                            }
-                            if parent.height > 34px: Text {
-                                x: 6px;
-                                y: 19px;
-                                width: parent.width - 8px;
-                                text: item.time;
-                                font-size: 11px;
-                                color: item.text-color;
-                                overflow: elide;
-                            }
-                        }
-
-                        // Current time.
-                        if root.now-day >= 0: Rectangle {
-                            x: gutter + root.now-day * day-w;
-                            y: root.now-min / 60.0 * hour-h - 1px;
-                            width: day-w;
-                            height: 2px;
-                            background: Theme.now;
-                        }
-                        if root.now-day >= 0: Rectangle {
-                            x: gutter + root.now-day * day-w - 6px;
-                            y: root.now-min / 60.0 * hour-h - 6px;
-                            width: 12px;
-                            height: 12px;
-                            border-radius: 6px;
-                            background: Theme.now;
-                        }
+                    Text {
+                        text: line.what;
+                        font-size: 13px;
+                        color: Theme.text;
                     }
                 }
             }

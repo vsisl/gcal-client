@@ -35,6 +35,9 @@ pub struct StoredCalendar {
     pub entry: CalendarListEntry,
     /// Token for fetching only this calendar's event changes; `None` before its first sync.
     pub events_sync_token: Option<String>,
+    /// Whether the calendar's events are drawn: the user's choice in this app if they made
+    /// one, otherwise whether it is ticked in Google's web interface.
+    pub shown: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -45,7 +48,8 @@ pub struct StoredEvent {
 }
 
 /// Schema versions, applied in order; the database's `user_version` counts how many ran.
-const MIGRATIONS: &[&str] = &["
+const MIGRATIONS: &[&str] = &[
+    "
     CREATE TABLE accounts (
         id INTEGER PRIMARY KEY,
         email TEXT NOT NULL UNIQUE,
@@ -74,7 +78,13 @@ const MIGRATIONS: &[&str] = &["
             REFERENCES calendars(account_id, id) ON DELETE CASCADE
     );
     CREATE INDEX events_by_time ON events (start_ts, end_ts);
-"];
+",
+    "
+    -- The user's own tick in this app's sidebar; NULL until they touch it. Kept apart from
+    -- the JSON so that syncing the calendar list does not overwrite it.
+    ALTER TABLE calendars ADD COLUMN shown_override INTEGER;
+",
+];
 
 pub struct Store {
     conn: Connection,
@@ -123,6 +133,20 @@ impl Store {
     pub fn remove_account(&self, id: AccountId) -> Result<()> {
         self.conn
             .execute("DELETE FROM accounts WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Gives the space of deleted rows back to the disk. SQLite otherwise keeps the file
+    /// at its largest size, and removing an account can free most of it.
+    pub fn compact(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM")?;
+        // In write-ahead mode the vacuumed database first lands in the log, and the file
+        // only shrinks when the log is folded back in; the window's connection keeps the
+        // log from being folded in on close. If that connection is reading right now this
+        // reports "busy" and does nothing, and the space comes back with a later write
+        // or when the app exits.
+        self.conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
         Ok(())
     }
 
@@ -204,21 +228,25 @@ impl Store {
     /// All calendars of all accounts, ordered by account, then primary first, then by name.
     pub fn calendars(&self) -> Result<Vec<StoredCalendar>> {
         let mut stmt = self.conn.prepare(
-            "SELECT account_id, json, events_sync_token FROM calendars ORDER BY account_id",
+            "SELECT account_id, json, events_sync_token, shown_override
+             FROM calendars ORDER BY account_id",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, AccountId>(0)?,
                 row.get::<_, String>(1)?,
                 row.get(2)?,
+                row.get::<_, Option<bool>>(3)?,
             ))
         })?;
         let mut calendars = Vec::new();
         for row in rows {
-            let (account_id, json, events_sync_token) = row?;
+            let (account_id, json, events_sync_token, shown_override) = row?;
+            let entry: CalendarListEntry = serde_json::from_str(&json)?;
             calendars.push(StoredCalendar {
                 account_id,
-                entry: serde_json::from_str(&json)?,
+                shown: shown_override.unwrap_or(entry.selected),
+                entry,
                 events_sync_token,
             });
         }
@@ -235,6 +263,20 @@ impl Store {
                 ))
         });
         Ok(calendars)
+    }
+
+    /// Remembers the user's choice to show or hide a calendar in this app.
+    pub fn set_calendar_shown(
+        &self,
+        account: AccountId,
+        calendar_id: &str,
+        shown: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE calendars SET shown_override = ?3 WHERE account_id = ?1 AND id = ?2",
+            params![account, calendar_id, shown],
+        )?;
+        Ok(())
     }
 
     /// Saves events from a sync of one calendar and the token for the next one.
@@ -543,6 +585,18 @@ mod tests {
     }
 
     #[test]
+    fn compacting_keeps_what_is_stored() {
+        let (mut store, account) = store_with_calendar();
+        let items = [timed("e", "2026-11-16T10:00:00Z", "2026-11-16T11:00:00Z")];
+        store
+            .apply_events(account, "cal", &items, None, true)
+            .unwrap();
+        store.compact().unwrap();
+        assert_eq!(store.calendars().unwrap().len(), 1);
+        assert_eq!(store.single_events_for_range(0, i64::MAX).unwrap().len(), 1);
+    }
+
+    #[test]
     fn removing_a_calendar_or_account_removes_its_events() {
         let (mut store, account) = store_with_calendar();
         let items = [timed("e", "2026-11-16T10:00:00Z", "2026-11-16T11:00:00Z")];
@@ -562,6 +616,31 @@ mod tests {
 
         store.remove_account(account).unwrap();
         assert!(store.accounts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn showing_a_calendar_follows_google_until_the_user_chooses_and_survives_sync() {
+        let mut store = Store::open_in_memory().unwrap();
+        let account = store.add_account("me@example.com").unwrap();
+        let list = [
+            json!({"id": "ticked", "summary": "A", "selected": true}),
+            json!({"id": "unticked", "summary": "B"}),
+        ];
+        store
+            .apply_calendar_list(account, &list, None, true)
+            .unwrap();
+        let shown = |store: &Store| -> Vec<bool> {
+            store.calendars().unwrap().iter().map(|c| c.shown).collect()
+        };
+        assert_eq!(shown(&store), [true, false]);
+
+        store.set_calendar_shown(account, "ticked", false).unwrap();
+        store.set_calendar_shown(account, "unticked", true).unwrap();
+        // A later sync of the list must not undo the user's choice.
+        store
+            .apply_calendar_list(account, &list, None, true)
+            .unwrap();
+        assert_eq!(shown(&store), [false, true]);
     }
 
     #[test]

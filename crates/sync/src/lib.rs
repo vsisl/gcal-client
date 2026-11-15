@@ -14,6 +14,10 @@ pub enum SyncError {
 /// What one sync of an account did.
 #[derive(Debug, Default, PartialEq)]
 pub struct SyncReport {
+    /// Whether the cache may differ from before: something came back from Google, or a
+    /// collection was replaced in full (which removes what Google no longer lists, even
+    /// when it lists nothing).
+    pub changed: bool,
     pub calendars_synced: usize,
     /// Events created, changed or deleted since the previous sync (all of them on a first one).
     pub events_changed: usize,
@@ -35,7 +39,10 @@ pub async fn sync_account(
     let (list, full) = fetch(token.as_deref(), |t| client.list_calendars(t)).await?;
     store.apply_calendar_list(account, &list.items, list.sync_token.as_deref(), full)?;
 
-    let mut report = SyncReport::default();
+    let mut report = SyncReport {
+        changed: full || !list.items.is_empty(),
+        ..SyncReport::default()
+    };
     for calendar in store
         .calendars()?
         .into_iter()
@@ -57,6 +64,7 @@ pub async fn sync_account(
                 );
                 match applied {
                     Ok(()) => {
+                        report.changed |= full || !events.items.is_empty();
                         report.calendars_synced += 1;
                         report.events_changed += events.items.len();
                     }
@@ -188,6 +196,7 @@ mod tests {
         assert_eq!(
             report,
             SyncReport {
+                changed: true,
                 calendars_synced: 1,
                 events_changed: 2,
                 ..Default::default()
@@ -215,6 +224,7 @@ mod tests {
             .await;
         let report = sync_account(&client, &mut store, account).await.unwrap();
         assert_eq!(report.events_changed, 1);
+        assert!(report.changed);
         assert_eq!(stored_ids(&store), ["b"]);
         assert_eq!(
             store.calendars().unwrap()[0].events_sync_token.as_deref(),

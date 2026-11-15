@@ -4,10 +4,13 @@
 //! separate event for every occurrence that was changed or deleted. Expanding a series means
 //! generating the master's occurrences and replacing those that have such an exception.
 
+use std::borrow::Borrow;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
-use chrono::{DateTime, Duration, NaiveDate, NaiveTime, Utc};
+use chrono::offset::LocalResult;
+use chrono::{DateTime, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use rrule::RRuleSet;
 
 use crate::model::{Event, EventStatus, EventTime};
@@ -22,68 +25,182 @@ pub struct Instance<'a, K> {
     pub end: EventTime,
 }
 
-/// Upper bound on occurrences of one series inside one range; far above any real calendar.
-const MAX_OCCURRENCES: u16 = 5000;
+/// Upper bound on the occurrences of one series that are worked out and remembered; far
+/// above any real calendar (a daily event reaches it after 179 years).
+const MAX_REMEMBERED: u16 = u16::MAX;
+/// Upper bound on occurrences of one series inside one range. Calendars shared by others
+/// are among the input, and a rule repeating every second must not be able to put tens of
+/// thousands of blocks into one view.
+const MAX_PER_RANGE: u16 = 5000;
+/// How far past the range asked for an endless series is worked out, so that moving on
+/// through the calendar rarely has to do it again.
+const LOOKAHEAD_DAYS: i64 = 400;
 
-/// The instances of `events` that may overlap `from..to`.
+/// The repeating events of a cache, prepared for being asked again and again which
+/// occurrences fall in a range.
 ///
-/// `events` must hold every master and exception (the store's range query does); single
-/// events outside the range are filtered out here. All-day instances are kept with a day of
-/// slack on either side, since which days they cover depends on the viewer's time zone.
-pub fn expand<'a, K>(
-    events: impl IntoIterator<Item = (K, &'a Event)>,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
-) -> Vec<Instance<'a, K>>
+/// Moving through the calendar asks once per step. Parsing every rule and walking every
+/// series from its first date each time made that visibly slow, so the rules are parsed
+/// once here and each series remembers the dates it has worked out.
+pub struct Series<K, E> {
+    entries: Vec<Entry<K, E>>,
+}
+
+struct Entry<K, E> {
+    key: K,
+    event: E,
+    start: EventTime,
+    end: EventTime,
+    /// `None` for a changed occurrence, which is an ordinary event at its new time.
+    master: Option<Master>,
+}
+
+struct Master {
+    /// `None` when the rule cannot be parsed: the series is then its first occurrence alone,
+    /// so the event stays visible instead of disappearing.
+    set: Option<RRuleSet>,
+    /// Whether every rule ends by itself (UNTIL or COUNT), so all dates can be listed.
+    finite: bool,
+    /// Original start times of the occurrences that were changed or deleted.
+    replaced: HashSet<EventTime>,
+    known: RefCell<Known>,
+}
+
+/// The occurrence starts of a series worked out so far: all of them, in order, up to
+/// `through`.
+#[derive(Default)]
+struct Known {
+    dates: Vec<DateTime<Utc>>,
+    through: Option<DateTime<Utc>>,
+    /// There are more occurrences than are remembered; ranges are then computed directly.
+    too_many: bool,
+}
+
+impl<K, E> Default for Series<K, E> {
+    fn default() -> Self {
+        Series {
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl<K, E> Series<K, E>
 where
     K: Clone + Eq + Hash,
+    E: Borrow<Event>,
 {
-    let events: Vec<(K, &Event)> = events.into_iter().collect();
+    /// `events` must hold every master and every changed or deleted occurrence. Other
+    /// events may be among them and are treated as occurring once.
+    pub fn new(events: impl IntoIterator<Item = (K, E)>) -> Self {
+        let events: Vec<(K, E)> = events.into_iter().collect();
 
-    // Original start times of occurrences that were changed or deleted, per series.
-    let mut replaced: HashMap<(K, &str), HashSet<EventTime>> = HashMap::new();
-    for (key, event) in &events {
-        if let (Some(master), Some(original)) = (
-            event.recurring_event_id.as_deref(),
-            event.original_start_time.as_ref().and_then(|t| t.time()),
-        ) {
-            replaced
-                .entry((key.clone(), master))
-                .or_default()
-                .insert(original);
-        }
-    }
-
-    let mut instances = Vec::new();
-    for (key, event) in events {
-        if event.status == EventStatus::Cancelled {
-            continue;
-        }
-        let (Some(start), Some(end)) = (event.start_time(), event.end_time()) else {
-            continue;
-        };
-        if event.is_recurring_master() {
-            let skip = replaced.get(&(key.clone(), event.id.as_str()));
-            for (start, end) in occurrences(event, start, end, from, to) {
-                if skip.is_none_or(|s| !s.contains(&start)) {
-                    instances.push(Instance {
-                        key: key.clone(),
-                        event,
-                        start,
-                        end,
-                    });
-                }
+        // Original start times of occurrences that were changed or deleted, per series.
+        let mut replaced: HashMap<(K, String), HashSet<EventTime>> = HashMap::new();
+        for (key, event) in &events {
+            let event = event.borrow();
+            if let (Some(master), Some(original)) = (
+                event.recurring_event_id.as_deref(),
+                event.original_start_time.as_ref().and_then(|t| t.time()),
+            ) {
+                replaced
+                    .entry((key.clone(), master.to_owned()))
+                    .or_default()
+                    .insert(original);
             }
-        } else if overlaps(start, end, from, to) {
-            instances.push(Instance {
-                key,
-                event,
-                start,
-                end,
-            });
         }
+
+        let entries = events
+            .into_iter()
+            .filter_map(|(key, owner)| {
+                let event = owner.borrow();
+                if event.status == EventStatus::Cancelled {
+                    return None;
+                }
+                let (start, end) = (event.start_time()?, event.end_time()?);
+                let master = event.is_recurring_master().then(|| {
+                    let set = rule_set(event, start);
+                    let finite = set.as_ref().is_some_and(|set| {
+                        set.get_rrule()
+                            .iter()
+                            .all(|rule| rule.get_until().is_some() || rule.get_count().is_some())
+                    });
+                    Master {
+                        set,
+                        finite,
+                        replaced: replaced
+                            .remove(&(key.clone(), event.id.clone()))
+                            .unwrap_or_default(),
+                        known: RefCell::default(),
+                    }
+                });
+                Some(Entry {
+                    key,
+                    event: owner,
+                    start,
+                    end,
+                    master,
+                })
+            })
+            .collect();
+        Series { entries }
     }
-    instances
+
+    /// The instances that may overlap `from..to`, of the events whose key `keep` accepts.
+    ///
+    /// All-day instances are kept with a day of slack on either side, since which days they
+    /// cover depends on the viewer's time zone.
+    pub fn expand(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        keep: impl Fn(&K) -> bool,
+    ) -> Vec<Instance<'_, K>> {
+        let mut instances = Vec::new();
+        for entry in self.entries.iter().filter(|entry| keep(&entry.key)) {
+            let event = entry.event.borrow();
+            match &entry.master {
+                Some(master) => {
+                    for (start, end) in master.occurrences(entry.start, entry.end, from, to) {
+                        if !master.replaced.contains(&start) {
+                            instances.push(Instance {
+                                key: entry.key.clone(),
+                                event,
+                                start,
+                                end,
+                            });
+                        }
+                    }
+                }
+                None if overlaps(entry.start, entry.end, from, to) => instances.push(Instance {
+                    key: entry.key.clone(),
+                    event,
+                    start: entry.start,
+                    end: entry.end,
+                }),
+                None => {}
+            }
+        }
+        instances
+    }
+}
+
+/// An event that does not repeat, as an instance if it may overlap `from..to`.
+pub fn single_instance<K>(
+    key: K,
+    event: &Event,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Option<Instance<'_, K>> {
+    if event.status == EventStatus::Cancelled {
+        return None;
+    }
+    let (start, end) = (event.start_time()?, event.end_time()?);
+    overlaps(start, end, from, to).then_some(Instance {
+        key,
+        event,
+        start,
+        end,
+    })
 }
 
 fn overlaps(start: EventTime, end: EventTime, from: DateTime<Utc>, to: DateTime<Utc>) -> bool {
@@ -96,61 +213,117 @@ fn overlaps(start: EventTime, end: EventTime, from: DateTime<Utc>, to: DateTime<
     start.timestamp() < to.timestamp() + slack && end > from.timestamp() - slack
 }
 
-/// Start and end of each occurrence of a series that may overlap `from..to`.
-///
-/// A series whose rule cannot be parsed falls back to its first occurrence alone, so the
-/// event stays visible instead of disappearing.
-fn occurrences(
-    master: &Event,
-    start: EventTime,
-    end: EventTime,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
-) -> Vec<(EventTime, EventTime)> {
-    let length = Duration::seconds((end.timestamp() - start.timestamp()).max(0));
-    let all_day = matches!(start, EventTime::AllDay(_));
-    let slack = if all_day {
-        Duration::days(1)
-    } else {
-        Duration::zero()
-    };
-    let window_start = from - length - slack;
-    let window_end = to + slack;
-
-    let Some(set) = rule_set(master, start) else {
-        return if overlaps(start, end, from, to) {
-            vec![(start, end)]
-        } else {
-            Vec::new()
-        };
-    };
-    let utc = rrule::Tz::UTC;
-    let result = set
-        .after(window_start.with_timezone(&utc))
-        .before(window_end.with_timezone(&utc))
-        .all(MAX_OCCURRENCES);
-
-    result
-        .dates
-        .into_iter()
-        .map(|occurrence| {
-            let occurrence = occurrence.with_timezone(&Utc);
-            if all_day {
-                let day = occurrence.date_naive();
-                let days = length.num_days().max(1);
-                (
-                    EventTime::AllDay(day),
-                    EventTime::AllDay(day + Duration::days(days)),
-                )
+impl Master {
+    /// Start and end of each occurrence that may overlap `from..to`, for a series whose
+    /// first occurrence is `start..end`.
+    fn occurrences(
+        &self,
+        start: EventTime,
+        end: EventTime,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Vec<(EventTime, EventTime)> {
+        let Some(set) = &self.set else {
+            return if overlaps(start, end, from, to) {
+                vec![(start, end)]
             } else {
-                (
-                    EventTime::Timed(occurrence),
-                    EventTime::Timed(occurrence + length),
-                )
+                Vec::new()
+            };
+        };
+        let length = Duration::seconds((end.timestamp() - start.timestamp()).max(0));
+        let all_day = matches!(start, EventTime::AllDay(_));
+        let slack = if all_day {
+            Duration::days(1)
+        } else {
+            Duration::zero()
+        };
+        let window_start = from - length - slack;
+        let window_end = to + slack;
+
+        let mut known = self.known.borrow_mut();
+        if !known.too_many && known.through.is_none_or(|through| through < window_end) {
+            // Work out the series from its beginning again, further than asked for. The
+            // library walks from the first date whatever range it is given, so doing it
+            // rarely is what saves the time.
+            let through = if self.finite {
+                DateTime::<Utc>::MAX_UTC
+            } else {
+                window_end + Duration::days(LOOKAHEAD_DAYS)
+            };
+            let result = if self.finite {
+                set.clone().all(MAX_REMEMBERED)
+            } else {
+                set.clone()
+                    .before(through.with_timezone(&rrule::Tz::UTC))
+                    .all(MAX_REMEMBERED)
+            };
+            if result.limited {
+                *known = Known {
+                    too_many: true,
+                    ..Known::default()
+                };
+            } else {
+                let mut dates: Vec<_> = result
+                    .dates
+                    .into_iter()
+                    .map(|date| date.with_timezone(&Utc))
+                    .collect();
+                // The start is in the set twice when the rules produce it as well (see
+                // `rule_set`).
+                dates.sort();
+                dates.dedup();
+                *known = Known {
+                    dates,
+                    through: Some(through),
+                    too_many: false,
+                };
             }
-        })
-        .filter(|(start, end)| overlaps(*start, *end, from, to))
-        .collect()
+        }
+
+        let direct;
+        let dates: &[DateTime<Utc>] = if known.too_many {
+            let utc = rrule::Tz::UTC;
+            let result = set
+                .clone()
+                .after(window_start.with_timezone(&utc))
+                .before(window_end.with_timezone(&utc))
+                .all(MAX_PER_RANGE);
+            let mut dates: Vec<_> = result
+                .dates
+                .into_iter()
+                .map(|date| date.with_timezone(&Utc))
+                .collect();
+            dates.sort();
+            dates.dedup();
+            direct = dates;
+            &direct
+        } else {
+            let first = known.dates.partition_point(|date| *date < window_start);
+            let past_last = known.dates.partition_point(|date| *date <= window_end);
+            let past_last = past_last.min(first + usize::from(MAX_PER_RANGE));
+            &known.dates[first..past_last]
+        };
+
+        dates
+            .iter()
+            .map(|&occurrence| {
+                if all_day {
+                    let day = occurrence.date_naive();
+                    let days = length.num_days().max(1);
+                    (
+                        EventTime::AllDay(day),
+                        EventTime::AllDay(day + Duration::days(days)),
+                    )
+                } else {
+                    (
+                        EventTime::Timed(occurrence),
+                        EventTime::Timed(occurrence + length),
+                    )
+                }
+            })
+            .filter(|(start, end)| overlaps(*start, *end, from, to))
+            .collect()
+    }
 }
 
 /// Builds the rule set for a master in the form the `rrule` crate parses.
@@ -159,8 +332,12 @@ fn occurrences(
 /// across daylight-saving changes. All-day series are computed at midnight UTC and only the
 /// date of each result is used.
 fn rule_set(master: &Event, start: EventTime) -> Option<RRuleSet> {
-    let mut text = match start {
-        EventTime::AllDay(day) => format!("DTSTART:{}T000000Z", day.format("%Y%m%d")),
+    // The start is handed over as an instant in its zone, not as local-time text: text
+    // cannot tell apart the two 02:30s of the night clocks go back, and the parser rejects
+    // such a start outright.
+    let mut start_uncounted = false;
+    let first = match start {
+        EventTime::AllDay(day) => day_start_utc(day).with_timezone(&rrule::Tz::UTC),
         EventTime::Timed(instant) => {
             let zone = master
                 .start
@@ -168,20 +345,62 @@ fn rule_set(master: &Event, start: EventTime) -> Option<RRuleSet> {
                 .and_then(|s| s.time_zone.as_deref())
                 .and_then(|name| name.parse::<chrono_tz::Tz>().ok())
                 .unwrap_or(chrono_tz::UTC);
-            let local = instant.with_timezone(&zone);
-            format!(
-                "DTSTART;TZID={}:{}",
-                zone.name(),
-                local.format("%Y%m%dT%H%M%S")
-            )
+            // On the night clocks go back, the library turns a repeated local time into
+            // the earlier of its two instants. For a series starting at the later one, the
+            // rule's own first occurrence then lies before the start and is dropped
+            // without being counted, so COUNT would yield one occurrence too many.
+            let local = instant.with_timezone(&zone).naive_local();
+            start_uncounted = matches!(
+                zone.from_local_datetime(&local),
+                LocalResult::Ambiguous(_, later) if later.with_timezone(&Utc) == instant
+            );
+            instant.with_timezone(&rrule::Tz::Tz(zone))
         }
     };
     let all_day = matches!(start, EventTime::AllDay(_));
-    for line in &master.recurrence {
-        text.push('\n');
-        text.push_str(&normalise_line(line, all_day));
+    let lines: Vec<String> = master
+        .recurrence
+        .iter()
+        .filter_map(|line| {
+            let line = normalise_line(line, all_day);
+            if start_uncounted {
+                // The start itself is added below; the rule supplies the rest.
+                one_fewer(&line)
+            } else {
+                Some(line)
+            }
+        })
+        .collect();
+    RRuleSet::new(first)
+        .set_from_string(&lines.join("\n"))
+        .ok()
+        // The library yields only what the rules and extra dates produce. Google counts the
+        // event's own start as an occurrence too, which matters for a series made of
+        // extra dates alone. A start the rules also produce comes out twice; the caller
+        // removes the duplicate.
+        .map(|set| set.rdate(first))
+}
+
+/// The rule with its COUNT lowered by one; `None` when nothing would be left of it. Lines
+/// without a COUNT come back unchanged.
+fn one_fewer(line: &str) -> Option<String> {
+    if !line.starts_with("RRULE") {
+        return Some(line.to_owned());
     }
-    text.parse().ok()
+    let mut parts = Vec::new();
+    for part in line.split(';') {
+        // The first part also carries the property name ("RRULE:COUNT=2").
+        let (prefix, field) = match part.split_once(':') {
+            Some((name, field)) => (format!("{name}:"), field),
+            None => (String::new(), part),
+        };
+        match field.strip_prefix("COUNT=").map(str::parse::<u32>) {
+            Some(Ok(count)) if count <= 1 => return None,
+            Some(Ok(count)) => parts.push(format!("{prefix}COUNT={}", count - 1)),
+            _ => parts.push(part.to_owned()),
+        }
+    }
+    Some(parts.join(";"))
 }
 
 /// Rewrites the date-only values Google uses into the date-time forms the parser needs.
@@ -251,7 +470,8 @@ mod tests {
 
     fn starts(events: &[Event]) -> Vec<EventTime> {
         let (from, to) = week();
-        let mut starts: Vec<_> = expand(events.iter().map(|e| ((), e)), from, to)
+        let mut starts: Vec<_> = Series::new(events.iter().map(|e| ((), e)))
+            .expand(from, to, |()| true)
             .into_iter()
             .map(|i| i.start)
             .collect();
@@ -276,7 +496,9 @@ mod tests {
             ),
         ];
         let (from, to) = week();
-        let ids: Vec<_> = expand(events.iter().map(|e| ((), e)), from, to)
+        let series = Series::new(events.iter().map(|e| ((), e)));
+        let ids: Vec<_> = series
+            .expand(from, to, |()| true)
             .into_iter()
             .map(|i| i.event.id.as_str())
             .collect();
@@ -344,13 +566,48 @@ mod tests {
             "originalStartTime": {"dateTime": "2026-11-16T10:00:00Z"}
         }));
         let (from, to) = week();
-        let found = expand(
-            [("a", &master), ("b", &master), ("b", &cancelled)],
-            from,
-            to,
-        );
+        let series = Series::new([("a", &master), ("b", &master), ("b", &cancelled)]);
+        let found = series.expand(from, to, |_| true);
         let count = |key| found.iter().filter(|i| i.key == key).count();
         assert_eq!((count("a"), count("b")), (2, 1));
+    }
+
+    #[test]
+    fn asking_again_in_any_order_gives_the_same_answers() {
+        // An endless and an ending series; the remembered dates must serve ranges far
+        // ahead of, and then again before, the ones asked for earlier.
+        let events = [
+            event(json!({
+                "id": "endless",
+                "start": {"dateTime": "2020-01-06T10:00:00Z"},
+                "end": {"dateTime": "2020-01-06T11:00:00Z"},
+                "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO,TH"]
+            })),
+            event(json!({
+                "id": "ending",
+                "start": {"date": "2026-01-01"}, "end": {"date": "2026-01-02"},
+                "recurrence": ["RRULE:FREQ=DAILY;UNTIL=20290101"]
+            })),
+        ];
+        let weeks = [
+            "2026-11-16",
+            "2029-06-04",
+            "2021-03-01",
+            "2026-11-16",
+            "2028-12-25",
+        ];
+        let series = Series::new(events.iter().map(|e| ((), e)));
+        for monday in weeks {
+            let (from, to) = (
+                day_start_utc(date(monday)),
+                day_start_utc(date(monday) + Duration::days(7)),
+            );
+            let fresh = Series::new(events.iter().map(|e| ((), e)));
+            let expected = fresh.expand(from, to, |()| true);
+            assert_eq!(series.expand(from, to, |()| true), expected, "{monday}");
+            let endless = expected.iter().filter(|i| i.event.id == "endless").count();
+            assert_eq!(endless, 2, "{monday}");
+        }
     }
 
     #[test]
@@ -414,6 +671,114 @@ mod tests {
             "recurrence": ["RRULE:FREQ=YEARLY"]
         }));
         assert_eq!(starts(&[master]), [EventTime::AllDay(date("2026-11-20"))]);
+    }
+
+    #[test]
+    fn series_that_began_in_the_repeated_hour_of_a_clock_change_still_repeats() {
+        // 02:30 happens twice in Prague on 25 October 2026; this is the first (UTC+2).
+        let master = event(json!({
+            "id": "m",
+            "start": {"dateTime": "2026-10-25T02:30:00+02:00", "timeZone": "Europe/Prague"},
+            "end": {"dateTime": "2026-10-25T03:00:00+02:00", "timeZone": "Europe/Prague"},
+            "recurrence": ["RRULE:FREQ=WEEKLY"]
+        }));
+        assert_eq!(
+            starts(&[master]),
+            [EventTime::Timed(instant("2026-11-22T01:30:00Z"))]
+        );
+    }
+
+    #[test]
+    fn count_includes_a_start_in_either_repeated_hour_of_a_clock_change() {
+        // 02:30 happens twice in Prague on 25 October 2026: at UTC+2, then at UTC+1.
+        for (offset, first, second) in [
+            ("+02:00", "2026-10-25T00:30:00Z", "2026-11-01T01:30:00Z"),
+            ("+01:00", "2026-10-25T01:30:00Z", "2026-11-01T01:30:00Z"),
+        ] {
+            let master = event(json!({
+                "id": "m",
+                "start": {"dateTime": format!("2026-10-25T02:30:00{offset}"),
+                          "timeZone": "Europe/Prague"},
+                "end": {"dateTime": format!("2026-10-25T03:00:00{offset}"),
+                        "timeZone": "Europe/Prague"},
+                "recurrence": ["RRULE:FREQ=WEEKLY;COUNT=2"]
+            }));
+            let series = Series::new([((), &master)]);
+            let found: Vec<_> = series
+                .expand(
+                    day_start_utc(date("2026-10-19")),
+                    day_start_utc(date("2026-12-01")),
+                    |()| true,
+                )
+                .into_iter()
+                .map(|i| i.start)
+                .collect();
+            assert_eq!(
+                found,
+                [
+                    EventTime::Timed(instant(first)),
+                    EventTime::Timed(instant(second))
+                ],
+                "{offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn exrule_removes_the_occurrences_it_matches() {
+        let master = event(json!({
+            "id": "m",
+            "start": {"dateTime": "2026-11-02T10:00:00Z", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-11-02T11:00:00Z", "timeZone": "UTC"},
+            "recurrence": ["RRULE:FREQ=DAILY", "EXRULE:FREQ=WEEKLY;BYDAY=SA,SU"]
+        }));
+        assert_eq!(starts(&[master]).len(), 5);
+    }
+
+    #[test]
+    fn series_made_only_of_extra_dates_keeps_its_first_occurrence() {
+        let timed = event(json!({
+            "id": "t",
+            "start": {"dateTime": "2026-11-16T10:00:00Z", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-11-16T11:00:00Z", "timeZone": "UTC"},
+            "recurrence": ["RDATE:20261118T100000Z"]
+        }));
+        assert_eq!(
+            starts(&[timed]),
+            [
+                EventTime::Timed(instant("2026-11-16T10:00:00Z")),
+                EventTime::Timed(instant("2026-11-18T10:00:00Z")),
+            ]
+        );
+        let all_day = event(json!({
+            "id": "a",
+            "start": {"date": "2026-11-17"}, "end": {"date": "2026-11-18"},
+            "recurrence": ["RDATE;VALUE=DATE:20261119"]
+        }));
+        assert_eq!(
+            starts(&[all_day]),
+            [
+                EventTime::AllDay(date("2026-11-17")),
+                EventTime::AllDay(date("2026-11-19")),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_excluded_first_occurrence_stays_excluded() {
+        let master = event(json!({
+            "id": "m",
+            "start": {"dateTime": "2026-11-16T10:00:00Z", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-11-16T11:00:00Z", "timeZone": "UTC"},
+            "recurrence": ["RRULE:FREQ=DAILY;COUNT=3", "EXDATE:20261116T100000Z"]
+        }));
+        assert_eq!(
+            starts(&[master]),
+            [
+                EventTime::Timed(instant("2026-11-17T10:00:00Z")),
+                EventTime::Timed(instant("2026-11-18T10:00:00Z")),
+            ]
+        );
     }
 
     #[test]

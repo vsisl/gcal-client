@@ -116,6 +116,9 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
         // hold up a sync.
         let worker = worker.clone();
         tokio::task::spawn_local(async move {
+            // A sync tells the window itself, and only when it changed something: every
+            // reload closes an open details card and forgets the series' occurrences.
+            let reload = !matches!(command, Command::SyncAll);
             let result = match command {
                 Command::AddAccount => worker.add_account().await,
                 Command::SyncAll => worker.sync_all().await,
@@ -127,7 +130,9 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
                 worker.activity.borrow_mut().error = Some(format!("{error:#}"));
             }
             worker.publish();
-            worker.data_changed();
+            if reload {
+                worker.data_changed();
+            }
         });
     }
 }
@@ -217,10 +222,14 @@ impl Worker {
             .client(config, refresh_token.clone())
             .with_access_token(tokens.access_token, tokens.expires_at);
         let email = client.account_email().await?;
-        vault.save(&email, &refresh_token).await?;
 
         let _syncing = self.start(|activity| &mut activity.syncing);
+        // The sign-in is saved under the same lock as the account row. Saved before it, a
+        // removal of this very account that was waiting on a running sync would delete the
+        // fresh sign-in and leave an account that can never sync again. The lock is handed
+        // out in order, so that removal now runs first and this account is added after it.
         let _cache = self.cache.lock().await;
+        vault.save(&email, &refresh_token).await?;
         let mut store = open_store()?;
         let account = store.add_account(&email)?;
         self.data_changed();
@@ -272,7 +281,16 @@ impl Worker {
             let client = self.client(config.clone(), refresh_token);
             let result = gcal_sync::sync_account(&client, &mut store, account.id).await;
             problems.extend(sync_problem(&account.email, &result));
-            self.data_changed();
+            // Redrawing closes an open details card and costs time, so the window is only
+            // told when there is something new to show. A failed run may have saved part
+            // of what it fetched.
+            let unchanged = matches!(
+                &result,
+                Ok(report) if !report.changed
+            );
+            if !unchanged {
+                self.data_changed();
+            }
         }
         if !problems.is_empty() {
             bail!("{}", problems.join("; "));
@@ -290,6 +308,8 @@ impl Worker {
         };
         Vault::open().await?.delete(email).await?;
         store.remove_account(account.id)?;
+        // The account is gone either way; a file left larger than needed is no failure.
+        let _ = store.compact();
         Ok(())
     }
 }
