@@ -116,6 +116,9 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
         // hold up a sync.
         let worker = worker.clone();
         tokio::task::spawn_local(async move {
+            // A sync tells the window itself, and only when it changed something: every
+            // reload closes an open details card and forgets the series' occurrences.
+            let reload = !matches!(command, Command::SyncAll);
             let result = match command {
                 Command::AddAccount => worker.add_account().await,
                 Command::SyncAll => worker.sync_all().await,
@@ -127,7 +130,9 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
                 worker.activity.borrow_mut().error = Some(format!("{error:#}"));
             }
             worker.publish();
-            worker.data_changed();
+            if reload {
+                worker.data_changed();
+            }
         });
     }
 }
@@ -281,7 +286,7 @@ impl Worker {
             // of what it fetched.
             let unchanged = matches!(
                 &result,
-                Ok(report) if report.calendars_changed == 0 && report.events_changed == 0
+                Ok(report) if !report.changed
             );
             if !unchanged {
                 self.data_changed();
