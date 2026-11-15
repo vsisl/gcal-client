@@ -148,9 +148,8 @@ pub fn layout_month(
         };
         loop {
             let mut changed = false;
-            for segment in 0..segments.len() {
+            for (segment, &(_, first, last)) in segments.iter().enumerate() {
                 if hidden(&limit, segment) {
-                    let (_, first, last) = segments[segment];
                     for day in &mut limit[first..=last] {
                         if *day == capacity {
                             *day = capacity - 1;
