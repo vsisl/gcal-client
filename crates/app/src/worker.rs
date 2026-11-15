@@ -44,14 +44,11 @@ pub enum Command {
         deletion: Deletion,
         notify: bool,
     },
-    /// Changes fields of an event as the user asked in the window (moving it, say),
-    /// only if it still is the version the window showed.
-    ChangeEvent {
+    /// Changes an event, or part of a series, as the user asked in the window.
+    EditEvent {
         account: AccountId,
         calendar_id: String,
-        event_id: String,
-        etag: Option<String>,
-        changes: Value,
+        edit: Edit,
     },
     /// Changes fields of an event to take an earlier change back.
     PatchEvent {
@@ -70,6 +67,34 @@ pub enum Command {
     RestoreEvent {
         account: AccountId,
         calendar_id: String,
+        resource: Value,
+    },
+}
+
+/// What exactly a change applies to.
+#[derive(Debug, PartialEq)]
+pub enum Edit {
+    /// The event itself: an ordinary event, or a series with all its occurrences. With
+    /// an `etag`, only if the event still is the version the window showed.
+    Event {
+        event_id: String,
+        etag: Option<String>,
+        changes: Value,
+    },
+    /// One occurrence of a series, told by when it would start unchanged.
+    Occurrence {
+        series_id: String,
+        original_start: EventTime,
+        /// Its own identifier, when the cache has it (a changed occurrence).
+        known_id: Option<String>,
+        changes: Value,
+    },
+    /// An occurrence and all later ones: the series ends before it (`recurrence` is
+    /// its shortened rule) and `resource` becomes a new series from there on.
+    Following {
+        series_id: String,
+        etag: Option<String>,
+        recurrence: Vec<String>,
         resource: Value,
     },
 }
@@ -192,7 +217,7 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
             // the status line, where it is easily missed.
             let failure = match command {
                 Command::DeleteEvent { .. } => Some("The event was not deleted."),
-                Command::ChangeEvent { .. } => Some("The event was not changed."),
+                Command::EditEvent { .. } => Some("The event was not changed."),
                 Command::PatchEvent { .. } => Some("The change could not be taken back."),
                 Command::CreateEvent { .. } => Some("The event was not saved."),
                 Command::RestoreEvent { .. } => Some("The event could not be brought back."),
@@ -222,22 +247,23 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
                         .upgrade_in_event_loop(move |ui| ui.invoke_delete_finished(ok, id.into()));
                     deleted.map(|_| ())
                 }
-                Command::ChangeEvent {
+                Command::EditEvent {
                     account,
                     calendar_id,
-                    event_id,
-                    etag,
-                    changes,
+                    edit,
                 } => {
-                    let changed = worker
-                        .patch_event(account, &calendar_id, &event_id, changes, etag.as_deref())
-                        .await;
-                    // The window drew the change already and takes it back on failure.
-                    let ok = changed.is_ok();
+                    let changed = worker.edit_event(account, &calendar_id, edit).await;
+                    // The window may have drawn the change already and takes it back on
+                    // failure; to undo a change to one occurrence it needs to know
+                    // which event that is.
+                    let (ok, id) = match &changed {
+                        Ok(id) => (true, id.clone()),
+                        Err(_) => (false, String::new()),
+                    };
                     let _ = worker
                         .ui
-                        .upgrade_in_event_loop(move |ui| ui.invoke_change_finished(ok));
-                    changed
+                        .upgrade_in_event_loop(move |ui| ui.invoke_change_finished(ok, id.into()));
+                    changed.map(|_| ())
                 }
                 Command::PatchEvent {
                     account,
@@ -569,6 +595,65 @@ impl Worker {
                 );
             }
             Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Applies a change and returns the identifier of the occurrence it was made to, if
+    /// it was a single one of a series (empty otherwise).
+    async fn edit_event(
+        &self,
+        account: AccountId,
+        calendar_id: &str,
+        edit: Edit,
+    ) -> Result<String> {
+        match edit {
+            Edit::Event {
+                event_id,
+                etag,
+                changes,
+            } => {
+                self.patch_event(account, calendar_id, &event_id, changes, etag.as_deref())
+                    .await?;
+                Ok(String::new())
+            }
+            Edit::Occurrence {
+                series_id,
+                original_start,
+                known_id,
+                changes,
+            } => {
+                let id = match known_id {
+                    Some(id) => id,
+                    None => {
+                        let store = open_store()?;
+                        let client = self.account_client(&store, account).await?;
+                        occurrence_id(&client, calendar_id, &series_id, original_start).await?
+                    }
+                };
+                self.patch_event(account, calendar_id, &id, changes, None)
+                    .await?;
+                Ok(id)
+            }
+            Edit::Following {
+                series_id,
+                etag,
+                recurrence,
+                resource,
+            } => {
+                // First the old series ends; only then does the new one begin, so that
+                // a refusal leaves nothing doubled.
+                self.patch_event(
+                    account,
+                    calendar_id,
+                    &series_id,
+                    serde_json::json!({ "recurrence": recurrence }),
+                    etag.as_deref(),
+                )
+                .await?;
+                self.insert_event(account, calendar_id, restorable(resource))
+                    .await?;
+                Ok(String::new())
+            }
         }
     }
 

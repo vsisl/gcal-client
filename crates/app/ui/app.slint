@@ -323,7 +323,26 @@ export component AppWindow inherits Window {
     // many minutes. The worker answers with change-finished.
     callback event-moved(int, int, int);
     callback event-resized(int, int);
-    callback change-finished(bool);
+    callback change-finished(bool, string);
+    // A repeating event was dragged: the question card asks how much of the series is
+    // meant and answers with edit-scope-chosen (0 this, 1 this and following, 2 all).
+    property <bool> ask-edit;
+    callback edit-scope-chosen(int);
+    public function ask-edit-scope() {
+        root.detail-visible = false;
+        root.delete-scope = 0;
+        root.ask-edit = true;
+        root.delete-ask-visible = true;
+    }
+
+    function confirm-ask() {
+        if (root.ask-edit) {
+            root.delete-ask-visible = false;
+            root.edit-scope-chosen(root.delete-scope);
+        } else {
+            root.delete-event(root.detail-instance, root.delete-scope, root.delete-notify);
+        }
+    }
     // The questions asked before deleting a repeating event or one with guests.
     in-out property <bool> delete-ask-visible;
     property <int> delete-scope;
@@ -334,6 +353,7 @@ export component AppWindow inherits Window {
         if (root.detail.repeating || root.detail.notify-guests) {
             root.delete-scope = 0;
             root.delete-notify = root.detail.notify-guests;
+            root.ask-edit = false;
             root.delete-ask-visible = true;
         } else {
             root.delete-event(root.detail-instance, 0, false);
@@ -418,10 +438,10 @@ export component AppWindow inherits Window {
                 if (event.text == Key.Escape) {
                     root.delete-ask-visible = false;
                 } else if (event.text == Key.Return) {
-                    root.delete-event(root.detail-instance, root.delete-scope, root.delete-notify);
-                } else if (event.text == Key.DownArrow && root.detail.repeating) {
+                    root.confirm-ask();
+                } else if (event.text == Key.DownArrow && (root.ask-edit || root.detail.repeating)) {
                     root.delete-scope = Math.min(2, root.delete-scope + 1);
-                } else if (event.text == Key.UpArrow && root.detail.repeating) {
+                } else if (event.text == Key.UpArrow && (root.ask-edit || root.detail.repeating)) {
                     root.delete-scope = Math.max(0, root.delete-scope - 1);
                 }
                 return accept;
@@ -1560,7 +1580,7 @@ export component AppWindow inherits Window {
                 spacing: 6px;
 
                 delete-title := Text {
-                    text: root.detail.repeating ? @tr("Delete repeating event") : @tr("Delete event");
+                    text: root.ask-edit ? @tr("Edit repeating event") : root.detail.repeating ? @tr("Delete repeating event") : @tr("Delete event");
                     font-size: 18px;
                     color: Theme.text;
                 }
@@ -1569,7 +1589,7 @@ export component AppWindow inherits Window {
                     height: 8px;
                 }
 
-                if root.detail.repeating: VerticalLayout {
+                if root.ask-edit || root.detail.repeating: VerticalLayout {
                     for label[i] in [@tr("This event"), @tr("This and following events"), @tr("All events")]: RadioRow {
                         text: label;
                         selected: root.delete-scope == i;
@@ -1578,7 +1598,7 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                if root.detail.notify-guests: Rectangle {
+                if !root.ask-edit && root.detail.notify-guests: Rectangle {
                     height: 36px;
                     border-radius: 4px;
                     background: notify-touch.has-hover ? Theme.hover : transparent;
@@ -1629,11 +1649,11 @@ export component AppWindow inherits Window {
                     }
 
                     TextButton {
-                        text: @tr("Delete");
+                        text: root.ask-edit ? @tr("OK") : @tr("Delete");
                         height: 32px;
-                        text-color: Theme.danger;
+                        text-color: root.ask-edit ? Theme.accent : Theme.danger;
                         clicked => {
-                            root.delete-event(root.detail-instance, root.delete-scope, root.delete-notify);
+                            root.confirm-ask();
                         }
                     }
                 }

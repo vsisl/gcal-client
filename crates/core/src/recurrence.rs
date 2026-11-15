@@ -218,6 +218,93 @@ pub fn end_series_before(recurrence: &[String], first_removed: EventTime) -> Vec
         .collect()
 }
 
+/// Rewrites one part (`NAME=value`) of every rule among recurrence lines; `change`
+/// returns the new value, or `None` to drop the part.
+fn map_rule_part(
+    recurrence: &[String],
+    name: &str,
+    change: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    recurrence
+        .iter()
+        .map(|line| {
+            let Some(rule) = line.strip_prefix("RRULE:") else {
+                return line.clone();
+            };
+            let parts: Vec<String> = rule
+                .split(';')
+                .filter(|part| !part.is_empty())
+                .filter_map(|part| match part.split_once('=') {
+                    Some((key, value)) if key.eq_ignore_ascii_case(name) => {
+                        change(value).map(|value| format!("{key}={value}"))
+                    }
+                    _ => Some(part.to_owned()),
+                })
+                .collect();
+            format!("RRULE:{}", parts.join(";"))
+        })
+        .collect()
+}
+
+/// The rules of a series whose first `earlier` occurrences now belong to another series
+/// (it was split at "this and following"): a `COUNT` goes down by that many, at least
+/// to one. Rules ending by date or never are unchanged.
+pub fn remaining_series(recurrence: &[String], earlier: u32) -> Vec<String> {
+    map_rule_part(recurrence, "COUNT", |count| {
+        let count: u32 = count.parse().ok()?;
+        Some(count.saturating_sub(earlier).max(1).to_string())
+    })
+}
+
+/// The rules of a series moved by whole days: weekdays named in `BYDAY` move along, so
+/// that a series "every Monday" dragged to Wednesday repeats on Wednesdays.
+pub fn shift_weekdays(recurrence: &[String], days: i64) -> Vec<String> {
+    const NAMES: [&str; 7] = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"];
+    if days.rem_euclid(7) == 0 {
+        return recurrence.to_vec();
+    }
+    map_rule_part(recurrence, "BYDAY", |list| {
+        let moved: Vec<String> = list
+            .split(',')
+            .map(|entry| {
+                // An entry may carry a number in front: "2MO" is the second Monday.
+                let split = entry.len().saturating_sub(2);
+                let (ordinal, name) = entry.split_at(split);
+                match NAMES.iter().position(|n| n.eq_ignore_ascii_case(name)) {
+                    Some(day) => {
+                        let moved = (day as i64 + days).rem_euclid(7) as usize;
+                        format!("{ordinal}{}", NAMES[moved])
+                    }
+                    None => entry.to_owned(),
+                }
+            })
+            .collect();
+        Some(moved.join(","))
+    })
+}
+
+/// How many occurrences of a series start before `before`, the changed ones included.
+pub fn occurrences_before(master: &Event, before: EventTime) -> u32 {
+    let (Some(start), Some(end)) = (master.start_time(), master.end_time()) else {
+        return 0;
+    };
+    let instant =
+        |time: EventTime| DateTime::from_timestamp(time.timestamp(), 0).unwrap_or_default();
+    let (from, to) = (instant(start), instant(before));
+    if to <= from {
+        return 0;
+    }
+    let length = instant(end) - from;
+    // An occurrence is listed when it overlaps the range; looking from one length
+    // earlier, and counting starts, makes zero-length events count too.
+    let series = Series::new([((), master.clone())]);
+    series
+        .expand(from - length - Duration::seconds(1), to, |_| true)
+        .iter()
+        .filter(|occurrence| instant(occurrence.start) < to)
+        .count() as u32
+}
+
 pub fn single_instance<K>(
     key: K,
     event: &Event,
@@ -854,6 +941,65 @@ mod tests {
                 EventTime::Timed(instant("2026-11-17T10:00:00Z")),
             ]
         );
+    }
+
+    #[test]
+    fn a_split_series_keeps_counting_and_a_moved_one_changes_weekday() {
+        let lines = |lines: &[&str]| lines.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            remaining_series(
+                &lines(&["RRULE:FREQ=DAILY;COUNT=10", "EXDATE:20261117T100000Z"]),
+                3
+            ),
+            lines(&["RRULE:FREQ=DAILY;COUNT=7", "EXDATE:20261117T100000Z"])
+        );
+        assert_eq!(
+            remaining_series(&lines(&["RRULE:FREQ=DAILY;COUNT=2"]), 5),
+            lines(&["RRULE:FREQ=DAILY;COUNT=1"])
+        );
+        assert_eq!(
+            remaining_series(&lines(&["RRULE:FREQ=DAILY;UNTIL=20270101"]), 3),
+            lines(&["RRULE:FREQ=DAILY;UNTIL=20270101"])
+        );
+
+        assert_eq!(
+            shift_weekdays(&lines(&["RRULE:FREQ=WEEKLY;BYDAY=MO,FR"]), 2),
+            lines(&["RRULE:FREQ=WEEKLY;BYDAY=WE,SU"])
+        );
+        assert_eq!(
+            shift_weekdays(&lines(&["RRULE:FREQ=MONTHLY;BYDAY=2MO,-1SU"]), -1),
+            lines(&["RRULE:FREQ=MONTHLY;BYDAY=2SU,-1SA"])
+        );
+        assert_eq!(
+            shift_weekdays(&lines(&["RRULE:FREQ=WEEKLY;BYDAY=MO"]), 7),
+            lines(&["RRULE:FREQ=WEEKLY;BYDAY=MO"])
+        );
+        assert_eq!(
+            shift_weekdays(&lines(&["RRULE:FREQ=DAILY"]), 1),
+            lines(&["RRULE:FREQ=DAILY"])
+        );
+    }
+
+    #[test]
+    fn occurrences_before_a_date_are_counted() {
+        let master = event(json!({
+            "id": "m",
+            "start": {"dateTime": "2026-11-16T10:00:00Z", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-11-16T11:00:00Z", "timeZone": "UTC"},
+            "recurrence": ["RRULE:FREQ=DAILY;COUNT=10"]
+        }));
+        let before = |text: &str| occurrences_before(&master, EventTime::Timed(instant(text)));
+        assert_eq!(before("2026-11-16T10:00:00Z"), 0);
+        assert_eq!(before("2026-11-17T10:00:00Z"), 1);
+        assert_eq!(before("2026-11-19T10:00:00Z"), 3);
+
+        let all_day = event(json!({
+            "id": "a",
+            "start": {"date": "2026-11-16"}, "end": {"date": "2026-11-17"},
+            "recurrence": ["RRULE:FREQ=WEEKLY"]
+        }));
+        let day = |d: u32| EventTime::AllDay(NaiveDate::from_ymd_opt(2026, 11, d).unwrap());
+        assert_eq!(occurrences_before(&all_day, day(30)), 2);
     }
 
     #[test]
