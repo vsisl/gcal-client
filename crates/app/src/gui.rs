@@ -21,6 +21,9 @@ use crate::worker::{self, Command};
 
 slint::include_modules!();
 
+/// How often changes are fetched from Google while the window is open. (Google can only
+/// push changes to a public web server, so a desktop app has to ask.)
+const SYNC_INTERVAL: StdDuration = StdDuration::from_secs(5 * 60);
 /// Hour at the top of the grid when the window opens, like the web interface.
 const FIRST_VISIBLE_HOUR: i32 = 7;
 const FALLBACK_COLOR: Color = Color::from_rgb_u8(0x03, 0x9b, 0xe5);
@@ -708,6 +711,14 @@ pub fn run() -> Result<()> {
             } else if let Some(ui) = view.ui.upgrade() {
                 view.update_now(&ui);
             }
+        }
+    });
+
+    let sync_timer = Timer::default();
+    sync_timer.start(TimerMode::Repeated, SYNC_INTERVAL, {
+        let commands = commands.clone();
+        move || {
+            let _ = commands.send(Command::SyncAll);
         }
     });
 

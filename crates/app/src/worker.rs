@@ -276,7 +276,16 @@ impl Worker {
             let client = self.client(config.clone(), refresh_token);
             let result = gcal_sync::sync_account(&client, &mut store, account.id).await;
             problems.extend(sync_problem(&account.email, &result));
-            self.data_changed();
+            // Redrawing closes an open details card and costs time, so the window is only
+            // told when there is something new to show. A failed run may have saved part
+            // of what it fetched.
+            let unchanged = matches!(
+                &result,
+                Ok(report) if report.calendars_changed == 0 && report.events_changed == 0
+            );
+            if !unchanged {
+                self.data_changed();
+            }
         }
         if !problems.is_empty() {
             bail!("{}", problems.join("; "));
