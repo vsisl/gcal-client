@@ -17,6 +17,15 @@ pub fn plain_text(html: &str) -> String {
             break;
         };
         let tag = rest[open + 1..open + close].trim().to_ascii_lowercase();
+        // "a < b and c > d" is text, not a tag: a tag starts with a letter, "/" or "!".
+        let is_tag = tag
+            .trim_start_matches('/')
+            .starts_with(|c: char| c.is_ascii_alphabetic() || c == '!');
+        if !is_tag {
+            out.push('<');
+            rest = &rest[open + 1..];
+            continue;
+        }
         let name = tag
             .trim_start_matches('/')
             .split(|c: char| c.is_whitespace() || c == '/')
@@ -53,6 +62,11 @@ mod tests {
             "Bring the slides\nRoom 2"
         );
         assert_eq!(plain_text("if a < b then"), "if a < b then");
+        assert_eq!(
+            plain_text("Discuss x < 5 and y > 10"),
+            "Discuss x < 5 and y > 10"
+        );
+        assert_eq!(plain_text("1 <2> 3 <b>4</b>"), "1 <2> 3 4");
     }
 
     #[test]

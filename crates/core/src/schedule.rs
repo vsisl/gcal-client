@@ -4,7 +4,7 @@
 //! all-day entries come before timed ones, and days without events are left out by the
 //! caller simply because they have no entries.
 
-use chrono::{Duration, NaiveDate};
+use chrono::{Duration, NaiveDate, NaiveTime};
 use chrono_tz::Tz;
 
 use crate::model::EventTime;
@@ -42,7 +42,7 @@ pub fn schedule(
     // (day, all-day entries first, time of day it starts at, index) orders the list.
     let mut keyed = Vec::new();
     for (index, &(start, end)) in spans.iter().enumerate() {
-        let (first, last, starts_at) = match (start, end) {
+        let (first, last, starts_at, ends_at_midnight) = match (start, end) {
             (EventTime::Timed(start), EventTime::Timed(end)) => {
                 let local = start.with_timezone(&zone);
                 // An event ending exactly at midnight does not touch the following day.
@@ -50,11 +50,15 @@ pub fn schedule(
                     .with_timezone(&zone)
                     .date_naive();
                 let first = local.date_naive();
-                (first, last.max(first), Some(local.time()))
+                let ends_at_midnight = end.with_timezone(&zone).time() == NaiveTime::MIN;
+                (first, last.max(first), Some(local.time()), ends_at_midnight)
             }
-            (EventTime::AllDay(first), EventTime::AllDay(past_last)) => {
-                (first, (past_last - Duration::days(1)).max(first), None)
-            }
+            (EventTime::AllDay(first), EventTime::AllDay(past_last)) => (
+                first,
+                (past_last - Duration::days(1)).max(first),
+                None,
+                false,
+            ),
             // Google never mixes the two kinds within one event.
             _ => continue,
         };
@@ -65,6 +69,8 @@ pub fn schedule(
                 None => DayPart::AllDay,
                 Some(_) if from == to => DayPart::Whole,
                 Some(_) if day == from => DayPart::Starts,
+                // Covered to its very end: "until 0:00" would name the next day's midnight.
+                Some(_) if day == to && ends_at_midnight => DayPart::AllDay,
                 Some(_) if day == to => DayPart::Ends,
                 Some(_) => DayPart::AllDay,
             };
@@ -145,6 +151,13 @@ mod tests {
                 (3, 0, DayPart::Ends),
             ]
         );
+    }
+
+    #[test]
+    fn a_last_day_covered_up_to_midnight_is_a_whole_day() {
+        // Monday 22:00 to the midnight that ends Tuesday, Prague time.
+        let entries = listed(&[timed("2026-11-16T21:00:00Z", "2026-11-17T23:00:00Z")]);
+        assert_eq!(entries, [(0, 0, DayPart::Starts), (1, 0, DayPart::AllDay)]);
     }
 
     #[test]
