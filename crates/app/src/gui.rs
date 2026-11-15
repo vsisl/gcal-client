@@ -9,7 +9,7 @@ use anyhow::Result;
 use chrono::{DateTime, Datelike, Duration, Months, NaiveDate, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use gcal_core::month::{MonthLayout, layout_month};
-use gcal_core::recurrence::{Series, single_instance};
+use gcal_core::recurrence::{Series, end_series_before, single_instance};
 use gcal_core::schedule::{DayPart, schedule};
 use gcal_core::text::plain_text;
 use gcal_core::week::{WeekLayout, layout_days, local_day_start};
@@ -18,7 +18,7 @@ use gcal_store::{Account, AccountId, Store, StoredCalendar};
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
 use crate::open_store;
-use crate::worker::{self, Command};
+use crate::worker::{self, Command, Deletion};
 use tokio::sync::mpsc::UnboundedSender;
 
 slint::include_modules!();
@@ -274,13 +274,119 @@ struct Target {
     calendar_id: String,
     event_id: String,
     etag: Option<String>,
+    /// Set when the instance is one occurrence of a series.
+    occurrence: Option<Occurrence>,
 }
 
-/// What undoing a deletion needs: the event as it was.
+/// Which occurrence of which series an instance on screen is.
+#[derive(Clone)]
+struct Occurrence {
+    series_id: String,
+    /// When it would start had it not been changed; this is what tells occurrences apart.
+    original_start: EventTime,
+    /// Whether it is a changed occurrence, stored as an event of its own.
+    changed: bool,
+}
+
+fn occurrence_of(event: &Event, start: EventTime) -> Option<Occurrence> {
+    if event.is_recurring_master() {
+        return Some(Occurrence {
+            series_id: event.id.clone(),
+            original_start: start,
+            changed: false,
+        });
+    }
+    Some(Occurrence {
+        series_id: event.recurring_event_id.clone()?,
+        original_start: event
+            .original_start_time
+            .as_ref()
+            .and_then(|original| original.time())
+            .unwrap_or(start),
+        changed: true,
+    })
+}
+
+/// How much of a series a deletion takes, as asked in the window.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Scope {
+    This,
+    Following,
+    All,
+}
+
+/// What to send to delete `target` and how to take that back; `series` is the cached
+/// resource of the series the target belongs to, if it belongs to one.
+fn plan_deletion(
+    target: &Target,
+    scope: Scope,
+    own: Option<serde_json::Value>,
+    series: Option<serde_json::Value>,
+) -> Option<(Deletion, UndoKind)> {
+    let Some(occurrence) = &target.occurrence else {
+        return Some((
+            Deletion::Event {
+                event_id: target.event_id.clone(),
+                etag: target.etag.clone(),
+            },
+            UndoKind::Recreate(own?),
+        ));
+    };
+    if scope == Scope::This {
+        return Some((
+            Deletion::Occurrence {
+                series_id: occurrence.series_id.clone(),
+                original_start: occurrence.original_start,
+                known_id: occurrence.changed.then(|| target.event_id.clone()),
+            },
+            UndoKind::Occurrence,
+        ));
+    }
+    let resource = series?;
+    let master: Event = serde_json::from_value(resource.clone()).ok()?;
+    // "This and following" from the first occurrence on is the whole series.
+    if scope == Scope::Following && master.start_time() != Some(occurrence.original_start) {
+        return Some((
+            Deletion::Following {
+                series_id: master.id.clone(),
+                recurrence: end_series_before(&master.recurrence, occurrence.original_start),
+                etag: master.etag.clone(),
+            },
+            UndoKind::Patch {
+                event_id: master.id,
+                changes: serde_json::json!({ "recurrence": master.recurrence }),
+            },
+        ));
+    }
+    Some((
+        Deletion::Event {
+            event_id: master.id,
+            etag: master.etag,
+        },
+        UndoKind::Recreate(resource),
+    ))
+}
+
+/// What undoing a deletion needs.
 struct Undo {
     account: AccountId,
     calendar_id: String,
-    resource: serde_json::Value,
+    kind: UndoKind,
+}
+
+#[derive(Debug, PartialEq)]
+enum UndoKind {
+    /// Create the event again from the resource it had. For a series this brings back
+    /// the series, not the changes that had been made to single occurrences.
+    Recreate(serde_json::Value),
+    /// Give an event some of its fields back.
+    Patch {
+        event_id: String,
+        changes: serde_json::Value,
+    },
+    /// Bring back one occurrence of a series; which event that is, the worker tells
+    /// once it has deleted it.
+    Occurrence,
 }
 
 /// A new event being typed in.
@@ -327,18 +433,6 @@ fn event_resource(title: &str, start: EventTime, end: EventTime, zone: Tz) -> se
         "start": time(start),
         "end": time(end),
     })
-}
-
-/// Whether the app itself can delete this event. Not yet: single occurrences and whole
-/// series (which need the "this / following / all" question), events with guests (who
-/// would have to be told) and the special kinds of entry (birthdays, out of office, ...).
-/// Those are still opened in the browser.
-fn can_delete(event: &Event, calendar: &CalendarListEntry) -> bool {
-    calendar.is_writable()
-        && matches!(event.event_type.as_deref(), None | Some("default"))
-        && event.recurrence.is_empty()
-        && event.recurring_event_id.is_none()
-        && event.attendees.is_empty()
 }
 
 struct View {
@@ -693,7 +787,11 @@ impl View {
                     account: email.into(),
                     color: color(index),
                     link: web_link(event, email).into(),
-                    can_delete: can_delete(event, &calendar.entry),
+                    // Anything in a calendar this account may write to. Should Google
+                    // refuse a particular entry, it says why.
+                    can_delete: calendar.entry.is_writable(),
+                    repeating: event.is_recurring_master() || event.recurring_event_id.is_some(),
+                    notify_guests: event.has_guests_to_notify(),
                 }
             })
             .collect();
@@ -707,12 +805,14 @@ impl View {
                     calendar_id: calendar.entry.id.clone(),
                     event_id: instance.event.id.clone(),
                     etag: instance.event.etag.clone(),
+                    occurrence: occurrence_of(instance.event, instance.start),
                 }
             })
             .collect();
         self.targets.replace(targets);
-        // What it described may have moved or gone.
+        // What they described may have moved or gone.
         ui.set_detail_visible(false);
+        ui.set_delete_ask_visible(false);
         Ok(())
     }
 
@@ -805,45 +905,72 @@ impl View {
 
     /// Deletes the event behind an instance on screen. The copy kept for undoing is taken
     /// from the cache before anything is sent.
-    fn delete_event(&self, instance: usize) {
+    fn delete_event(&self, instance: usize, scope: Scope, notify: bool) {
         let Some(target) = self.targets.borrow().get(instance).cloned() else {
             return;
         };
-        let resource =
-            match self
-                .store
-                .event_json(target.account, &target.calendar_id, &target.event_id)
-            {
-                Ok(Some(resource)) => resource,
-                // Gone from the cache already: a sync has removed it meanwhile.
-                Ok(None) => return,
-                Err(error) => return self.show_error(&error.into()),
+        let cached = |id: &str| {
+            self.store
+                .event_json(target.account, &target.calendar_id, id)
+        };
+        let resources = cached(&target.event_id).and_then(|own| {
+            let series = match &target.occurrence {
+                Some(occurrence) => cached(&occurrence.series_id)?,
+                None => None,
             };
+            Ok((own, series))
+        });
+        let (own, series) = match resources {
+            Ok(resources) => resources,
+            Err(error) => return self.show_error(&error.into()),
+        };
+        // Nothing to send if it is gone from the cache: a sync has removed it meanwhile.
+        let Some((deletion, kind)) = plan_deletion(&target, scope, own, series) else {
+            return;
+        };
         self.undo.replace(Some(Undo {
             account: target.account,
             calendar_id: target.calendar_id.clone(),
-            resource,
+            kind,
         }));
         if let Some(ui) = self.ui.upgrade() {
             ui.set_detail_visible(false);
+            ui.set_delete_ask_visible(false);
             ui.set_toast(SharedString::new());
         }
         let _ = self.commands.send(Command::DeleteEvent {
             account: target.account,
             calendar_id: target.calendar_id,
-            event_id: target.event_id,
-            etag: target.etag,
+            deletion,
+            notify,
         });
     }
 
-    /// The worker has answered a deletion: offer to undo it, for a while.
-    fn delete_finished(&self, deleted: bool) {
+    /// The worker has answered a deletion: offer to undo it, for a while. `occurrence`
+    /// is the event that was removed, if it was one occurrence of a series.
+    fn delete_finished(&self, deleted: bool, occurrence: &str) {
         if !deleted {
-            // The status line says why; there is nothing to undo.
+            // A dialog says why; there is nothing to undo.
             self.undo.take();
             return;
         }
-        self.show_toast("Event deleted", true);
+        let mut undo = self.undo.borrow_mut();
+        if let Some(Undo { kind, .. }) = undo.as_mut()
+            && *kind == UndoKind::Occurrence
+        {
+            if occurrence.is_empty() {
+                undo.take();
+            } else {
+                // Google keeps a deleted occurrence as a cancelled event.
+                *kind = UndoKind::Patch {
+                    event_id: occurrence.to_owned(),
+                    changes: serde_json::json!({ "status": "confirmed" }),
+                };
+            }
+        }
+        let can_undo = undo.is_some();
+        drop(undo);
+        self.show_toast("Event deleted", can_undo);
     }
 
     /// Says what just happened, for a while; with "Undo" if it can be taken back.
@@ -964,13 +1091,29 @@ impl View {
         if let Some(ui) = self.ui.upgrade() {
             ui.set_toast(SharedString::new());
         }
-        if let Some(undo) = self.undo.take() {
-            let _ = self.commands.send(Command::RestoreEvent {
-                account: undo.account,
-                calendar_id: undo.calendar_id,
-                resource: undo.resource,
-            });
-        }
+        let Some(Undo {
+            account,
+            calendar_id,
+            kind,
+        }) = self.undo.take()
+        else {
+            return;
+        };
+        let _ = self.commands.send(match kind {
+            UndoKind::Recreate(resource) => Command::RestoreEvent {
+                account,
+                calendar_id,
+                resource,
+            },
+            UndoKind::Patch { event_id, changes } => Command::PatchEvent {
+                account,
+                calendar_id,
+                event_id,
+                changes,
+            },
+            // The worker has not said which occurrence it removed.
+            UndoKind::Occurrence => return,
+        });
     }
 
     /// Opens the day view on the day of a cell of the month grid.
@@ -1029,11 +1172,18 @@ pub fn run() -> Result<()> {
 
     ui.on_delete_event({
         let view = view.clone();
-        move |instance| view.delete_event(instance as usize)
+        move |instance, scope, notify| {
+            let scope = match scope {
+                1 => Scope::Following,
+                2 => Scope::All,
+                _ => Scope::This,
+            };
+            view.delete_event(instance as usize, scope, notify);
+        }
     });
     ui.on_delete_finished({
         let view = view.clone();
-        move |deleted| view.delete_finished(deleted)
+        move |deleted, occurrence| view.delete_finished(deleted, &occurrence)
     });
     ui.on_draft_requested({
         let view = view.clone();
@@ -1288,34 +1438,136 @@ mod tests {
     }
 
     #[test]
-    fn only_plain_events_in_writable_calendars_can_be_deleted_here() {
+    fn only_calendars_this_account_may_write_to_allow_deleting() {
         let calendar = |role: &str| -> CalendarListEntry {
             serde_json::from_value(serde_json::json!({"id": "c", "accessRole": role})).unwrap()
         };
-        let event = |extra: serde_json::Value| -> Event {
-            let mut value = serde_json::json!({"id": "e"});
-            value
-                .as_object_mut()
-                .unwrap()
-                .extend(extra.as_object().unwrap().clone());
-            serde_json::from_value(value).unwrap()
+        assert!(calendar("owner").is_writable());
+        assert!(calendar("writer").is_writable());
+        assert!(!calendar("reader").is_writable());
+        assert!(!calendar("freeBusyReader").is_writable());
+    }
+
+    #[test]
+    fn a_deletion_is_planned_with_its_way_back() {
+        use serde_json::json;
+        let instant = |text: &str| EventTime::Timed(text.parse::<DateTime<Utc>>().unwrap());
+        let target = |event_id: &str, occurrence: Option<Occurrence>| Target {
+            account: 1,
+            calendar_id: "c".into(),
+            event_id: event_id.into(),
+            etag: Some("\"own\"".into()),
+            occurrence,
         };
-        let plain = event(serde_json::json!({}));
-        assert!(can_delete(&plain, &calendar("owner")));
-        assert!(can_delete(&plain, &calendar("writer")));
-        assert!(!can_delete(&plain, &calendar("reader")));
-        assert!(!can_delete(&plain, &calendar("freeBusyReader")));
-        let owner = calendar("owner");
-        let series = event(serde_json::json!({"recurrence": ["RRULE:FREQ=DAILY"]}));
-        let occurrence = event(serde_json::json!({"recurringEventId": "m"}));
-        let with_guests = event(serde_json::json!({"attendees": [{"email": "a@example.com"}]}));
-        assert!(!can_delete(&series, &owner));
-        assert!(!can_delete(&occurrence, &owner));
-        assert!(!can_delete(&with_guests, &owner));
-        let birthday = event(serde_json::json!({"eventType": "birthday"}));
-        let ordinary = event(serde_json::json!({"eventType": "default"}));
-        assert!(!can_delete(&birthday, &owner));
-        assert!(can_delete(&ordinary, &owner));
+        let series = json!({
+            "id": "m", "etag": "\"series\"",
+            "start": {"dateTime": "2026-11-16T10:00:00Z"},
+            "end": {"dateTime": "2026-11-16T11:00:00Z"},
+            "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"]
+        });
+        let third = Occurrence {
+            series_id: "m".into(),
+            original_start: instant("2026-11-18T10:00:00Z"),
+            changed: false,
+        };
+
+        // An ordinary event: deleted as the version shown, recreated to undo.
+        let plain = json!({"id": "e", "summary": "Lunch"});
+        assert_eq!(
+            plan_deletion(&target("e", None), Scope::This, Some(plain.clone()), None),
+            Some((
+                Deletion::Event {
+                    event_id: "e".into(),
+                    etag: Some("\"own\"".into())
+                },
+                UndoKind::Recreate(plain),
+            ))
+        );
+        // Gone from the cache: nothing to do.
+        assert_eq!(
+            plan_deletion(&target("e", None), Scope::This, None, None),
+            None
+        );
+
+        // One occurrence: found by its original start, or by its own identifier when it
+        // is a changed one.
+        assert_eq!(
+            plan_deletion(
+                &target("m", Some(third.clone())),
+                Scope::This,
+                None,
+                Some(series.clone())
+            ),
+            Some((
+                Deletion::Occurrence {
+                    series_id: "m".into(),
+                    original_start: third.original_start,
+                    known_id: None,
+                },
+                UndoKind::Occurrence,
+            ))
+        );
+        let changed = Occurrence {
+            changed: true,
+            ..third.clone()
+        };
+        assert!(matches!(
+            plan_deletion(&target("m_x", Some(changed)), Scope::This, None, Some(series.clone())),
+            Some((Deletion::Occurrence { known_id: Some(id), .. }, _)) if id == "m_x"
+        ));
+
+        // This and following: the series ends before it, and gets its rule back to undo.
+        assert_eq!(
+            plan_deletion(
+                &target("m", Some(third.clone())),
+                Scope::Following,
+                None,
+                Some(series.clone())
+            ),
+            Some((
+                Deletion::Following {
+                    series_id: "m".into(),
+                    recurrence: vec!["RRULE:FREQ=DAILY;UNTIL=20261118T095959Z".into()],
+                    etag: Some("\"series\"".into()),
+                },
+                UndoKind::Patch {
+                    event_id: "m".into(),
+                    changes: json!({"recurrence": ["RRULE:FREQ=DAILY;COUNT=5"]}),
+                },
+            ))
+        );
+
+        // All, and "following" from the first occurrence: the series itself.
+        let whole = Some((
+            Deletion::Event {
+                event_id: "m".into(),
+                etag: Some("\"series\"".into()),
+            },
+            UndoKind::Recreate(series.clone()),
+        ));
+        assert_eq!(
+            plan_deletion(
+                &target("m", Some(third)),
+                Scope::All,
+                None,
+                Some(series.clone())
+            ),
+            whole
+        );
+        let first = Occurrence {
+            series_id: "m".into(),
+            original_start: instant("2026-11-16T10:00:00Z"),
+            changed: false,
+        };
+        assert_eq!(
+            plan_deletion(
+                &target("m", Some(first)),
+                Scope::Following,
+                None,
+                Some(series)
+            ),
+            whole
+        );
     }
 
     #[test]

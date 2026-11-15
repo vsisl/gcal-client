@@ -42,6 +42,10 @@ export struct EventDetail {
     link: string,
     // Whether the app can delete it itself.
     can-delete: bool,
+    // One occurrence of a series: deleting asks how much of the series.
+    repeating: bool,
+    // The account invited guests, who can be told about a deletion.
+    notify-guests: bool,
 }
 
 // A day of the month view.
@@ -246,9 +250,26 @@ export component AppWindow inherits Window {
 
     // Which instance the details card is about.
     property <int> detail-instance;
-    // Deletes the event behind an instance; the worker answers with delete-finished.
-    callback delete-event(int);
-    callback delete-finished(bool);
+    // Deletes the event behind an instance: how much of a series (0 this occurrence,
+    // 1 this and following, 2 all) and whether to tell the guests. The worker answers
+    // with delete-finished, naming the occurrence it removed if it was a single one.
+    callback delete-event(int, int, bool);
+    callback delete-finished(bool, string);
+    // The questions asked before deleting a repeating event or one with guests.
+    in-out property <bool> delete-ask-visible;
+    property <int> delete-scope;
+    property <bool> delete-notify;
+
+    // Deletes the event of the open details card, asking first where there is a choice.
+    function ask-delete() {
+        if (root.detail.repeating || root.detail.notify-guests) {
+            root.delete-scope = 0;
+            root.delete-notify = root.detail.notify-guests;
+            root.delete-ask-visible = true;
+        } else {
+            root.delete-event(root.detail-instance, 0, false);
+        }
+    }
     // A short message about the last change, with "Undo"; empty when there is none.
     in property <string> toast;
     in property <bool> toast-undo;
@@ -323,6 +344,19 @@ export component AppWindow inherits Window {
                 }
                 return accept;
             }
+            if (root.delete-ask-visible) {
+                // Only its own keys while the question is open.
+                if (event.text == Key.Escape) {
+                    root.delete-ask-visible = false;
+                } else if (event.text == Key.Return) {
+                    root.delete-event(root.detail-instance, root.delete-scope, root.delete-notify);
+                } else if (event.text == Key.DownArrow && root.detail.repeating) {
+                    root.delete-scope = Math.min(2, root.delete-scope + 1);
+                } else if (event.text == Key.UpArrow && root.detail.repeating) {
+                    root.delete-scope = Math.max(0, root.delete-scope - 1);
+                }
+                return accept;
+            }
             if (event.text == Key.Escape && root.help-visible) {
                 root.help-visible = false;
                 return accept;
@@ -332,7 +366,7 @@ export component AppWindow inherits Window {
                 return accept;
             }
             if ((event.text == Key.Delete || event.text == Key.Backspace) && root.detail-visible && root.detail.can-delete) {
-                root.delete-event(root.detail-instance);
+                root.ask-delete();
                 return accept;
             }
             if (event.text == "c") {
@@ -1219,7 +1253,7 @@ export component AppWindow inherits Window {
                         height: 32px;
                         text-color: Theme.danger;
                         clicked => {
-                            root.delete-event(root.detail-instance);
+                            root.ask-delete();
                         }
                     }
                     if root.detail.link != "": TextButton {
@@ -1291,6 +1325,156 @@ export component AppWindow inherits Window {
                     font-size: 12px;
                     color: Theme.text-dim;
                     wrap: word-wrap;
+                }
+            }
+        }
+
+        // Before deleting a repeating event or one with guests: how much, and whether
+        // the guests are told.
+        if root.delete-ask-visible: Rectangle {
+            background: #00000066;
+            TouchArea {
+                clicked => {
+                    root.delete-ask-visible = false;
+                }
+            }
+        }
+        if root.delete-ask-visible: Rectangle {
+            width: Math.min(360px, root.width - 24px);
+            height: Math.min(delete-box.preferred-height, root.height - 24px);
+            background: Theme.card;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.line;
+            drop-shadow-blur: 24px;
+            drop-shadow-offset-y: 6px;
+            drop-shadow-color: #00000040;
+            clip: true;
+            accessible-role: groupbox;
+            accessible-label: delete-title.text;
+
+            TouchArea { }
+
+            delete-box := VerticalLayout {
+                padding: 24px;
+                padding-bottom: 12px;
+                spacing: 6px;
+
+                delete-title := Text {
+                    text: root.detail.repeating ? @tr("Delete repeating event") : @tr("Delete event");
+                    font-size: 18px;
+                    color: Theme.text;
+                }
+
+                Rectangle {
+                    height: 8px;
+                }
+
+                if root.detail.repeating: VerticalLayout {
+                    for label[i] in [@tr("This event"), @tr("This and following events"), @tr("All events")]: Rectangle {
+                        height: 36px;
+                        border-radius: 4px;
+                        background: scope-touch.has-hover ? Theme.hover : transparent;
+                        accessible-role: list-item;
+                        accessible-label: label;
+                        accessible-action-default => {
+                            root.delete-scope = i;
+                        }
+
+                        scope-touch := TouchArea {
+                            clicked => {
+                                root.delete-scope = i;
+                            }
+                        }
+
+                        // A radio button.
+                        Rectangle {
+                            x: 8px;
+                            y: (parent.height - self.height) / 2;
+                            width: 18px;
+                            height: 18px;
+                            border-radius: 9px;
+                            border-width: 2px;
+                            border-color: root.delete-scope == i ? Theme.accent : Theme.text-dim;
+
+                            if root.delete-scope == i: Rectangle {
+                                x: 4px;
+                                y: 4px;
+                                width: 10px;
+                                height: 10px;
+                                border-radius: 5px;
+                                background: Theme.accent;
+                            }
+                        }
+
+                        Text {
+                            x: 40px;
+                            height: parent.height;
+                            text: label;
+                            font-size: 14px;
+                            color: Theme.text;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+                if root.detail.notify-guests: Rectangle {
+                    height: 36px;
+                    border-radius: 4px;
+                    background: notify-touch.has-hover ? Theme.hover : transparent;
+                    accessible-role: checkbox;
+                    accessible-label: notify-label.text;
+                    accessible-checked: root.delete-notify;
+                    accessible-action-default => {
+                        root.delete-notify = !root.delete-notify;
+                    }
+
+                    notify-touch := TouchArea {
+                        clicked => {
+                            root.delete-notify = !root.delete-notify;
+                        }
+                    }
+
+                    Rectangle {
+                        x: 8px;
+                        y: (parent.height - self.height) / 2;
+                        width: 18px;
+                        height: 18px;
+                        border-radius: 3px;
+                        border-width: 2px;
+                        border-color: root.delete-notify ? Theme.accent : Theme.text-dim;
+                        background: root.delete-notify ? Theme.accent : transparent;
+                    }
+
+                    notify-label := Text {
+                        x: 40px;
+                        height: parent.height;
+                        text: @tr("Send cancellation e-mails to guests");
+                        font-size: 14px;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                    }
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 4px;
+                    padding-top: 8px;
+                    TextButton {
+                        text: @tr("Cancel");
+                        height: 32px;
+                        clicked => {
+                            root.delete-ask-visible = false;
+                        }
+                    }
+
+                    TextButton {
+                        text: @tr("Delete");
+                        height: 32px;
+                        text-color: Theme.danger;
+                        clicked => {
+                            root.delete-event(root.detail-instance, root.delete-scope, root.delete-notify);
+                        }
+                    }
                 }
             }
         }

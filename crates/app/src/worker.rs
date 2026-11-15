@@ -9,6 +9,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use gcal_core::{Event, EventTime};
 use gcal_google::{
     ApiError, ClientConfig, Endpoints, GoogleClient, HttpClient, SCOPE_CALENDAR, TokenSet,
 };
@@ -35,13 +36,20 @@ pub enum Command {
     AddAccount,
     SyncAll,
     RemoveAccount(String),
-    /// Deletes an event at Google and then from the cache. With an `etag`, only if the
-    /// event still is the version the window showed.
+    /// Deletes an event, or part of a series, at Google and then from the cache. With
+    /// `notify`, Google tells the guests.
     DeleteEvent {
         account: AccountId,
         calendar_id: String,
+        deletion: Deletion,
+        notify: bool,
+    },
+    /// Changes fields of an event; used to take back a deletion inside a series.
+    PatchEvent {
+        account: AccountId,
+        calendar_id: String,
         event_id: String,
-        etag: Option<String>,
+        changes: Value,
     },
     /// Creates an event from a resource the window put together.
     CreateEvent {
@@ -54,6 +62,30 @@ pub enum Command {
         account: AccountId,
         calendar_id: String,
         resource: Value,
+    },
+}
+
+/// What exactly a deletion removes.
+#[derive(Debug, PartialEq)]
+pub enum Deletion {
+    /// The event itself: an ordinary event, or a series with all its occurrences. With
+    /// an `etag`, only if the event still is the version the window showed.
+    Event {
+        event_id: String,
+        etag: Option<String>,
+    },
+    /// One occurrence of a series, told by when it would start unchanged.
+    Occurrence {
+        series_id: String,
+        original_start: EventTime,
+        /// Its own identifier, when the cache has it (a changed occurrence).
+        known_id: Option<String>,
+    },
+    /// An occurrence and all later ones: the series gets the shortened `recurrence`.
+    Following {
+        series_id: String,
+        recurrence: Vec<String>,
+        etag: Option<String>,
     },
 }
 
@@ -149,6 +181,7 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
             // the status line, where it is easily missed.
             let failure = match command {
                 Command::DeleteEvent { .. } => Some("The event was not deleted."),
+                Command::PatchEvent { .. } => Some("The event could not be brought back."),
                 Command::CreateEvent { .. } => Some("The event was not saved."),
                 Command::RestoreEvent { .. } => Some("The event could not be brought back."),
                 _ => None,
@@ -160,18 +193,32 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
                 Command::DeleteEvent {
                     account,
                     calendar_id,
-                    event_id,
-                    etag,
+                    deletion,
+                    notify,
                 } => {
                     let deleted = worker
-                        .delete_event(account, &calendar_id, &event_id, etag.as_deref())
+                        .delete_event(account, &calendar_id, deletion, notify)
                         .await;
-                    // The window offers to undo only what really happened.
-                    let ok = deleted.is_ok();
+                    // The window offers to undo only what really happened, and for a
+                    // single occurrence needs to know which event that was.
+                    let (ok, id) = match &deleted {
+                        Ok(id) => (true, id.clone()),
+                        Err(_) => (false, String::new()),
+                    };
                     let _ = worker
                         .ui
-                        .upgrade_in_event_loop(move |ui| ui.invoke_delete_finished(ok));
-                    deleted
+                        .upgrade_in_event_loop(move |ui| ui.invoke_delete_finished(ok, id.into()));
+                    deleted.map(|_| ())
+                }
+                Command::PatchEvent {
+                    account,
+                    calendar_id,
+                    event_id,
+                    changes,
+                } => {
+                    worker
+                        .patch_event(account, &calendar_id, &event_id, changes)
+                        .await
                 }
                 Command::CreateEvent {
                     account,
@@ -397,31 +444,103 @@ impl Worker {
         Ok(self.client(config, refresh_token))
     }
 
+    /// Deletes what `deletion` describes and returns the identifier of the occurrence
+    /// that was removed, if it was a single one of a series (empty otherwise).
     async fn delete_event(
         &self,
         account: AccountId,
         calendar_id: &str,
-        event_id: &str,
-        etag: Option<&str>,
-    ) -> Result<()> {
+        deletion: Deletion,
+        notify: bool,
+    ) -> Result<String> {
         self.clear_error();
-        let _saving = self.start(|activity| &mut activity.saving);
-        let store = open_store()?;
+        let saving = self.start(|activity| &mut activity.saving);
+        let mut store = open_store()?;
         let client = self.account_client(&store, account).await?;
-        match client.delete_event(calendar_id, event_id, etag).await {
-            // Already deleted elsewhere: what the user wanted has happened.
-            Ok(()) | Err(ApiError::Gone) => {}
+        let removed = match deletion {
+            Deletion::Event { event_id, etag } => {
+                let deleted = client
+                    .delete_event(calendar_id, &event_id, etag.as_deref(), notify)
+                    .await;
+                self.written(deleted).await?;
+                store.remove_event(account, calendar_id, &event_id)?;
+                return Ok(String::new());
+            }
+            Deletion::Occurrence {
+                series_id,
+                original_start,
+                known_id,
+            } => {
+                let id = match known_id {
+                    Some(id) => id,
+                    None => occurrence_id(&client, calendar_id, &series_id, original_start).await?,
+                };
+                let deleted = client.delete_event(calendar_id, &id, None, notify).await;
+                self.written(deleted).await?;
+                id
+            }
+            Deletion::Following {
+                series_id,
+                recurrence,
+                etag,
+            } => {
+                let shortened = client
+                    .patch_event(
+                        calendar_id,
+                        &series_id,
+                        &serde_json::json!({ "recurrence": recurrence }),
+                        etag.as_deref(),
+                        notify,
+                    )
+                    .await;
+                if let Some(series) = self.written(shortened).await? {
+                    store.apply_event(account, calendar_id, &series)?;
+                }
+                String::new()
+            }
+        };
+        // Google answers a change inside a series with other changes (the occurrence
+        // marked as cancelled, changed occurrences past the new end removed): fetch them.
+        drop(saving);
+        let _ = self.sync_all().await;
+        Ok(removed)
+    }
+
+    /// Sorts out Google's answer to a change. An event that is gone already is no
+    /// failure (`None`: there is nothing to save); one changed elsewhere is, and the
+    /// calendar is brought up to date so that the user sees what they would be changing.
+    async fn written<T>(&self, answer: Result<T, ApiError>) -> Result<Option<T>> {
+        match answer {
+            Ok(answer) => Ok(Some(answer)),
+            Err(ApiError::Gone) => Ok(None),
             Err(ApiError::Changed) => {
-                // Someone changed it since the window showed it. Nothing was deleted;
-                // fetch the new version so the user sees what they would be deleting.
                 let _ = self.sync_all().await;
                 bail!(
-                    "it was changed somewhere else in the meantime. The calendar now shows its current version; delete it again if you still want to"
+                    "it was changed somewhere else in the meantime. The calendar now shows its current version; try again if you still want to"
                 );
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => Err(error.into()),
         }
-        store.remove_event(account, calendar_id, event_id)?;
+    }
+
+    /// Changes fields of an event and saves what Google made of it.
+    async fn patch_event(
+        &self,
+        account: AccountId,
+        calendar_id: &str,
+        event_id: &str,
+        changes: Value,
+    ) -> Result<()> {
+        self.clear_error();
+        let saving = self.start(|activity| &mut activity.saving);
+        let mut store = open_store()?;
+        let client = self.account_client(&store, account).await?;
+        let changed = client
+            .patch_event(calendar_id, event_id, &changes, None, false)
+            .await?;
+        store.apply_event(account, calendar_id, &changed)?;
+        drop(saving);
+        let _ = self.sync_all().await;
         Ok(())
     }
 
@@ -455,6 +574,42 @@ impl Worker {
         let _ = store.compact();
         Ok(())
     }
+}
+
+/// Finds the identifier Google gives the occurrence of a series that would start at
+/// `original_start`.
+async fn occurrence_id(
+    client: &GoogleClient,
+    calendar_id: &str,
+    series_id: &str,
+    original_start: EventTime,
+) -> Result<String> {
+    // Only occurrences touching this window are listed; the right one is then told by
+    // its original start. An all-day occurrence has no instant of its own, so its
+    // window is generous.
+    let (from, to) = match original_start {
+        EventTime::Timed(start) => (start, start + chrono::Duration::seconds(1)),
+        EventTime::AllDay(day) => {
+            let midnight = day.and_time(chrono::NaiveTime::MIN).and_utc();
+            (
+                midnight - chrono::Duration::days(1),
+                midnight + chrono::Duration::days(2),
+            )
+        }
+    };
+    let instances = client.instances(calendar_id, series_id, from, to).await?;
+    instances
+        .into_iter()
+        .filter_map(|instance| serde_json::from_value::<Event>(instance).ok())
+        .find(|instance| {
+            instance
+                .original_start_time
+                .as_ref()
+                .and_then(|start| start.time())
+                == Some(original_start)
+        })
+        .map(|instance| instance.id)
+        .context("that occurrence no longer exists")
 }
 
 /// An error message as a sentence of its own: capitalised, with a full stop.

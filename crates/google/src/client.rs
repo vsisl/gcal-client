@@ -173,19 +173,21 @@ impl GoogleClient {
     /// Changes the given fields of an event and returns the event as Google stored it.
     ///
     /// With `etag`, the change is made only if the event still is the version the caller
-    /// has; otherwise the result is [`ApiError::Changed`] and nothing is modified.
+    /// has; otherwise the result is [`ApiError::Changed`] and nothing is modified. With
+    /// `notify`, Google e-mails the event's guests about the change.
     pub async fn patch_event(
         &self,
         calendar_id: &str,
         event_id: &str,
         changes: &Value,
         etag: Option<&str>,
+        notify: bool,
     ) -> Result<Value, ApiError> {
         let response = self
             .send(
                 Method::PATCH,
                 &["calendars", calendar_id, "events", event_id],
-                &[],
+                send_updates(notify),
                 Some(changes),
                 etag,
             )
@@ -195,23 +197,46 @@ impl GoogleClient {
     }
 
     /// Deletes an event. An event that is already gone is reported as [`ApiError::Gone`],
-    /// which a caller wanting it deleted can treat as success.
+    /// which a caller wanting it deleted can treat as success. With `notify`, Google
+    /// e-mails the event's guests that it was cancelled.
     pub async fn delete_event(
         &self,
         calendar_id: &str,
         event_id: &str,
         etag: Option<&str>,
+        notify: bool,
     ) -> Result<(), ApiError> {
         self.send(
             Method::DELETE,
             &["calendars", calendar_id, "events", event_id],
-            &[],
+            send_updates(notify),
             None,
             etag,
         )
         .await
         .map_err(gone_if_missing)?;
         Ok(())
+    }
+
+    /// The occurrences of a series between two instants, each as an event of its own
+    /// (with its own identifier, which is what deleting one occurrence needs).
+    pub async fn instances(
+        &self,
+        calendar_id: &str,
+        series_id: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<Value>, ApiError> {
+        let (from, to) = (from.to_rfc3339(), to.to_rfc3339());
+        let listing = self
+            .list(
+                &["calendars", calendar_id, "events", series_id, "instances"],
+                &[("timeMin", &from), ("timeMax", &to), ("maxResults", "250")],
+                None,
+            )
+            .await
+            .map_err(gone_if_missing)?;
+        Ok(listing.items)
     }
 
     async fn get<T: serde::de::DeserializeOwned>(
@@ -301,6 +326,16 @@ impl GoogleClient {
             expires_at: fresh.expires_at,
         });
         Ok(token)
+    }
+}
+
+/// The query that decides whether guests are e-mailed about a change. Google's default
+/// is not to.
+fn send_updates(notify: bool) -> &'static [(&'static str, &'static str)] {
+    if notify {
+        &[("sendUpdates", "all")]
+    } else {
+        &[]
     }
 }
 
@@ -442,14 +477,58 @@ mod tests {
                 "e1",
                 &json!({"summary": "Late lunch"}),
                 created["etag"].as_str(),
+                false,
             )
             .await
             .unwrap();
         assert_eq!(changed["summary"], "Late lunch");
         client
-            .delete_event("me@example.com", "e1", changed["etag"].as_str())
+            .delete_event("me@example.com", "e1", changed["etag"].as_str(), false)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn guests_are_told_only_when_asked_and_occurrences_are_listed() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/calendars/c/events/quiet"))
+            .and(query_param_is_missing("sendUpdates"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/calendars/c/events/told"))
+            .and(query_param("sendUpdates", "all"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/calendars/c/events/series/instances"))
+            .and(query_param("timeMin", "2026-11-17T10:00:00+00:00"))
+            .and(query_param("timeMax", "2026-11-17T10:00:01+00:00"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"items": [{"id": "series_20261117T100000Z"}]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        client
+            .delete_event("c", "quiet", None, false)
+            .await
+            .unwrap();
+        client.delete_event("c", "told", None, true).await.unwrap();
+        let from = "2026-11-17T10:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let found = client
+            .instances("c", "series", from, from + chrono::Duration::seconds(1))
+            .await
+            .unwrap();
+        assert_eq!(found[0]["id"], "series_20261117T100000Z");
     }
 
     #[tokio::test]
@@ -473,11 +552,11 @@ mod tests {
 
         let client = client(&server).await;
         let patched = client
-            .patch_event("c", "stale", &json!({"summary": "x"}), Some("\"1\""))
+            .patch_event("c", "stale", &json!({"summary": "x"}), Some("\"1\""), false)
             .await;
         assert!(matches!(patched, Err(ApiError::Changed)));
         for id in ["deleted", "unknown"] {
-            let deleted = client.delete_event("c", id, None).await;
+            let deleted = client.delete_event("c", id, None, false).await;
             assert!(matches!(deleted, Err(ApiError::Gone)), "{id}");
         }
     }

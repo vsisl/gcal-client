@@ -185,6 +185,39 @@ where
 }
 
 /// An event that does not repeat, as an instance if it may overlap `from..to`.
+/// The recurrence lines of a series cut short so that the occurrence that would start at
+/// `first_removed`, and every later one, no longer happens.
+///
+/// Each rule gets an `UNTIL` just before that start in place of whatever ended it before
+/// (`COUNT` or a later `UNTIL`): in UTC for timed series and as a date for all-day ones,
+/// the two forms Google accepts.
+pub fn end_series_before(recurrence: &[String], first_removed: EventTime) -> Vec<String> {
+    let until = match first_removed {
+        EventTime::Timed(start) => (start - Duration::seconds(1))
+            .format("%Y%m%dT%H%M%SZ")
+            .to_string(),
+        EventTime::AllDay(day) => (day - Duration::days(1)).format("%Y%m%d").to_string(),
+    };
+    recurrence
+        .iter()
+        .map(|line| {
+            let Some(rule) = line.strip_prefix("RRULE:") else {
+                return line.clone();
+            };
+            let kept: Vec<&str> = rule
+                .split(';')
+                .filter(|part| {
+                    let name = part.split('=').next().unwrap_or("");
+                    !part.is_empty()
+                        && !name.eq_ignore_ascii_case("COUNT")
+                        && !name.eq_ignore_ascii_case("UNTIL")
+                })
+                .collect();
+            format!("RRULE:{};UNTIL={until}", kept.join(";"))
+        })
+        .collect()
+}
+
 pub fn single_instance<K>(
     key: K,
     event: &Event,
@@ -777,6 +810,48 @@ mod tests {
             [
                 EventTime::Timed(instant("2026-11-17T10:00:00Z")),
                 EventTime::Timed(instant("2026-11-18T10:00:00Z")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_series_is_cut_short_just_before_the_first_removed_occurrence() {
+        let lines = |lines: &[&str]| lines.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+        // A count, or a later end, is replaced; other lines are left alone.
+        assert_eq!(
+            end_series_before(
+                &lines(&["RRULE:FREQ=DAILY;COUNT=10", "EXDATE:20261117T100000Z"]),
+                EventTime::Timed(instant("2026-11-19T10:00:00Z")),
+            ),
+            lines(&[
+                "RRULE:FREQ=DAILY;UNTIL=20261119T095959Z",
+                "EXDATE:20261117T100000Z"
+            ])
+        );
+        assert_eq!(
+            end_series_before(
+                &lines(&["RRULE:FREQ=WEEKLY;UNTIL=20270101;BYDAY=MO"]),
+                EventTime::AllDay(NaiveDate::from_ymd_opt(2026, 11, 30).unwrap()),
+            ),
+            lines(&["RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261129"])
+        );
+
+        // What is left really ends there.
+        let cut = end_series_before(
+            &lines(&["RRULE:FREQ=DAILY"]),
+            EventTime::Timed(instant("2026-11-18T10:00:00Z")),
+        );
+        let master = event(json!({
+            "id": "m",
+            "start": {"dateTime": "2026-11-16T10:00:00Z", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-11-16T11:00:00Z", "timeZone": "UTC"},
+            "recurrence": cut
+        }));
+        assert_eq!(
+            starts(&[master]),
+            [
+                EventTime::Timed(instant("2026-11-16T10:00:00Z")),
+                EventTime::Timed(instant("2026-11-17T10:00:00Z")),
             ]
         );
     }
