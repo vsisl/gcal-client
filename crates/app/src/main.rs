@@ -167,7 +167,16 @@ async fn insert(email: &str, calendar_id: &str, file: &str) -> Result<()> {
         &std::fs::read_to_string(file).with_context(|| format!("cannot read {file}"))?,
     )?;
     let mut store = open_store()?;
-    let Some(account) = store.accounts()?.into_iter().find(|a| a.email == email) else {
+    // Made for the one-account folders of the end-to-end tests. Refusing anything else
+    // keeps a mistyped command from creating events through the real cache.
+    let accounts = store.accounts()?;
+    if accounts.len() != 1 {
+        bail!(
+            "this cache holds {} accounts; `insert` only runs on a test folder with one",
+            accounts.len()
+        );
+    }
+    let Some(account) = accounts.into_iter().find(|a| a.email == email) else {
         bail!("no account {email}");
     };
     let refresh_token = Vault::open()
