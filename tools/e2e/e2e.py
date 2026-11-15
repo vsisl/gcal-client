@@ -5,9 +5,9 @@ It changes a real calendar, so it must only ever see a test account:
 
 1. Build the test copy of the app (it has Slint's test server and the `insert` command):
      SLINT_EMIT_DEBUG_INFO=1 cargo build --features ui-testing -p gcal-client --target-dir target/uitest
-2. Make a data folder whose cache.db holds the test account alone (a copy of the real
-   cache with every other account's rows deleted), and point XDG_DATA_HOME at it for
-   every command below. The app can then reach no other account.
+2. Make a data folder whose cache.db holds the test account alone, and point
+   XDG_DATA_HOME at it for every command below. The app can then reach no other account:
+     python3 tools/e2e/make_test_cache.py <email> <data folder>
 3. Seed the repeating event:
      gcal-client insert <email> <calendar> tools/e2e/series.json
 4. Start the app with SLINT_MCP_PORT=8766, then:
