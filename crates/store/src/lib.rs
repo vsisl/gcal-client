@@ -295,12 +295,34 @@ impl Store {
     /// events overlapping the range, plus every series master and changed occurrence, since
     /// only expanding a series tells whether it occurs in the range.
     pub fn events_for_range(&self, from_ts: i64, to_ts: i64) -> Result<Vec<StoredEvent>> {
-        let mut stmt = self.conn.prepare(
+        let mut events = self.recurring_events()?;
+        events.extend(self.single_events_for_range(from_ts, to_ts)?);
+        Ok(events)
+    }
+
+    /// Every series master and changed or deleted occurrence. These are needed whatever the
+    /// date range, so callers showing many ranges can load them once per sync.
+    pub fn recurring_events(&self) -> Result<Vec<StoredEvent>> {
+        self.query_events(
             "SELECT account_id, calendar_id, json FROM events
-             WHERE is_master = 1 OR recurring_event_id IS NOT NULL
-                OR (start_ts < ?2 AND end_ts > ?1)",
-        )?;
-        let rows = stmt.query_map(params![from_ts, to_ts], |row| {
+             WHERE is_master = 1 OR recurring_event_id IS NOT NULL",
+            params![],
+        )
+    }
+
+    /// Non-repeating events overlapping the range between two instants.
+    pub fn single_events_for_range(&self, from_ts: i64, to_ts: i64) -> Result<Vec<StoredEvent>> {
+        self.query_events(
+            "SELECT account_id, calendar_id, json FROM events
+             WHERE is_master = 0 AND recurring_event_id IS NULL
+               AND start_ts < ?2 AND end_ts > ?1",
+            params![from_ts, to_ts],
+        )
+    }
+
+    fn query_events(&self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<StoredEvent>> {
+        let mut stmt = self.conn.prepare_cached(sql)?;
+        let rows = stmt.query_map(params, |row| {
             Ok((
                 row.get::<_, AccountId>(0)?,
                 row.get::<_, String>(1)?,

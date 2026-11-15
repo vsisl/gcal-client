@@ -1,6 +1,6 @@
 //! The window: turns the cache into what the week view shows and wires up its controls.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration as StdDuration;
@@ -11,7 +11,7 @@ use chrono_tz::Tz;
 use gcal_core::recurrence::expand;
 use gcal_core::week::{DAYS, layout_week, local_day_start};
 use gcal_core::{CalendarListEntry, Event, EventTime};
-use gcal_store::{AccountId, Store};
+use gcal_store::{Account, AccountId, Store, StoredCalendar, StoredEvent};
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
 use crate::open_store;
@@ -119,9 +119,21 @@ fn patch<T: Clone + PartialEq + 'static>(model: &VecModel<T>, rows: Vec<T>) {
     }
 }
 
+/// What every week needs from the cache whatever its dates. Read once per change to the
+/// cache rather than on each move between weeks: with tens of thousands of events, parsing
+/// every series each time made navigation visibly lag.
+#[derive(Default)]
+struct Loaded {
+    accounts: Vec<Account>,
+    calendars: Vec<StoredCalendar>,
+    /// Series masters and their changed or deleted occurrences.
+    recurring: Vec<StoredEvent>,
+}
+
 struct View {
     ui: slint::Weak<AppWindow>,
     store: Store,
+    loaded: RefCell<Loaded>,
     zone: Tz,
     week_start: Cell<NaiveDate>,
     days: Rc<VecModel<DayHeader>>,
@@ -135,10 +147,34 @@ impl View {
         Utc::now().with_timezone(&self.zone).date_naive()
     }
 
-    /// Re-reads the cache and updates everything the window shows.
+    /// Re-reads the cache after it changed, then redraws.
+    fn reload(&self) {
+        let loaded = (|| -> Result<Loaded> {
+            Ok(Loaded {
+                accounts: self.store.accounts()?,
+                calendars: self.store.calendars()?,
+                recurring: self.store.recurring_events()?,
+            })
+        })();
+        match loaded {
+            Ok(loaded) => {
+                self.loaded.replace(loaded);
+                self.refresh();
+            }
+            Err(error) => self.show_error(&error),
+        }
+    }
+
+    /// Updates everything the window shows for the current week.
     fn refresh(&self) {
         let Some(ui) = self.ui.upgrade() else { return };
         if let Err(error) = self.try_refresh(&ui) {
+            self.show_error(&error);
+        }
+    }
+
+    fn show_error(&self, error: &anyhow::Error) {
+        if let Some(ui) = self.ui.upgrade() {
             ui.set_status_kind(StatusKind::Failed);
             ui.set_status_detail(format!("{error:#}").into());
         }
@@ -163,10 +199,10 @@ impl View {
         );
         self.update_now(ui);
 
-        let accounts = self.store.accounts()?;
-        let calendars = self.store.calendars()?;
+        let loaded = self.loaded.borrow();
+        let (accounts, calendars) = (&loaded.accounts, &loaded.calendars);
         let mut sidebar = Vec::new();
-        for account in &accounts {
+        for account in accounts {
             sidebar.push(SidebarRow {
                 is_account: true,
                 text: account.email.as_str().into(),
@@ -201,12 +237,14 @@ impl View {
 
         let from = local_day_start(week_start, self.zone);
         let to = local_day_start(week_start + Duration::days(DAYS), self.zone);
-        let stored = self
+        let singles = self
             .store
-            .events_for_range(from.timestamp() - 86_400, to.timestamp() + 86_400)?;
+            .single_events_for_range(from.timestamp() - 86_400, to.timestamp() + 86_400)?;
         let instances = expand(
-            stored
+            loaded
+                .recurring
                 .iter()
+                .chain(&singles)
                 .map(|e| ((e.account_id, e.calendar_id.as_str()), &e.event))
                 .filter(|(key, _)| shown.contains_key(key)),
             from,
@@ -300,6 +338,7 @@ pub fn run() -> Result<()> {
     let view = Rc::new(View {
         ui: ui.as_weak(),
         store: open_store()?,
+        loaded: RefCell::default(),
         zone,
         week_start: Cell::new(week_start_of(Utc::now().with_timezone(&zone).date_naive())),
         days: Rc::default(),
@@ -328,7 +367,7 @@ pub fn run() -> Result<()> {
     });
     ui.on_data_changed({
         let view = view.clone();
-        move || view.refresh()
+        move || view.reload()
     });
     ui.on_add_account({
         let commands = commands.clone();
@@ -360,7 +399,7 @@ pub fn run() -> Result<()> {
         }
     });
 
-    view.refresh();
+    view.reload();
     ui.invoke_scroll_to_hour(FIRST_VISIBLE_HOUR);
     // Show what is cached at once, and fetch changes in the background.
     let _ = commands.send(Command::SyncAll);
