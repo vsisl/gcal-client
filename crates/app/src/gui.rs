@@ -28,6 +28,9 @@ slint::include_modules!();
 const SYNC_INTERVAL: StdDuration = StdDuration::from_secs(5 * 60);
 /// The setting that remembers which calendar the previous new event went to.
 const NEW_EVENT_CALENDAR: &str = "new_event_calendar";
+/// Setting: light or dark, as the number the window uses (0 as the desktop, 1 light,
+/// 2 dark).
+const THEME: &str = "theme";
 /// How long "Undo" stays on offer after a deletion.
 const UNDO_PERIOD: StdDuration = StdDuration::from_secs(10);
 /// The sidebar's small month always shows six weeks.
@@ -1170,6 +1173,16 @@ pub fn run() -> Result<()> {
             .collect::<Vec<_>>(),
     ))));
 
+    let theme = view.store.setting(THEME).ok().flatten();
+    ui.set_theme_mode(theme.and_then(|mode| mode.parse().ok()).unwrap_or(0));
+    ui.on_theme_chosen({
+        let view = view.clone();
+        move |mode| {
+            if let Err(error) = view.store.set_setting(THEME, &mode.to_string()) {
+                view.show_error(&error.into());
+            }
+        }
+    });
     ui.on_delete_event({
         let view = view.clone();
         move |instance, scope, notify| {
