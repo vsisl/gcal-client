@@ -16,6 +16,8 @@ def drag(index, dx_days, dy, downs):
     shot(f"sdrag-ask-{downs}")
     key(ENTER)
 time.sleep(4)
+# The app opens on the view it was closed with; these steps need the week.
+key("w")
 wait("six shown", lambda: len(items("AT series")) == 6)
 # this: Wednesday half an hour later
 drag(2, 0, 24, 0)

@@ -344,13 +344,15 @@ impl GoogleClient {
     }
 }
 
-/// The query that decides whether guests are e-mailed about a change. Google's default
-/// is not to.
+/// The query of every write: whether guests are e-mailed about the change (Google's
+/// default is not to), and that the app understands video meetings.
 fn send_updates(notify: bool) -> &'static [(&'static str, &'static str)] {
+    // Always said along: without it Google ignores what a write says about the event's
+    // video meeting (and would drop the meeting from an event that has one).
     if notify {
-        &[("sendUpdates", "all")]
+        &[("conferenceDataVersion", "1"), ("sendUpdates", "all")]
     } else {
-        &[]
+        &[("conferenceDataVersion", "1")]
     }
 }
 

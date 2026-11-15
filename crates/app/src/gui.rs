@@ -841,6 +841,7 @@ fn to_window(form: &Form) -> EditorForm {
         visibility: form.visibility as i32,
         busy: form.busy,
         guests: form.guests.as_str().into(),
+        meet: form.meet,
     }
 }
 
@@ -860,6 +861,7 @@ fn from_window(form: &EditorForm) -> Form {
         visibility: form.visibility.max(0) as usize,
         busy: form.busy,
         guests: form.guests.to_string(),
+        meet: form.meet,
     }
 }
 

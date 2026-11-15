@@ -148,6 +148,8 @@ export struct EditorForm {
     busy: bool,
     // The guests' e-mail addresses, separated by commas.
     guests: string,
+    // Whether it has a Google Meet video meeting.
+    meet: bool,
 }
 
 export struct DayHeader {
@@ -2800,6 +2802,17 @@ export component AppWindow inherits Window {
                             value: root.editor.guests;
                             edited(text) => {
                                 root.editor.guests = text;
+                            }
+                        }
+                    }
+
+                    EditorRow {
+                        label: "";
+                        CheckRow {
+                            text: @tr("Google Meet video meeting");
+                            checked: root.editor.meet;
+                            toggled => {
+                                root.editor.meet = !root.editor.meet;
                             }
                         }
                     }

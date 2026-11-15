@@ -1,0 +1,43 @@
+# M4 (people) — task plan
+
+From the design (`plans/i-want-to-create-deep-hamster.md`): guests, RSVP, guest
+permissions, contact autocomplete, "find a time" from free/busy, Meet links, rooms,
+attachment links.
+
+## Done (branch `m4-people`), each tested against Google with the test account
+
+1. **Guests in the details card**: names, answers, organiser, optional; "Join the video
+   meeting". (`tools/e2e/rsvp.py`)
+2. **Answer an invitation**: Yes / No / Maybe, with undo. For an occurrence of a series
+   that was not changed on its own, the answer is for the whole series.
+3. **Change events with guests** (drag, resize, editor), for the account that invited
+   them; asks whether to send e-mails. A guest's own copy stays read-only.
+4. **Guests in the editor**: a field of e-mail addresses; inviting on a new event,
+   adding and removing on an existing one; the organiser joins the first guests.
+   (`tools/e2e/guests.py`)
+5. **Google Meet** from the editor: create, keep, remove. (`tools/e2e/meet.py`)
+
+Sending e-mails has not been tried by the scripts on purpose: their guests are made-up
+addresses, and every question about e-mails is answered "no".
+
+## Left
+
+- **Answer for one occurrence** of a series (the web asks "this event / all events").
+- **Contact autocomplete** for the guests field: needs Google's People API and a further
+  permission at sign-in (every signed-in account has to agree again). Decide with the
+  owner before adding a scope.
+- **Guest permissions**: guests may modify the event / invite others / see the guest
+  list (`guestsCanModify`, `guestsCanInviteOthers`, `guestsCanSeeOtherGuests`).
+- **Optional guests**, and a note with an answer.
+- **Find a time**: other people's free/busy (`freebusy.query`) beside the event in the
+  editor.
+- **Rooms**: adding a room by name or address (a room is a guest with `resource`).
+- **Attachment links.**
+- A guest's copy of an event: "propose a new time" has no API and goes to the browser.
+
+## Known rough edges
+
+- After a change to a video meeting the app fetches the event again three seconds
+  later, which closes an open details card; within those seconds another change to the
+  event may be refused as "changed somewhere else".
+- The guests field takes addresses only; names are shown in the details card.

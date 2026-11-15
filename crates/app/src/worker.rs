@@ -29,6 +29,8 @@ use crate::{load_config, open_store};
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Limits on one request to Google. Without them a connection that stalls (suspend, captive
 /// portal) would never finish, and the sync holding it would block every later one.
+/// How long Google takes, generously, to finish setting up or removing a video meeting.
+const SETTLE_TIME: Duration = Duration::from_secs(3);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -559,6 +561,19 @@ impl Worker {
         result
     }
 
+    /// Syncs once more in a few seconds. Google goes on working on an event after
+    /// answering a change to its video meeting, and the event's version changes again
+    /// a moment later; until the app has that version, a further change to the event
+    /// would be refused as "changed somewhere else".
+    fn sync_soon(&self) {
+        let worker = self.clone();
+        tokio::task::spawn_local(async move {
+            tokio::time::sleep(SETTLE_TIME).await;
+            let _ = worker.sync_all().await;
+            worker.publish();
+        });
+    }
+
     /// A client for the account that owns what is being changed.
     async fn account_client(&self, store: &Store, account: AccountId) -> Result<GoogleClient> {
         let email = store
@@ -768,6 +783,9 @@ impl Worker {
         store.apply_event(account, calendar_id, &changed)?;
         drop(saving);
         let _ = self.sync_accounts().await;
+        if changes.get("conferenceData").is_some() {
+            self.sync_soon();
+        }
         Ok(changed["etag"].as_str().unwrap_or_default().to_owned())
     }
 
@@ -788,7 +806,18 @@ impl Worker {
             .await?;
         store.apply_event(account, calendar_id, &created)?;
         let text = |name: &str| created[name].as_str().unwrap_or_default().to_owned();
-        Ok((text("id"), text("etag")))
+        let (id, mut etag) = (text("id"), text("etag"));
+        if !resource["conferenceData"]["createRequest"].is_null() {
+            // Google sets the video meeting up after it has answered, and the event
+            // changes once more. Without fetching that, the next change to the event
+            // would be refused as "changed somewhere else".
+            let _ = self.sync_accounts().await;
+            if let Ok(Some(settled)) = store.event_json(account, calendar_id, &id) {
+                etag = settled["etag"].as_str().unwrap_or_default().to_owned();
+            }
+            self.sync_soon();
+        }
+        Ok((id, etag))
     }
 
     async fn remove_account(&self, email: &str) -> Result<()> {

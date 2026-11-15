@@ -6,6 +6,8 @@ from common import *
 def props(h): return json.loads(call("get_element_properties", elementHandle=h)["content"][0]["text"])
 def start(): return named("AT drag")[0]["start"]["dateTime"], named("AT drag")[0]["end"]["dateTime"]
 time.sleep(4)
+# The app opens on the view it was closed with; these steps need the week.
+key("w")
 h = items("AT drag")[0]
 p = props(h)
 print({k: p[k] for k in p if k in ("absolutePosition", "size", "x", "y", "width", "height")})

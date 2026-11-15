@@ -53,6 +53,8 @@ pub struct Form {
     pub busy: bool,
     /// The guests' addresses, separated by commas, spaces or new lines.
     pub guests: String,
+    /// Whether the event has a Google Meet video meeting.
+    pub meet: bool,
 }
 
 /// What the form cannot show but must not lose.
@@ -69,6 +71,8 @@ pub struct Kept {
     /// when the first ones are invited, as the web does, so that the organiser is
     /// among them.
     pub own_email: String,
+    /// The event's video meeting as Google describes it; null if it has none.
+    pub conference: Value,
 }
 
 fn clock(instant: DateTime<Utc>, zone: Tz) -> String {
@@ -149,6 +153,7 @@ pub fn form_of(resource: &Value, start: EventTime, end: EventTime, zone: Tz) -> 
             .cloned()
             .unwrap_or_default(),
         own_email: String::new(),
+        conference: resource["conferenceData"].clone(),
     };
     let guests: Vec<&str> = kept
         .attendees
@@ -156,6 +161,7 @@ pub fn form_of(resource: &Value, start: EventTime, end: EventTime, zone: Tz) -> 
         .filter_map(|guest| guest["email"].as_str())
         .collect();
     let mut form = Form {
+        meet: !kept.conference.is_null(),
         guests: guests.join(", "),
         title: text("summary"),
         location: text("location"),
@@ -273,7 +279,20 @@ pub fn fields(form: &Form, kept: &Kept, zone: Tz) -> Result<Value, String> {
             }],
         }),
     };
+    // A meeting the event has stays as it is; a new one is asked of Google, which
+    // needs a text of our choosing to tell a repeated request from a second one.
+    let conference = match (form.meet, kept.conference.is_null()) {
+        (true, false) => kept.conference.clone(),
+        (true, true) => json!({
+            "createRequest": {
+                "requestId": request_id(),
+                "conferenceSolutionKey": { "type": "hangoutsMeet" },
+            }
+        }),
+        (false, _) => Value::Null,
+    };
     Ok(json!({
+        "conferenceData": conference,
         "attendees": guest_list(form, kept)?,
         "summary": form.title.trim(),
         "start": start,
@@ -286,6 +305,17 @@ pub fn fields(form: &Form, kept: &Kept, zone: Tz) -> Result<Value, String> {
         "visibility": VISIBILITY.get(form.visibility).copied().unwrap_or("default"),
         "transparency": if form.busy { "opaque" } else { "transparent" },
     }))
+}
+
+/// A text that differs for every request made by this run of the app.
+fn request_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let now = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    format!(
+        "gcal-client-{now}-{}",
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// The guests the form names, as Google's list of attendees. A guest the event had
@@ -396,7 +426,7 @@ pub fn creation(fields: Value) -> Value {
     };
     let says_nothing = |name: &str, value: &Value| match name {
         "location" | "description" => value == "",
-        "colorId" => value.is_null(),
+        "colorId" | "conferenceData" => value.is_null(),
         "recurrence" | "attendees" => value == &json!([]),
         "reminders" => value == &json!({ "useDefault": true }),
         "visibility" => value == "default",
@@ -741,6 +771,7 @@ mod tests {
                 visibility: 2,
                 busy: false,
                 guests: String::new(),
+                meet: false,
             }
         );
         let opened = fields(&form, &kept, zone()).unwrap();
@@ -925,6 +956,55 @@ mod tests {
         assert_eq!(
             inverse(&changes, &json!({"id": "e"})),
             json!({"attendees": []})
+        );
+    }
+
+    #[test]
+    fn a_video_meeting_is_asked_for_kept_or_removed() {
+        let (start, end) = (timed("2026-11-17T11:00:00Z"), timed("2026-11-17T12:00:00Z"));
+        // New event with a meeting: a request for one; without: nothing.
+        let mut form = new_form(start, end, zone());
+        assert!(
+            creation(fields(&form, &Kept::default(), zone()).unwrap())
+                .get("conferenceData")
+                .is_none()
+        );
+        form.meet = true;
+        let created = creation(fields(&form, &Kept::default(), zone()).unwrap());
+        let request = &created["conferenceData"]["createRequest"];
+        assert_eq!(request["conferenceSolutionKey"]["type"], "hangoutsMeet");
+        assert!(
+            request["requestId"]
+                .as_str()
+                .unwrap()
+                .starts_with("gcal-client-")
+        );
+        // Two requests never share their text.
+        let again = creation(fields(&form, &Kept::default(), zone()).unwrap());
+        assert_ne!(
+            again["conferenceData"]["createRequest"]["requestId"],
+            request["requestId"]
+        );
+
+        // An event that has one: untouched nothing is sent; unticked it is removed.
+        let event = json!({
+            "id": "e",
+            "start": {"dateTime": "2026-11-17T12:00:00+01:00"},
+            "end": {"dateTime": "2026-11-17T13:00:00+01:00"},
+            "hangoutLink": "https://meet.google.com/abc-defg-hij",
+            "conferenceData": {"conferenceId": "abc-defg-hij"}
+        });
+        let (opened, kept) = form_of(&event, start, end, zone());
+        assert!(opened.meet);
+        let before = fields(&opened, &kept, zone()).unwrap();
+        assert_eq!(diff(&before, &before), json!({}));
+        let mut without = opened.clone();
+        without.meet = false;
+        let changes = diff(&before, &fields(&without, &kept, zone()).unwrap());
+        assert_eq!(changes, json!({"conferenceData": null}));
+        assert_eq!(
+            inverse(&changes, &event),
+            json!({"conferenceData": {"conferenceId": "abc-defg-hij"}})
         );
     }
 

@@ -12,10 +12,10 @@ Not affiliated with or endorsed by Google. Google Calendar is a trademark of Goo
 
 | Works | Not yet |
 |---|---|
-| Several accounts merged in one view, calendars ticked on and off | Guests: inviting, answering, editing events that have guests |
+| Several accounts merged in one view, calendars ticked on and off | Guests' address book, "find a time", rooms |
 | Day, week, a few days, month, year and schedule views; go to date | Search |
 | Create, edit, move, resize and delete events, with undo (two exceptions, see below) | Date and time pickers (dates and times are typed), custom repeat rules |
-| Repeating events: "this / this and following / all" | Reminders on the desktop, tray icon, running in the background |
+| Repeating events: "this / this and following / all"; guests, answering invitations, Google Meet links | Reminders on the desktop, tray icon, running in the background |
 | Settings: theme, first day of the week, 12/24-hour clock, zoom | Tasks, birthdays, out of office and other special entries |
 | Works offline for viewing; syncs every five minutes | Packaging (Flatpak), Windows and macOS |
 
