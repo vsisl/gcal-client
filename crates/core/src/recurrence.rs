@@ -130,8 +130,12 @@ fn occurrences(
         .before(window_end.with_timezone(&utc))
         .all(MAX_OCCURRENCES);
 
-    result
-        .dates
+    // The start is in the set twice when the rules produce it as well (see `rule_set`).
+    let mut dates = result.dates;
+    dates.sort();
+    dates.dedup();
+
+    dates
         .into_iter()
         .map(|occurrence| {
             let occurrence = occurrence.with_timezone(&Utc);
@@ -159,8 +163,11 @@ fn occurrences(
 /// across daylight-saving changes. All-day series are computed at midnight UTC and only the
 /// date of each result is used.
 fn rule_set(master: &Event, start: EventTime) -> Option<RRuleSet> {
-    let mut text = match start {
-        EventTime::AllDay(day) => format!("DTSTART:{}T000000Z", day.format("%Y%m%d")),
+    // The start is handed over as an instant in its zone, not as local-time text: text
+    // cannot tell apart the two 02:30s of the night clocks go back, and the parser rejects
+    // such a start outright.
+    let first = match start {
+        EventTime::AllDay(day) => day_start_utc(day).with_timezone(&rrule::Tz::UTC),
         EventTime::Timed(instant) => {
             let zone = master
                 .start
@@ -168,20 +175,23 @@ fn rule_set(master: &Event, start: EventTime) -> Option<RRuleSet> {
                 .and_then(|s| s.time_zone.as_deref())
                 .and_then(|name| name.parse::<chrono_tz::Tz>().ok())
                 .unwrap_or(chrono_tz::UTC);
-            let local = instant.with_timezone(&zone);
-            format!(
-                "DTSTART;TZID={}:{}",
-                zone.name(),
-                local.format("%Y%m%dT%H%M%S")
-            )
+            instant.with_timezone(&rrule::Tz::Tz(zone))
         }
     };
     let all_day = matches!(start, EventTime::AllDay(_));
-    for line in &master.recurrence {
-        text.push('\n');
-        text.push_str(&normalise_line(line, all_day));
-    }
-    text.parse().ok()
+    let lines: Vec<String> = master
+        .recurrence
+        .iter()
+        .map(|line| normalise_line(line, all_day))
+        .collect();
+    RRuleSet::new(first)
+        .set_from_string(&lines.join("\n"))
+        .ok()
+        // The library yields only what the rules and extra dates produce. Google counts the
+        // event's own start as an occurrence too, which matters for a series made of
+        // extra dates alone. A start the rules also produce comes out twice; the caller
+        // removes the duplicate.
+        .map(|set| set.rdate(first))
 }
 
 /// Rewrites the date-only values Google uses into the date-time forms the parser needs.
@@ -414,6 +424,78 @@ mod tests {
             "recurrence": ["RRULE:FREQ=YEARLY"]
         }));
         assert_eq!(starts(&[master]), [EventTime::AllDay(date("2026-11-20"))]);
+    }
+
+    #[test]
+    fn series_that_began_in_the_repeated_hour_of_a_clock_change_still_repeats() {
+        // 02:30 happens twice in Prague on 25 October 2026; this is the first (UTC+2).
+        let master = event(json!({
+            "id": "m",
+            "start": {"dateTime": "2026-10-25T02:30:00+02:00", "timeZone": "Europe/Prague"},
+            "end": {"dateTime": "2026-10-25T03:00:00+02:00", "timeZone": "Europe/Prague"},
+            "recurrence": ["RRULE:FREQ=WEEKLY"]
+        }));
+        assert_eq!(
+            starts(&[master]),
+            [EventTime::Timed(instant("2026-11-22T01:30:00Z"))]
+        );
+    }
+
+    #[test]
+    fn exrule_removes_the_occurrences_it_matches() {
+        let master = event(json!({
+            "id": "m",
+            "start": {"dateTime": "2026-11-02T10:00:00Z", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-11-02T11:00:00Z", "timeZone": "UTC"},
+            "recurrence": ["RRULE:FREQ=DAILY", "EXRULE:FREQ=WEEKLY;BYDAY=SA,SU"]
+        }));
+        assert_eq!(starts(&[master]).len(), 5);
+    }
+
+    #[test]
+    fn series_made_only_of_extra_dates_keeps_its_first_occurrence() {
+        let timed = event(json!({
+            "id": "t",
+            "start": {"dateTime": "2026-11-16T10:00:00Z", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-11-16T11:00:00Z", "timeZone": "UTC"},
+            "recurrence": ["RDATE:20261118T100000Z"]
+        }));
+        assert_eq!(
+            starts(&[timed]),
+            [
+                EventTime::Timed(instant("2026-11-16T10:00:00Z")),
+                EventTime::Timed(instant("2026-11-18T10:00:00Z")),
+            ]
+        );
+        let all_day = event(json!({
+            "id": "a",
+            "start": {"date": "2026-11-17"}, "end": {"date": "2026-11-18"},
+            "recurrence": ["RDATE;VALUE=DATE:20261119"]
+        }));
+        assert_eq!(
+            starts(&[all_day]),
+            [
+                EventTime::AllDay(date("2026-11-17")),
+                EventTime::AllDay(date("2026-11-19")),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_excluded_first_occurrence_stays_excluded() {
+        let master = event(json!({
+            "id": "m",
+            "start": {"dateTime": "2026-11-16T10:00:00Z", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-11-16T11:00:00Z", "timeZone": "UTC"},
+            "recurrence": ["RRULE:FREQ=DAILY;COUNT=3", "EXDATE:20261116T100000Z"]
+        }));
+        assert_eq!(
+            starts(&[master]),
+            [
+                EventTime::Timed(instant("2026-11-17T10:00:00Z")),
+                EventTime::Timed(instant("2026-11-18T10:00:00Z")),
+            ]
+        );
     }
 
     #[test]

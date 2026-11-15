@@ -11,7 +11,7 @@ workspace = true
 [dependencies]
 chrono = { version = "0.4.45", features = ["serde"] }
 chrono-tz = "0.10.4"
-rrule = "0.14.0"
+rrule = { version = "0.14.0", features = ["exrule"] }
 serde = { version = "1.0.229", features = ["derive"] }
 
 [dev-dependencies]
