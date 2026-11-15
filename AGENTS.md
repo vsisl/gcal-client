@@ -94,8 +94,12 @@ requests.
 - A write goes to Google first; the cache is then updated from Google's answer, and the
   window redraws from the cache. Nothing is written to the cache in the hope that Google
   will agree.
-- Every write carries the event's `etag` (`If-Match`). A change made elsewhere is refused
-  (HTTP 412), the calendar is synced, and a dialog says so. Never overwrite silently.
+- A change to an existing event carries the `etag` of the version the user saw
+  (`If-Match`). A change made elsewhere is then refused (HTTP 412), the calendar is
+  synced, and a dialog says so. Never overwrite silently. This is the rule for new
+  code; it does not hold everywhere yet: an occurrence of a series that was never
+  changed has no cached version and is written without one (issue 7), and so is the
+  repair after a failed split. Creating an event has nothing to compare with.
 - Writes run one at a time, in the order sent, under the same lock a sync holds. The
   window keeps what it sent in a queue (`pending`) and matches the worker's answers
   against it in order. Every write command must therefore be answered exactly once,
@@ -152,19 +156,23 @@ empty places and thin handles cannot be pressed; keys cannot be sent with Ctrl h
 elements scrolled out of view are not found. Look at the screenshots: a check that
 passes for the wrong reason is worse than none.
 
-To look at the window without any sign-in (nothing can be written, every write fails with
-a dialog), also point `XDG_CONFIG_HOME` at an empty folder.
+To look at the window without a sign-in key, also point `XDG_CONFIG_HOME` at an empty
+folder: nothing can then be sent to Google, and every change fails with a dialog. The
+keyring is still the real one, whatever the folders: removing an account in a test app
+(or `logout`) deletes the owner's real sign-in. Never do that in a test.
 
 **End to end, against Google.** Only with the test account the owner has set aside for
 this; ask the owner which one it is. It must be signed in to the app once (by the owner,
-in the browser).
+in the browser), and it must be an account made for testing: the test app can reach
+every calendar that account has access to, so no real calendar may be shared to it with
+write access.
 
 ```sh
-# A data folder that knows the test account and nothing else:
-python3 tools/e2e/make_test_cache.py <test account> <data folder>
-export XDG_DATA_HOME=<data folder>
-# The test build can create an event from a JSON file (repeating ones, which the
-# window cannot make from scratch quickly):
+# A data folder that knows the test account and no other. It prints the calendars
+# the account can reach: read that list. Go on only if this succeeds (&&).
+python3 tools/e2e/make_test_cache.py <test account> <data folder> &&
+export XDG_DATA_HOME=<data folder> &&
+# The test build can create an event from a JSON file (a repeating one, say):
 <scratch folder>/gcal-uitest insert <test account> <test account> tools/e2e/series.json
 SLINT_MCP_PORT=8766 timeout 300 <scratch folder>/gcal-uitest &
 python3 tools/e2e/e2e.py <screenshot folder> <data folder>/gcal-client/cache.db
@@ -175,16 +183,27 @@ python3 tools/e2e/e2e.py <screenshot folder> <data folder>/gcal-client/cache.db
 | `e2e.py` | create, delete, undo; a series: this / following / all | `series.json` inserted |
 | `drag.py` | move by dragging, undo | `plain.json` inserted |
 | `sdrag.py` | dragging occurrences: this / all / following | `series.json` inserted |
-| `ed.py` | the editor; `ed.py … clean` deletes every "AT …" event left behind | — |
+| `ed.py` | the editor, also on a series | `series.json` inserted |
 | `quick.py` | quick create and its undo | — |
 | `zoom.py` | zoom through the settings | — |
 
-Rules for these runs: always with `XDG_DATA_HOME` on the one-account folder, never on the
-real one; stop the test app with `pkill -x gcal-uitest` (`pkill -f` matches the shell
-that runs the script, and the name `gcal-client` would stop the owner's own app); leave the test calendar as it was found (events of the scripts are
-named "AT …"; anything else in it is the owner's). The Undo offer lasts ten seconds, so a
-script must not wait longer before pressing `z`. Add a step to these scripts for every
-new kind of write.
+Each script that needs a fixture uses it up or changes it: insert a fresh one before
+each. `ed.py … clean` deletes what the scripts left behind: every event on the month on
+screen whose title starts with "AT " (so the owner must not keep events named like that
+in the test calendar); it does not look at other months.
+
+The fixtures and the checks are written for the week of 2026-11-09, and the scripts
+expect that week on screen, where the app only opens during that week. Until that is
+fixed (issue 11), the scripts need adapting before they can be run again.
+
+Rules for these runs:
+- Always with `XDG_DATA_HOME` on the one-account folder, never on the real one.
+- Stop the test app with `pkill -x gcal-uitest`. `pkill -f` matches the shell that runs
+  the script, and the name `gcal-client` would stop the owner's own app.
+- Leave the test calendar as it was found. Events of the scripts are named "AT …";
+  anything else in it is the owner's.
+- The Undo offer lasts ten seconds, so a script must not wait longer before pressing `z`.
+- Add a step to these scripts for every new kind of write.
 
 Not covered by any test yet: Google failing or being slow, and the gestures the test
 server cannot make (issue 9).

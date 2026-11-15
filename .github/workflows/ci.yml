@@ -1,7 +1,9 @@
 name: CI
 
-# Only pull requests: everything reaches main through one, so a run on every push
-# would check the same commits twice.
+# Only pull requests, by the owner's decision: everything reaches main through one.
+# A run checks the branch merged with main as main was when the run started; main
+# itself is not checked again after the merge. If main moved on meanwhile, update the
+# branch before merging so that what lands has been checked.
 on:
   pull_request:
 

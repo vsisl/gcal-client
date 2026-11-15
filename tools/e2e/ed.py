@@ -71,13 +71,14 @@ def masters(name): return [e for e in events() if e.get("summary") == name and e
 time.sleep(4)
 key("m")
 if len(sys.argv) > 3 and sys.argv[3] == "clean":
-    while items("AT"):
-        n = len(items("AT"))
-        call("click_element", elementHandle=items("AT")[0]); time.sleep(0.4)
+    # Only what the scripts name: "AT " and a word. Not "ATM", "Attic", ...
+    while items("AT "):
+        n = len(items("AT "))
+        call("click_element", elementHandle=items("AT ")[0]); time.sleep(0.4)
         key(DEL); time.sleep(0.4)
         if "Cancel" in [label(b) for b in find("Button")]:
             key(DOWN); key(DOWN); key(ENTER)
-        wait("clean", lambda: len(items("AT")) < n)
+        wait("clean", lambda: len(items("AT ")) < n)
     print("left:", [e.get("summary") for e in events() if e.get("status") != "cancelled"])
     sys.exit(0)
 

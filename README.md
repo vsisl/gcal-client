@@ -14,7 +14,7 @@ Not affiliated with or endorsed by Google. Google Calendar is a trademark of Goo
 |---|---|
 | Several accounts merged in one view, calendars ticked on and off | Guests: inviting, answering, editing events that have guests |
 | Day, week, 4 days, month and schedule views; small month in the sidebar | Year view, go to date, search |
-| Create, edit, move, resize and delete events, with undo | Date and time pickers (dates and times are typed), custom repeat rules |
+| Create, edit, move, resize and delete events, with undo (two exceptions, see below) | Date and time pickers (dates and times are typed), custom repeat rules |
 | Repeating events: "this / this and following / all" | Reminders on the desktop, tray icon, running in the background |
 | Light and dark theme, zoom of the day columns | Tasks, birthdays, out of office and other special entries |
 | Works offline for viewing; syncs every five minutes | Packaging (Flatpak), Windows and macOS |
@@ -24,8 +24,8 @@ There is no installer yet: you build it yourself, and you need your own Google s
 
 ## Building
 
-Requires the Rust toolchain ([rustup](https://rustup.rs); the version is pinned in
-`rust-toolchain.toml`) and, on Debian/Ubuntu:
+Requires the Rust toolchain ([rustup](https://rustup.rs); the current stable release, as
+`rust-toolchain.toml` says) and, on Debian/Ubuntu:
 
 ```sh
 sudo apt install pkg-config libfontconfig-dev libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev libdbus-1-dev
@@ -72,7 +72,10 @@ is alive.
 - **Change:** drag an event to move it, drag its lower edge to resize it, or open it and
   press `e` for the editor.
 - **Delete:** open the event and press `Delete`.
-- **Undo:** "Undo" in the bar that appears at the bottom left, or `z`.
+- **Undo:** "Undo" in the bar that appears at the bottom left for ten seconds, or `z`.
+  Two changes cannot be undone, and offer no "Undo": editing or moving "this and
+  following events" of a repeating event, and deleting all events of a repeating event
+  in which single ones had been changed or deleted before.
 - **Zoom** the day columns: `Ctrl` and the mouse wheel (or two fingers on a touchpad),
   `Ctrl +` / `Ctrl −`, pinch on a touch screen, or the buttons in the settings.
 
