@@ -168,17 +168,24 @@ every calendar that account has access to, so no real calendar may be shared to 
 write access.
 
 ```sh
-# A data folder that knows the test account and no other. It prints the calendars
-# the account can reach: read that list. Go on only if this succeeds (&&).
+# Every step runs only if the one before succeeded (&&): nothing may reach Google
+# unless the one-account folder was made and is the one in use.
+#
+# 1. A data folder that knows the test account and no other. It prints the calendars
+#    the account can reach: read that list.
 python3 tools/e2e/make_test_cache.py <test account> <data folder> &&
 export XDG_DATA_HOME=<data folder> &&
-# The event a script starts from, dated in the current week, and created with the
-# test build's `insert` (account, calendar, file):
-python3 tools/e2e/fixture.py series <scratch folder>/fixture.json
-<scratch folder>/gcal-uitest insert <test account> <test account> <scratch folder>/fixture.json
-SLINT_MCP_PORT=8766 timeout 300 <scratch folder>/gcal-uitest &
+# 2. The event a script starts from, dated in the current week, created with the test
+#    build's `insert` (account, calendar, file).
+python3 tools/e2e/fixture.py series <scratch folder>/fixture.json &&
+<scratch folder>/gcal-uitest insert <test account> <test account> <scratch folder>/fixture.json &&
+# 3. The app, and the script that drives it.
+{ SLINT_MCP_PORT=8766 timeout 300 <scratch folder>/gcal-uitest & } &&
 python3 tools/e2e/e2e.py <screenshot folder> <data folder>/gcal-client/cache.db
 ```
+
+As a second guard, `insert` refuses to run on a cache that holds more than one account,
+which the real one usually does.
 
 | Script | Covers | Needs first |
 |---|---|---|
@@ -197,7 +204,9 @@ in the test calendar); it does not look at other months.
 The fixtures and the checks are for the week with today in it (`MONDAY` in
 `common.py`), which is the week the app opens on. `common.py` holds what the scripts
 share. Known limits: `ed.py` types an end time of 23:30 for an event created "now", so
-it fails late in the evening; a run across midnight on Sunday mixes two weeks.
+it fails late in the evening; a run across midnight on Sunday mixes two weeks; the
+fixtures are at 09:00 UTC, which in time zones far west of UTC is still Sunday, so
+there the series does not start in the week on screen.
 
 Rules for these runs:
 - Always with `XDG_DATA_HOME` on the one-account folder, never on the real one.

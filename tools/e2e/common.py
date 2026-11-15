@@ -63,7 +63,8 @@ def notice():
 
 # The fixtures (fixture.py) and the checks are for the week the app opens on: the one
 # with today in it, from its Monday. Day 0 is that Monday.
-MONDAY = date.today() - timedelta(days=date.today().weekday())
+_today = date.today()
+MONDAY = _today - timedelta(days=_today.weekday())
 
 
 def at(day, clock):
