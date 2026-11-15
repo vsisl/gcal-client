@@ -240,7 +240,10 @@ mod tests {
         // 22:00 to midnight, Prague time.
         let layout = november(&[timed("2026-11-17T21:00:00Z", "2026-11-17T23:00:00Z")], 4);
         assert_eq!(layout.chips.len(), 1);
-        assert_eq!((layout.chips[0].first_day, layout.chips[0].last_day), (1, 1));
+        assert_eq!(
+            (layout.chips[0].first_day, layout.chips[0].last_day),
+            (1, 1)
+        );
         assert!(layout.chips[0].within_day);
     }
 
@@ -248,7 +251,10 @@ mod tests {
     fn an_event_crossing_midnight_is_a_bar_over_both_days() {
         let layout = november(&[timed("2026-11-17T21:00:00Z", "2026-11-18T01:00:00Z")], 4);
         assert_eq!(layout.chips.len(), 1);
-        assert_eq!((layout.chips[0].first_day, layout.chips[0].last_day), (1, 2));
+        assert_eq!(
+            (layout.chips[0].first_day, layout.chips[0].last_day),
+            (1, 2)
+        );
         assert!(!layout.chips[0].within_day);
     }
 

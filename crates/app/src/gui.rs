@@ -6,11 +6,12 @@ use std::rc::Rc;
 use std::time::Duration as StdDuration;
 
 use anyhow::Result;
-use chrono::{DateTime, Datelike, Duration, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, Months, NaiveDate, Timelike, Utc};
 use chrono_tz::Tz;
+use gcal_core::month::{MonthLayout, layout_month};
 use gcal_core::recurrence::expand;
 use gcal_core::text::plain_text;
-use gcal_core::week::{layout_days, local_day_start};
+use gcal_core::week::{WeekLayout, layout_days, local_day_start};
 use gcal_core::{CalendarListEntry, Event, EventTime};
 use gcal_store::{Account, AccountId, Store, StoredCalendar, StoredEvent};
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
@@ -88,32 +89,54 @@ fn week_start_of(day: NaiveDate) -> NaiveDate {
     day - Duration::days(i64::from(day.weekday().num_days_from_monday()))
 }
 
-/// How many days the grid shows.
+/// Which stretch of days the window shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Span {
     Day,
-    FourDays,
     Week,
+    Month,
+    FourDays,
 }
 
 impl Span {
-    /// The order used by the interface's view switcher.
-    const ALL: [Span; 3] = [Span::Day, Span::FourDays, Span::Week];
+    /// The order used by the interface's view switcher and the number keys, as on the web.
+    const ALL: [Span; 4] = [Span::Day, Span::Week, Span::Month, Span::FourDays];
 
-    fn days(self) -> i64 {
+    /// The first day shown and the number of days, when the user is looking at `anchor`.
+    /// The week view snaps to the start of the week, the month view shows the whole weeks
+    /// that cover the month, and the others begin on the day itself.
+    fn range(self, anchor: NaiveDate) -> (NaiveDate, i64) {
         match self {
-            Span::Day => 1,
-            Span::FourDays => 4,
-            Span::Week => 7,
+            Span::Day => (anchor, 1),
+            Span::FourDays => (anchor, 4),
+            Span::Week => (week_start_of(anchor), 7),
+            Span::Month => {
+                let first = week_start_of(anchor.with_day(1).unwrap_or(anchor));
+                let next_month = (anchor.with_day(1).unwrap_or(anchor)) + Months::new(1);
+                let days = (next_month - first).num_days();
+                (first, (days + 6) / 7 * 7)
+            }
         }
     }
 
-    /// The first day shown when the user is looking at `anchor`: the week view snaps to
-    /// the start of the week, the others begin on the day itself.
-    fn first_day(self, anchor: NaiveDate) -> NaiveDate {
+    /// The day to look at after moving one screenful back (-1) or forward (1).
+    fn step(self, anchor: NaiveDate, direction: i64) -> NaiveDate {
         match self {
-            Span::Week => week_start_of(anchor),
-            Span::Day | Span::FourDays => anchor,
+            // Lands on the same day of the neighbouring month, or its last day.
+            Span::Month if direction < 0 => anchor - Months::new(1),
+            Span::Month => anchor + Months::new(1),
+            _ => anchor + Duration::days(direction * self.range(anchor).1),
+        }
+    }
+
+    /// The text next to the navigation buttons.
+    fn title(self, anchor: NaiveDate) -> String {
+        match self {
+            Span::Month => anchor.format("%B %Y").to_string(),
+            _ => {
+                let (first, days) = self.range(anchor);
+                period_title(first, days)
+            }
         }
     }
 }
@@ -226,12 +249,15 @@ struct View {
     /// Details of every instance now on screen, by the index its block or bar carries.
     details: RefCell<Vec<EventDetail>>,
     all_day: Rc<VecModel<AllDayItem>>,
+    month_cells: Rc<VecModel<MonthCell>>,
+    month_chips: Rc<VecModel<MonthChip>>,
     sidebar: Rc<VecModel<SidebarRow>>,
 }
 
 impl View {
-    fn first_day(&self) -> NaiveDate {
-        self.span.get().first_day(self.anchor.get())
+    /// The first day shown and how many days are.
+    fn range(&self) -> (NaiveDate, i64) {
+        self.span.get().range(self.anchor.get())
     }
 
     fn today(&self) -> NaiveDate {
@@ -272,27 +298,31 @@ impl View {
     }
 
     fn try_refresh(&self, ui: &AppWindow) -> Result<()> {
-        let week_start = self.first_day();
         let span = self.span.get();
-        let days = span.days();
+        let (week_start, days) = self.range();
+        let is_month = span == Span::Month;
         let today = self.today();
-        ui.set_day_count(days as i32);
         ui.set_view_index(Span::ALL.iter().position(|s| *s == span).unwrap_or(0) as i32);
         self.drawn_today.set(Some(today));
-        ui.set_period_title(period_title(week_start, days).into());
-        patch(
-            &self.days,
-            (0..days)
-                .map(|offset| {
-                    let day = week_start + Duration::days(offset);
-                    DayHeader {
-                        weekday: day.format("%a").to_string().to_uppercase().into(),
-                        number: day.day().to_string().into(),
-                        today: day == today,
-                    }
-                })
-                .collect(),
-        );
+        ui.set_period_title(span.title(self.anchor.get()).into());
+        if is_month {
+            ui.set_month_weeks((days / 7) as i32);
+        } else {
+            ui.set_day_count(days as i32);
+            patch(
+                &self.days,
+                (0..days)
+                    .map(|offset| {
+                        let day = week_start + Duration::days(offset);
+                        DayHeader {
+                            weekday: day.format("%a").to_string().to_uppercase().into(),
+                            number: day.day().to_string().into(),
+                            today: day == today,
+                        }
+                    })
+                    .collect(),
+            );
+        }
         self.update_now(ui);
 
         let loaded = self.loaded.borrow();
@@ -349,7 +379,23 @@ impl View {
             to,
         );
         let spans: Vec<_> = instances.iter().map(|i| (i.start, i.end)).collect();
-        let layout = layout_days(&spans, week_start, days, self.zone);
+        // Only one of the two grids is on screen; the other one's models are emptied.
+        let layout = if is_month {
+            WeekLayout::default()
+        } else {
+            layout_days(&spans, week_start, days, self.zone)
+        };
+        let month = if is_month {
+            layout_month(
+                &spans,
+                week_start,
+                days / 7,
+                self.zone,
+                ui.get_month_capacity(),
+            )
+        } else {
+            MonthLayout::default()
+        };
 
         let title = |index: usize| -> SharedString {
             instances[index]
@@ -412,6 +458,57 @@ impl View {
         );
         ui.set_all_day_rows(layout.all_day_rows);
 
+        let shown_month = self.anchor.get().month();
+        patch(
+            &self.month_cells,
+            month
+                .more
+                .iter()
+                .enumerate()
+                .map(|(offset, more)| {
+                    let day = week_start + Duration::days(offset as i64);
+                    // The first of a month says which month, as on the web.
+                    let label = if day.day() == 1 {
+                        day.format("%-d %b").to_string()
+                    } else {
+                        day.day().to_string()
+                    };
+                    MonthCell {
+                        label: label.into(),
+                        today: day == today,
+                        dim: day.month() != shown_month,
+                        more: *more,
+                    }
+                })
+                .collect(),
+        );
+        patch(
+            &self.month_chips,
+            month
+                .chips
+                .iter()
+                .map(|chip| {
+                    let color = color(chip.index);
+                    let time = match spans[chip.index].0 {
+                        EventTime::Timed(start) if chip.within_day => clock(start, self.zone),
+                        _ => String::new(),
+                    };
+                    MonthChip {
+                        instance: chip.index as i32,
+                        title: title(chip.index),
+                        time: time.into(),
+                        week: chip.week,
+                        first_day: chip.first_day,
+                        last_day: chip.last_day,
+                        row: chip.row,
+                        filled: !chip.within_day,
+                        color,
+                        text_color: text_color_on(color),
+                    }
+                })
+                .collect(),
+        );
+
         let emails: HashMap<AccountId, &str> =
             accounts.iter().map(|a| (a.id, a.email.as_str())).collect();
         let details = instances
@@ -441,8 +538,9 @@ impl View {
     /// Moves the current-time line.
     fn update_now(&self, ui: &AppWindow) {
         let now = Utc::now().with_timezone(&self.zone);
-        let offset = (now.date_naive() - self.first_day()).num_days();
-        if (0..self.span.get().days()).contains(&offset) {
+        let (first, days) = self.range();
+        let offset = (now.date_naive() - first).num_days();
+        if self.span.get() != Span::Month && (0..days).contains(&offset) {
             ui.set_now_day(offset as i32);
             ui.set_now_min((now.hour() * 60 + now.minute()) as i32);
         } else {
@@ -473,7 +571,14 @@ impl View {
 
     /// Moves one screenful back (-1) or forward (1).
     fn step(&self, direction: i64) {
-        self.show(self.anchor.get() + Duration::days(direction * self.span.get().days()));
+        self.show(self.span.get().step(self.anchor.get(), direction));
+    }
+
+    /// Opens the day view on the day of a cell of the month grid.
+    fn open_day(&self, cell: i64) {
+        let day = self.range().0 + Duration::days(cell);
+        self.span.set(Span::Day);
+        self.show(day);
     }
 }
 
@@ -492,12 +597,26 @@ pub fn run() -> Result<()> {
         timed: Rc::default(),
         details: RefCell::default(),
         all_day: Rc::default(),
+        month_cells: Rc::default(),
+        month_chips: Rc::default(),
         sidebar: Rc::default(),
     });
     ui.set_days(ModelRc::from(view.days.clone()));
     ui.set_timed(ModelRc::from(view.timed.clone()));
     ui.set_all_day(ModelRc::from(view.all_day.clone()));
+    ui.set_month_cells(ModelRc::from(view.month_cells.clone()));
+    ui.set_month_chips(ModelRc::from(view.month_chips.clone()));
     ui.set_sidebar(ModelRc::from(view.sidebar.clone()));
+    // Monday first, like the week view. 2026-11-16 is a Monday.
+    let monday = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap_or_default();
+    ui.set_weekday_names(ModelRc::from(Rc::new(VecModel::from(
+        (0..7)
+            .map(|offset| {
+                let day = monday + Duration::days(offset);
+                SharedString::from(day.format("%a").to_string().to_uppercase())
+            })
+            .collect::<Vec<_>>(),
+    ))));
 
     let commands = worker::spawn(ui.as_weak());
 
@@ -518,6 +637,19 @@ pub fn run() -> Result<()> {
         move |index| {
             if let Some(span) = Span::ALL.get(index as usize) {
                 view.span.set(*span);
+                view.refresh();
+            }
+        }
+    });
+    ui.on_open_day({
+        let view = view.clone();
+        move |cell| view.open_day(i64::from(cell))
+    });
+    ui.on_month_resized({
+        let view = view.clone();
+        move || {
+            // How many lines fit in a cell changed; only the month view cares.
+            if view.span.get() == Span::Month {
                 view.refresh();
             }
         }
@@ -613,9 +745,33 @@ mod tests {
     #[test]
     fn only_the_week_view_snaps_to_the_start_of_the_week() {
         let wednesday = date("2026-11-18");
-        assert_eq!(Span::Week.first_day(wednesday), date("2026-11-16"));
-        assert_eq!(Span::FourDays.first_day(wednesday), wednesday);
-        assert_eq!(Span::Day.first_day(wednesday), wednesday);
+        assert_eq!(Span::Week.range(wednesday), (date("2026-11-16"), 7));
+        assert_eq!(Span::FourDays.range(wednesday), (wednesday, 4));
+        assert_eq!(Span::Day.range(wednesday), (wednesday, 1));
+    }
+
+    #[test]
+    fn the_month_view_shows_the_whole_weeks_that_cover_the_month() {
+        // November 2026: Sunday the 1st to Monday the 30th, so six weeks.
+        assert_eq!(
+            Span::Month.range(date("2026-11-18")),
+            (date("2026-10-26"), 42)
+        );
+        // February 2027 starts on a Monday and has 28 days: exactly four weeks.
+        assert_eq!(
+            Span::Month.range(date("2027-02-10")),
+            (date("2027-02-01"), 28)
+        );
+        assert_eq!(Span::Month.title(date("2026-11-30")), "November 2026");
+    }
+
+    #[test]
+    fn stepping_moves_one_screenful() {
+        assert_eq!(Span::Week.step(date("2026-11-18"), 1), date("2026-11-25"));
+        assert_eq!(Span::Day.step(date("2026-11-18"), -1), date("2026-11-17"));
+        assert_eq!(Span::Month.step(date("2026-11-18"), 1), date("2026-12-18"));
+        // There is no 31 November.
+        assert_eq!(Span::Month.step(date("2026-12-31"), -1), date("2026-11-30"));
     }
 
     #[test]
