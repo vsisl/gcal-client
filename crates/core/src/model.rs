@@ -32,6 +32,11 @@ pub struct CalendarListEntry {
 }
 
 impl CalendarListEntry {
+    /// Whether this account may create, change and delete events in the calendar.
+    pub fn is_writable(&self) -> bool {
+        matches!(self.access_role.as_deref(), Some("owner" | "writer"))
+    }
+
     /// The name to show: the user's override if set, otherwise the calendar's own name.
     pub fn display_name(&self) -> &str {
         self.summary_override.as_deref().unwrap_or(&self.summary)
@@ -86,6 +91,13 @@ impl EventTime {
     }
 }
 
+/// A guest of an event. Only what the app reads so far.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Attendee {
+    pub email: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Event {
@@ -102,6 +114,9 @@ pub struct Event {
     pub description: Option<String>,
     /// Address of the event in Google's web interface.
     pub html_link: Option<String>,
+    /// Guests, including the organiser when there are any.
+    #[serde(default)]
+    pub attendees: Vec<Attendee>,
     /// RRULE/EXDATE/RDATE lines; present only on the master event of a series.
     #[serde(default)]
     pub recurrence: Vec<String>,

@@ -301,32 +301,7 @@ impl Store {
             )?;
         }
         for item in items {
-            let event: Event = serde_json::from_value(item.clone())?;
-            if event.status == EventStatus::Cancelled && event.recurring_event_id.is_none() {
-                // If it was a series, its changed occurrences go with it; left behind, they
-                // would keep showing as events of their own.
-                tx.execute(
-                    "DELETE FROM events WHERE account_id = ?1 AND calendar_id = ?2
-                     AND (id = ?3 OR recurring_event_id = ?3)",
-                    params![account, calendar_id, event.id],
-                )?;
-                continue;
-            }
-            tx.execute(
-                "INSERT OR REPLACE INTO events
-                 (account_id, calendar_id, id, start_ts, end_ts, is_master, recurring_event_id, json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    account,
-                    calendar_id,
-                    event.id,
-                    event.start_time().map(|t| t.timestamp()),
-                    event.end_time().map(|t| t.timestamp()),
-                    event.is_recurring_master(),
-                    event.recurring_event_id,
-                    item.to_string(),
-                ],
-            )?;
+            save_event(&tx, account, calendar_id, item)?;
         }
         tx.execute(
             "UPDATE calendars SET events_sync_token = ?3 WHERE account_id = ?1 AND id = ?2",
@@ -334,6 +309,50 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Saves one event as Google returned it after this app created or changed it, without
+    /// waiting for the next sync (which will bring the same event again, harmlessly).
+    pub fn apply_event(
+        &mut self,
+        account: AccountId,
+        calendar_id: &str,
+        item: &Value,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        save_event(&tx, account, calendar_id, item)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Forgets an event this app has just deleted at Google, and with a series its changed
+    /// occurrences.
+    pub fn remove_event(&self, account: AccountId, calendar_id: &str, id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM events WHERE account_id = ?1 AND calendar_id = ?2
+             AND (id = ?3 OR recurring_event_id = ?3)",
+            params![account, calendar_id, id],
+        )?;
+        Ok(())
+    }
+
+    /// The complete resource of an event as Google sent it, including the fields this app
+    /// does not read.
+    pub fn event_json(
+        &self,
+        account: AccountId,
+        calendar_id: &str,
+        id: &str,
+    ) -> Result<Option<Value>> {
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT json FROM events WHERE account_id = ?1 AND calendar_id = ?2 AND id = ?3",
+                params![account, calendar_id, id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(json.map(|json| serde_json::from_str(&json)).transpose()?)
     }
 
     /// Events that can appear between two instants (seconds since the Unix epoch): single
@@ -393,6 +412,43 @@ impl Store {
             |row| row.get(0),
         )?)
     }
+}
+
+/// Applies one event resource: a cancelled event is a deletion, except for a cancelled
+/// occurrence of a series, which is kept (see [`Store::apply_events`]).
+fn save_event(
+    tx: &rusqlite::Transaction<'_>,
+    account: AccountId,
+    calendar_id: &str,
+    item: &Value,
+) -> Result<()> {
+    let event: Event = serde_json::from_value(item.clone())?;
+    if event.status == EventStatus::Cancelled && event.recurring_event_id.is_none() {
+        // If it was a series, its changed occurrences go with it; left behind, they
+        // would keep showing as events of their own.
+        tx.execute(
+            "DELETE FROM events WHERE account_id = ?1 AND calendar_id = ?2
+             AND (id = ?3 OR recurring_event_id = ?3)",
+            params![account, calendar_id, event.id],
+        )?;
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT OR REPLACE INTO events
+         (account_id, calendar_id, id, start_ts, end_ts, is_master, recurring_event_id, json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            account,
+            calendar_id,
+            event.id,
+            event.start_time().map(|t| t.timestamp()),
+            event.end_time().map(|t| t.timestamp()),
+            event.is_recurring_master(),
+            event.recurring_event_id,
+            item.to_string(),
+        ],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -582,6 +638,22 @@ mod tests {
             .apply_events(account, "cal", &new, Some("ev-2"), true)
             .unwrap();
         assert_eq!(ids(&store, DAY, DAY + 24 * HOUR), ["new"]);
+    }
+
+    #[test]
+    fn a_single_event_can_be_saved_read_back_and_removed() {
+        let (mut store, account) = store_with_calendar();
+        let mut item = timed("e", "2026-11-16T10:00:00Z", "2026-11-16T11:00:00Z");
+        item["extendedProperties"] = json!({"private": {"k": "v"}});
+        store.apply_event(account, "cal", &item).unwrap();
+        // Fields the app does not read survive.
+        assert_eq!(store.event_json(account, "cal", "e").unwrap(), Some(item));
+        assert_eq!(store.event_json(account, "cal", "other").unwrap(), None);
+        // The calendar's sync token is left alone.
+        assert_eq!(store.calendars().unwrap()[0].events_sync_token, None);
+
+        store.remove_event(account, "cal", "e").unwrap();
+        assert_eq!(store.event_json(account, "cal", "e").unwrap(), None);
     }
 
     #[test]
