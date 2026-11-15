@@ -1,6 +1,8 @@
 //! Authenticated access to the Calendar API for one signed-in account.
 
 use chrono::{DateTime, Utc};
+use reqwest::Method;
+use reqwest::header::IF_MATCH;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -15,6 +17,13 @@ pub enum ApiError {
     /// what it has for that collection and list it again from scratch.
     #[error("the sync token is no longer valid")]
     SyncTokenInvalid,
+    /// HTTP 412: the event was changed elsewhere since the copy the edit was based on. The
+    /// caller must fetch it again and let the user decide.
+    #[error("the event was changed elsewhere in the meantime")]
+    Changed,
+    /// HTTP 404 or 410 on a write: the event (or its calendar) no longer exists.
+    #[error("the event no longer exists")]
+    Gone,
     #[error(transparent)]
     Auth(#[from] AuthError),
     #[error("Google returned HTTP {status}: {body}")]
@@ -146,11 +155,89 @@ impl GoogleClient {
         }
     }
 
+    /// Creates an event from the given resource and returns it as Google stored it.
+    pub async fn insert_event(&self, calendar_id: &str, event: &Value) -> Result<Value, ApiError> {
+        let response = self
+            .send(
+                Method::POST,
+                &["calendars", calendar_id, "events"],
+                &[],
+                Some(event),
+                None,
+            )
+            .await
+            .map_err(gone_if_missing)?;
+        Ok(response.json().await?)
+    }
+
+    /// Changes the given fields of an event and returns the event as Google stored it.
+    ///
+    /// With `etag`, the change is made only if the event still is the version the caller
+    /// has; otherwise the result is [`ApiError::Changed`] and nothing is modified.
+    pub async fn patch_event(
+        &self,
+        calendar_id: &str,
+        event_id: &str,
+        changes: &Value,
+        etag: Option<&str>,
+    ) -> Result<Value, ApiError> {
+        let response = self
+            .send(
+                Method::PATCH,
+                &["calendars", calendar_id, "events", event_id],
+                &[],
+                Some(changes),
+                etag,
+            )
+            .await
+            .map_err(gone_if_missing)?;
+        Ok(response.json().await?)
+    }
+
+    /// Deletes an event. An event that is already gone is reported as [`ApiError::Gone`],
+    /// which a caller wanting it deleted can treat as success.
+    pub async fn delete_event(
+        &self,
+        calendar_id: &str,
+        event_id: &str,
+        etag: Option<&str>,
+    ) -> Result<(), ApiError> {
+        self.send(
+            Method::DELETE,
+            &["calendars", calendar_id, "events", event_id],
+            &[],
+            None,
+            etag,
+        )
+        .await
+        .map_err(gone_if_missing)?;
+        Ok(())
+    }
+
     async fn get<T: serde::de::DeserializeOwned>(
         &self,
         path: &[&str],
         query: &[(&str, &str)],
     ) -> Result<T, ApiError> {
+        let response = self
+            .send(Method::GET, path, query, None, None)
+            .await
+            .map_err(|error| match error {
+                ApiError::Status { status: 410, .. } => ApiError::SyncTokenInvalid,
+                other => other,
+            })?;
+        Ok(response.json().await?)
+    }
+
+    /// Sends one request to the Calendar API and returns the response if it succeeded.
+    async fn send(
+        &self,
+        method: Method,
+        path: &[&str],
+        query: &[(&str, &str)],
+        body: Option<&Value>,
+        if_match: Option<&str>,
+    ) -> Result<reqwest::Response, ApiError> {
         let mut url =
             Url::parse(&self.endpoints.calendar_api).expect("the API address must be a valid URL");
         // Calendar IDs contain characters such as `@` and `#`; pushing segments encodes them.
@@ -161,16 +248,21 @@ impl GoogleClient {
         let mut retried = false;
         loop {
             let token = self.access_token().await?;
-            let response = self
+            let mut request = self
                 .http
-                .get(url.clone())
+                .request(method.clone(), url.clone())
                 .query(query)
-                .bearer_auth(token)
-                .send()
-                .await?;
+                .bearer_auth(token);
+            if let Some(body) = body {
+                request = request.json(body);
+            }
+            if let Some(etag) = if_match {
+                request = request.header(IF_MATCH, etag);
+            }
+            let response = request.send().await?;
             let status = response.status();
             if status.is_success() {
-                return Ok(response.json().await?);
+                return Ok(response);
             }
             if status.as_u16() == 401 && !retried {
                 // The token was revoked or expired early: fetch a new one and try once more.
@@ -178,8 +270,8 @@ impl GoogleClient {
                 *self.access.lock().await = None;
                 continue;
             }
-            if status.as_u16() == 410 {
-                return Err(ApiError::SyncTokenInvalid);
+            if status.as_u16() == 412 {
+                return Err(ApiError::Changed);
             }
             let body = response.text().await.unwrap_or_default();
             return Err(ApiError::Status {
@@ -212,11 +304,23 @@ impl GoogleClient {
     }
 }
 
+/// For writes: a missing event or calendar is its own kind of error.
+fn gone_if_missing(error: ApiError) -> ApiError {
+    match error {
+        ApiError::Status {
+            status: 404 | 410, ..
+        } => ApiError::Gone,
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-    use wiremock::matchers::{header, method, path, query_param, query_param_is_missing};
+    use wiremock::matchers::{
+        body_json, header, method, path, query_param, query_param_is_missing,
+    };
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     async fn client(server: &MockServer) -> GoogleClient {
@@ -291,6 +395,91 @@ mod tests {
 
         let result = client(&server).await.list_calendars(Some("stale")).await;
         assert!(matches!(result, Err(ApiError::SyncTokenInvalid)));
+    }
+
+    #[tokio::test]
+    async fn creates_changes_and_deletes_an_event() {
+        let server = MockServer::start().await;
+        let events = "/calendars/me@example.com/events";
+        Mock::given(method("POST"))
+            .and(path(events))
+            .and(body_json(json!({"summary": "Lunch"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"id": "e1", "etag": "\"1\"", "summary": "Lunch"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("{events}/e1")))
+            .and(header("if-match", "\"1\""))
+            .and(body_json(json!({"summary": "Late lunch"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"id": "e1", "etag": "\"2\"", "summary": "Late lunch"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("{events}/e1")))
+            .and(header("if-match", "\"2\""))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        let created = client
+            .insert_event("me@example.com", &json!({"summary": "Lunch"}))
+            .await
+            .unwrap();
+        assert_eq!(created["id"], "e1");
+        let changed = client
+            .patch_event(
+                "me@example.com",
+                "e1",
+                &json!({"summary": "Late lunch"}),
+                created["etag"].as_str(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed["summary"], "Late lunch");
+        client
+            .delete_event("me@example.com", "e1", changed["etag"].as_str())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_write_reports_a_newer_version_and_a_missing_event() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/calendars/c/events/stale"))
+            .respond_with(ResponseTemplate::new(412))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/calendars/c/events/deleted"))
+            .respond_with(ResponseTemplate::new(410))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/calendars/c/events/unknown"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        let patched = client
+            .patch_event("c", "stale", &json!({"summary": "x"}), Some("\"1\""))
+            .await;
+        assert!(matches!(patched, Err(ApiError::Changed)));
+        for id in ["deleted", "unknown"] {
+            let deleted = client.delete_event("c", id, None).await;
+            assert!(matches!(deleted, Err(ApiError::Gone)), "{id}");
+        }
     }
 
     #[tokio::test]
