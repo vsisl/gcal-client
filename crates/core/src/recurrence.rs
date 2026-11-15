@@ -9,7 +9,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
-use chrono::{DateTime, Duration, NaiveDate, NaiveTime, Utc};
+use chrono::offset::LocalResult;
+use chrono::{DateTime, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use rrule::RRuleSet;
 
 use crate::model::{Event, EventStatus, EventTime};
@@ -26,7 +27,11 @@ pub struct Instance<'a, K> {
 
 /// Upper bound on the occurrences of one series that are worked out and remembered; far
 /// above any real calendar (a daily event reaches it after 179 years).
-const MAX_OCCURRENCES: u16 = u16::MAX;
+const MAX_REMEMBERED: u16 = u16::MAX;
+/// Upper bound on occurrences of one series inside one range. Calendars shared by others
+/// are among the input, and a rule repeating every second must not be able to put tens of
+/// thousands of blocks into one view.
+const MAX_PER_RANGE: u16 = 5000;
 /// How far past the range asked for an endless series is worked out, so that moving on
 /// through the calendar rarely has to do it again.
 const LOOKAHEAD_DAYS: i64 = 400;
@@ -246,11 +251,11 @@ impl Master {
                 window_end + Duration::days(LOOKAHEAD_DAYS)
             };
             let result = if self.finite {
-                set.clone().all(MAX_OCCURRENCES)
+                set.clone().all(MAX_REMEMBERED)
             } else {
                 set.clone()
                     .before(through.with_timezone(&rrule::Tz::UTC))
-                    .all(MAX_OCCURRENCES)
+                    .all(MAX_REMEMBERED)
             };
             if result.limited {
                 *known = Known {
@@ -282,7 +287,7 @@ impl Master {
                 .clone()
                 .after(window_start.with_timezone(&utc))
                 .before(window_end.with_timezone(&utc))
-                .all(MAX_OCCURRENCES);
+                .all(MAX_PER_RANGE);
             let mut dates: Vec<_> = result
                 .dates
                 .into_iter()
@@ -295,6 +300,7 @@ impl Master {
         } else {
             let first = known.dates.partition_point(|date| *date < window_start);
             let past_last = known.dates.partition_point(|date| *date <= window_end);
+            let past_last = past_last.min(first + usize::from(MAX_PER_RANGE));
             &known.dates[first..past_last]
         };
 
@@ -329,6 +335,7 @@ fn rule_set(master: &Event, start: EventTime) -> Option<RRuleSet> {
     // The start is handed over as an instant in its zone, not as local-time text: text
     // cannot tell apart the two 02:30s of the night clocks go back, and the parser rejects
     // such a start outright.
+    let mut start_uncounted = false;
     let first = match start {
         EventTime::AllDay(day) => day_start_utc(day).with_timezone(&rrule::Tz::UTC),
         EventTime::Timed(instant) => {
@@ -338,6 +345,15 @@ fn rule_set(master: &Event, start: EventTime) -> Option<RRuleSet> {
                 .and_then(|s| s.time_zone.as_deref())
                 .and_then(|name| name.parse::<chrono_tz::Tz>().ok())
                 .unwrap_or(chrono_tz::UTC);
+            // On the night clocks go back, the library turns a repeated local time into
+            // the earlier of its two instants. For a series starting at the later one, the
+            // rule's own first occurrence then lies before the start and is dropped
+            // without being counted, so COUNT would yield one occurrence too many.
+            let local = instant.with_timezone(&zone).naive_local();
+            start_uncounted = matches!(
+                zone.from_local_datetime(&local),
+                LocalResult::Ambiguous(_, later) if later.with_timezone(&Utc) == instant
+            );
             instant.with_timezone(&rrule::Tz::Tz(zone))
         }
     };
@@ -345,7 +361,15 @@ fn rule_set(master: &Event, start: EventTime) -> Option<RRuleSet> {
     let lines: Vec<String> = master
         .recurrence
         .iter()
-        .map(|line| normalise_line(line, all_day))
+        .filter_map(|line| {
+            let line = normalise_line(line, all_day);
+            if start_uncounted {
+                // The start itself is added below; the rule supplies the rest.
+                one_fewer(&line)
+            } else {
+                Some(line)
+            }
+        })
         .collect();
     RRuleSet::new(first)
         .set_from_string(&lines.join("\n"))
@@ -355,6 +379,28 @@ fn rule_set(master: &Event, start: EventTime) -> Option<RRuleSet> {
         // extra dates alone. A start the rules also produce comes out twice; the caller
         // removes the duplicate.
         .map(|set| set.rdate(first))
+}
+
+/// The rule with its COUNT lowered by one; `None` when nothing would be left of it. Lines
+/// without a COUNT come back unchanged.
+fn one_fewer(line: &str) -> Option<String> {
+    if !line.starts_with("RRULE") {
+        return Some(line.to_owned());
+    }
+    let mut parts = Vec::new();
+    for part in line.split(';') {
+        // The first part also carries the property name ("RRULE:COUNT=2").
+        let (prefix, field) = match part.split_once(':') {
+            Some((name, field)) => (format!("{name}:"), field),
+            None => (String::new(), part),
+        };
+        match field.strip_prefix("COUNT=").map(str::parse::<u32>) {
+            Some(Ok(count)) if count <= 1 => return None,
+            Some(Ok(count)) => parts.push(format!("{prefix}COUNT={}", count - 1)),
+            _ => parts.push(part.to_owned()),
+        }
+    }
+    Some(parts.join(";"))
 }
 
 /// Rewrites the date-only values Google uses into the date-time forms the parser needs.
@@ -640,6 +686,42 @@ mod tests {
             starts(&[master]),
             [EventTime::Timed(instant("2026-11-22T01:30:00Z"))]
         );
+    }
+
+    #[test]
+    fn count_includes_a_start_in_either_repeated_hour_of_a_clock_change() {
+        // 02:30 happens twice in Prague on 25 October 2026: at UTC+2, then at UTC+1.
+        for (offset, first, second) in [
+            ("+02:00", "2026-10-25T00:30:00Z", "2026-11-01T01:30:00Z"),
+            ("+01:00", "2026-10-25T01:30:00Z", "2026-11-01T01:30:00Z"),
+        ] {
+            let master = event(json!({
+                "id": "m",
+                "start": {"dateTime": format!("2026-10-25T02:30:00{offset}"),
+                          "timeZone": "Europe/Prague"},
+                "end": {"dateTime": format!("2026-10-25T03:00:00{offset}"),
+                        "timeZone": "Europe/Prague"},
+                "recurrence": ["RRULE:FREQ=WEEKLY;COUNT=2"]
+            }));
+            let series = Series::new([((), &master)]);
+            let found: Vec<_> = series
+                .expand(
+                    day_start_utc(date("2026-10-19")),
+                    day_start_utc(date("2026-12-01")),
+                    |()| true,
+                )
+                .into_iter()
+                .map(|i| i.start)
+                .collect();
+            assert_eq!(
+                found,
+                [
+                    EventTime::Timed(instant(first)),
+                    EventTime::Timed(instant(second))
+                ],
+                "{offset}"
+            );
+        }
     }
 
     #[test]
