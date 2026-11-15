@@ -1,8 +1,10 @@
 # gcal-client
 
-A native desktop client for Google Calendar (Rust, Slint, GPLv3; Linux first). It behaves
-like the Google Calendar web interface but shows several Google accounts in one view, as
-the mobile app does. It is open source: every user signs in with their own accounts.
+Google Calendar native client, behaves just like Google calendar web interface but supports multiple Google accounts 
+natively, just like the mobile Google Calendar app does.
+
+Written in Rust with Slint, GPLv3, Linux first. It is open source: every user signs in with
+their own accounts.
 
 Read first: `README.md` (what it does, how to build and run), then
 `plans/i-want-to-create-deep-hamster.md` (design, decisions, milestones M0–M9). The other

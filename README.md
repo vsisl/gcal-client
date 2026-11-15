@@ -1,8 +1,10 @@
 # gcal-client
 
-A native desktop calendar that works with Google Calendar and shows several Google accounts
-(for example personal and work) in one view. It aims to behave like the Google Calendar web
-interface, including its keyboard shortcuts, while being fast and light on memory.
+Google Calendar native client, behaves just like Google calendar web interface but supports multiple Google accounts 
+natively, just like the mobile Google Calendar app does.
+
+Several accounts (for example personal and work) are shown in one view, with the web
+interface's keyboard shortcuts. It aims to be fast and light on memory.
 
 Not affiliated with or endorsed by Google. Google Calendar is a trademark of Google LLC.
 
