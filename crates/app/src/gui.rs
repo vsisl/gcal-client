@@ -1937,10 +1937,19 @@ pub fn run() -> Result<()> {
         // The window keeps its own limits; this only guards against nonsense.
         ui.set_hour_h(height.clamp(20.0, 192.0));
     }
+    // Zooming changes the height many times a second; it is saved once it rests.
+    let zoom_timer = Timer::default();
     ui.on_zoom_changed({
         let view = view.clone();
         move |height| {
-            let _ = view.store.set_setting(HOUR_HEIGHT, &height.to_string());
+            let view = view.clone();
+            zoom_timer.start(
+                TimerMode::SingleShot,
+                StdDuration::from_millis(500),
+                move || {
+                    let _ = view.store.set_setting(HOUR_HEIGHT, &height.to_string());
+                },
+            );
         }
     });
     ui.on_theme_chosen({

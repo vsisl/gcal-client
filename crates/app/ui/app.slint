@@ -676,9 +676,18 @@ export component AppWindow inherits Window {
         root.zoom-changed(root.hour-h / 1px);
     }
 
+    // A step from a key or a button: a tenth.
     function zoom-by(steps: int) {
-        root.set-hour-height(steps > 0 ? root.hour-h * 1.25 : root.hour-h * 0.8);
+        root.set-hour-height(steps > 0 ? root.hour-h * 1.1 : root.hour-h / 1.1);
     }
+
+    // The wheel or two fingers on a touchpad, with Ctrl: in proportion to how far it
+    // was turned. One notch of a wheel is about 60 px, which makes a twelfth.
+    function zoom-wheel(delta: length) {
+        root.set-hour-height(root.hour-h * (1 + Math.max(-90, Math.min(90, delta / 1px)) * 0.0014));
+    }
+    // The height of an hour when two fingers began to pinch.
+    property <length> pinch-start;
     property <length> gutter: 56px;
     property <length> head-h: 80px;
     property <length> bar-h: 22px;
@@ -1305,11 +1314,27 @@ export component AppWindow inherits Window {
                         }
 
                         // Hour grid.
-                        grid := Flickable {
+                        Rectangle {
                             x: 0;
                             y: head-h + strip-h + 1px;
                             width: parent.width;
                             height: parent.height - self.y;
+
+                        // Two fingers moving apart or together zoom, on touch screens (and
+                        // on touchpads where the system passes the gesture on).
+                        ScaleRotateGestureHandler {
+                            started => {
+                                root.pinch-start = root.hour-h;
+                            }
+                            updated => {
+                                root.set-hour-height(root.pinch-start * self.scale);
+                            }
+
+                        grid := Flickable {
+                            x: 0;
+                            y: 0;
+                            width: parent.width;
+                            height: parent.height;
                             // Wheel and touchpad scrolling only; pointer drags are for events.
                             interactive: false;
                             content-width: self.width;
@@ -1323,7 +1348,7 @@ export component AppWindow inherits Window {
                                 height: hour-h * 24;
                                 scroll-event(event) => {
                                     if (event.modifiers.control) {
-                                        root.zoom-by(event.delta-y > 0 ? 1 : -1);
+                                        root.zoom-wheel(event.delta-y);
                                         return accept;
                                     }
                                     reject
@@ -1416,7 +1441,7 @@ export component AppWindow inherits Window {
                                     mouse-cursor: pointer;
                                     scroll-event(event) => {
                                         if (event.modifiers.control) {
-                                            root.zoom-by(event.delta-y > 0 ? 1 : -1);
+                                            root.zoom-wheel(event.delta-y);
                                             return accept;
                                         }
                                         reject
@@ -1549,6 +1574,8 @@ export component AppWindow inherits Window {
                                 border-radius: 6px;
                                 background: Theme.now;
                             }
+                        }
+                        }
                         }
                     }
 
