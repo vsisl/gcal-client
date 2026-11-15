@@ -67,6 +67,19 @@ export struct MonthChip {
     text-color: color,
 }
 
+// One line of the schedule view: an event on one of the days it touches.
+export struct ScheduleRow {
+    instance: int,
+    // The first line of its day carries the date.
+    first-of-day: bool,
+    day-number: string,
+    day-name: string,
+    today: bool,
+    time: string,
+    title: string,
+    color: color,
+}
+
 export struct DayHeader {
     weekday: string,
     number: string,
@@ -154,9 +167,12 @@ export component AppWindow inherits Window {
     in property <[DayHeader]> days;
     // Number of day columns: 1, 4 or 7.
     in property <int> day-count: 7;
-    // Which entry of the view switcher is active: 0 day, 1 week, 2 month, 3 four days.
+    // Which entry of the view switcher is active: 0 day, 1 week, 2 month, 3 four days,
+    // 4 schedule.
     in property <int> view-index: 1;
     property <bool> is-month: root.view-index == 2;
+    property <bool> is-schedule: root.view-index == 4;
+    in property <[ScheduleRow]> schedule;
     // The month view: seven names, one cell per day, one chip per line of an event.
     in property <[string]> weekday-names;
     in property <[MonthCell]> month-cells;
@@ -257,6 +273,10 @@ export component AppWindow inherits Window {
                 root.set-view(3);
                 return accept;
             }
+            if (event.text == "a" || event.text == "5") {
+                root.set-view(4);
+                return accept;
+            }
             if (event.text == "r") {
                 root.sync-now();
                 return accept;
@@ -329,7 +349,7 @@ export component AppWindow inherits Window {
                     max-width: 420px;
                 }
 
-                for label[index] in [@tr("Day"), @tr("Week"), @tr("Month"), @tr("4 days")]: VerticalLayout {
+                for label[index] in [@tr("Day"), @tr("Week"), @tr("Month"), @tr("4 days"), @tr("Schedule")]: VerticalLayout {
                     alignment: center;
                     TextButton {
                         text: label;
@@ -490,7 +510,7 @@ export component AppWindow inherits Window {
 
                     // The day, 4-day and week views: day columns under an all-day strip.
                     Rectangle {
-                        visible: !root.is-month;
+                        visible: !root.is-month && !root.is-schedule;
 
                         // Day headers.
                         for day[d] in root.days: Rectangle {
@@ -825,6 +845,108 @@ export component AppWindow inherits Window {
                                 color: chip.filled ? chip.text-color : Theme.text;
                                 vertical-alignment: center;
                                 overflow: elide;
+                            }
+                        }
+                    }
+                    // The schedule: the coming days' events as a list.
+                    Flickable {
+                        visible: root.is-schedule;
+                        interactive: false;
+                        content-height: agenda.preferred-height;
+
+                        agenda := VerticalLayout {
+                            alignment: start;
+                            padding-top: 8px;
+                            padding-bottom: 16px;
+
+                            for row in root.schedule: Rectangle {
+                                height: 40px;
+                                background: row-touch.has-hover ? Theme.hover : transparent;
+                                accessible-role: list-item;
+                                accessible-label: "\{row.day-number} \{row.day-name}, \{row.time}, \{row.title}";
+                                accessible-action-default => {
+                                    root.show-detail(row.instance, self.absolute-position.x + 200px, self.absolute-position.y);
+                                }
+
+                                if row.first-of-day: Rectangle {
+                                    x: 0;
+                                    y: 0;
+                                    width: parent.width;
+                                    height: 1px;
+                                    background: Theme.line;
+                                }
+
+                                row-touch := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        root.show-detail(row.instance, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                    }
+                                }
+
+                                if row.first-of-day: Rectangle {
+                                    x: 16px;
+                                    y: (parent.height - self.height) / 2;
+                                    width: 32px;
+                                    height: 32px;
+                                    border-radius: 16px;
+                                    background: row.today ? Theme.accent : transparent;
+
+                                    Text {
+                                        text: row.day-number;
+                                        font-size: 18px;
+                                        color: row.today ? white : Theme.text;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                if row.first-of-day: Text {
+                                    x: 56px;
+                                    width: 80px;
+                                    height: parent.height;
+                                    text: row.day-name;
+                                    font-size: 11px;
+                                    font-weight: 500;
+                                    color: row.today ? Theme.accent : Theme.text-dim;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle {
+                                    x: 150px;
+                                    y: (parent.height - self.height) / 2;
+                                    width: 12px;
+                                    height: 12px;
+                                    border-radius: 6px;
+                                    background: row.color;
+                                }
+
+                                Text {
+                                    x: 178px;
+                                    width: 130px;
+                                    height: parent.height;
+                                    text: row.time;
+                                    font-size: 14px;
+                                    color: Theme.text;
+                                    vertical-alignment: center;
+                                }
+
+                                Text {
+                                    x: 316px;
+                                    width: parent.width - self.x - 16px;
+                                    height: parent.height;
+                                    text: row.title == "" ? @tr("(No title)") : row.title;
+                                    font-size: 14px;
+                                    font-weight: 500;
+                                    color: Theme.text;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                            if root.schedule.length == 0: Text {
+                                height: 80px;
+                                text: @tr("Nothing planned in these days.");
+                                font-size: 14px;
+                                color: Theme.text-dim;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
                             }
                         }
                     }

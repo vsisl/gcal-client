@@ -3,6 +3,7 @@
 pub mod model;
 pub mod month;
 pub mod recurrence;
+pub mod schedule;
 pub mod text;
 pub mod week;
 

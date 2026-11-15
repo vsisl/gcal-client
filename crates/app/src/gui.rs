@@ -10,6 +10,7 @@ use chrono::{DateTime, Datelike, Duration, Months, NaiveDate, Timelike, Utc};
 use chrono_tz::Tz;
 use gcal_core::month::{MonthLayout, layout_month};
 use gcal_core::recurrence::expand;
+use gcal_core::schedule::{DayPart, schedule};
 use gcal_core::text::plain_text;
 use gcal_core::week::{WeekLayout, layout_days, local_day_start};
 use gcal_core::{CalendarListEntry, Event, EventTime};
@@ -24,6 +25,8 @@ slint::include_modules!();
 /// How often changes are fetched from Google while the window is open. (Google can only
 /// push changes to a public web server, so a desktop app has to ask.)
 const SYNC_INTERVAL: StdDuration = StdDuration::from_secs(5 * 60);
+/// How many days ahead the schedule view lists.
+const SCHEDULE_DAYS: i64 = 30;
 /// Hour at the top of the grid when the window opens, like the web interface.
 const FIRST_VISIBLE_HOUR: i32 = 7;
 const FALLBACK_COLOR: Color = Color::from_rgb_u8(0x03, 0x9b, 0xe5);
@@ -99,11 +102,19 @@ enum Span {
     Week,
     Month,
     FourDays,
+    /// A list of the coming days' events.
+    Schedule,
 }
 
 impl Span {
     /// The order used by the interface's view switcher and the number keys, as on the web.
-    const ALL: [Span; 4] = [Span::Day, Span::Week, Span::Month, Span::FourDays];
+    const ALL: [Span; 5] = [
+        Span::Day,
+        Span::Week,
+        Span::Month,
+        Span::FourDays,
+        Span::Schedule,
+    ];
 
     /// The first day shown and the number of days, when the user is looking at `anchor`.
     /// The week view snaps to the start of the week, the month view shows the whole weeks
@@ -112,6 +123,7 @@ impl Span {
         match self {
             Span::Day => (anchor, 1),
             Span::FourDays => (anchor, 4),
+            Span::Schedule => (anchor, SCHEDULE_DAYS),
             Span::Week => (week_start_of(anchor), 7),
             Span::Month => {
                 let first = week_start_of(anchor.with_day(1).unwrap_or(anchor));
@@ -254,6 +266,7 @@ struct View {
     all_day: Rc<VecModel<AllDayItem>>,
     month_cells: Rc<VecModel<MonthCell>>,
     month_chips: Rc<VecModel<MonthChip>>,
+    schedule: Rc<VecModel<ScheduleRow>>,
     sidebar: Rc<VecModel<SidebarRow>>,
 }
 
@@ -304,13 +317,14 @@ impl View {
         let span = self.span.get();
         let (week_start, days) = self.range();
         let is_month = span == Span::Month;
+        let is_schedule = span == Span::Schedule;
         let today = self.today();
         ui.set_view_index(Span::ALL.iter().position(|s| *s == span).unwrap_or(0) as i32);
         self.drawn_today.set(Some(today));
         ui.set_period_title(span.title(self.anchor.get()).into());
         if is_month {
             ui.set_month_weeks((days / 7) as i32);
-        } else {
+        } else if !is_schedule {
             ui.set_day_count(days as i32);
             patch(
                 &self.days,
@@ -382,8 +396,8 @@ impl View {
             to,
         );
         let spans: Vec<_> = instances.iter().map(|i| (i.start, i.end)).collect();
-        // Only one of the two grids is on screen; the other one's models are emptied.
-        let layout = if is_month {
+        // Only one of the views is on screen; the models of the others are emptied.
+        let layout = if is_month || is_schedule {
             WeekLayout::default()
         } else {
             layout_days(&spans, week_start, days, self.zone)
@@ -412,6 +426,43 @@ impl View {
             let instance = &instances[index];
             event_color(instance.event, shown[&instance.key])
         };
+
+        let entries = if is_schedule {
+            schedule(&spans, week_start, days, self.zone)
+        } else {
+            Vec::new()
+        };
+        let mut previous_day = None;
+        patch(
+            &self.schedule,
+            entries
+                .iter()
+                .map(|entry| {
+                    let day = week_start + Duration::days(i64::from(entry.day));
+                    let first_of_day = previous_day.replace(entry.day) != Some(entry.day);
+                    let time = match (entry.part, spans[entry.index]) {
+                        (DayPart::Whole, (EventTime::Timed(start), EventTime::Timed(end))) => {
+                            format!("{} – {}", clock(start, self.zone), clock(end, self.zone))
+                        }
+                        (DayPart::Starts, (EventTime::Timed(start), _)) => clock(start, self.zone),
+                        (DayPart::Ends, (_, EventTime::Timed(end))) => {
+                            format!("Until {}", clock(end, self.zone))
+                        }
+                        _ => "All day".to_owned(),
+                    };
+                    ScheduleRow {
+                        instance: entry.index as i32,
+                        first_of_day,
+                        day_number: day.day().to_string().into(),
+                        day_name: day.format("%b, %a").to_string().to_uppercase().into(),
+                        today: day == today,
+                        time: time.into(),
+                        title: title(entry.index),
+                        color: color(entry.index),
+                    }
+                })
+                .collect(),
+        );
         patch(
             &self.timed,
             layout
@@ -543,7 +594,8 @@ impl View {
         let now = Utc::now().with_timezone(&self.zone);
         let (first, days) = self.range();
         let offset = (now.date_naive() - first).num_days();
-        if self.span.get() != Span::Month && (0..days).contains(&offset) {
+        let has_columns = !matches!(self.span.get(), Span::Month | Span::Schedule);
+        if has_columns && (0..days).contains(&offset) {
             ui.set_now_day(offset as i32);
             ui.set_now_min((now.hour() * 60 + now.minute()) as i32);
         } else {
@@ -602,6 +654,7 @@ pub fn run() -> Result<()> {
         all_day: Rc::default(),
         month_cells: Rc::default(),
         month_chips: Rc::default(),
+        schedule: Rc::default(),
         sidebar: Rc::default(),
     });
     ui.set_days(ModelRc::from(view.days.clone()));
@@ -609,6 +662,7 @@ pub fn run() -> Result<()> {
     ui.set_all_day(ModelRc::from(view.all_day.clone()));
     ui.set_month_cells(ModelRc::from(view.month_cells.clone()));
     ui.set_month_chips(ModelRc::from(view.month_chips.clone()));
+    ui.set_schedule(ModelRc::from(view.schedule.clone()));
     ui.set_sidebar(ModelRc::from(view.sidebar.clone()));
     // Monday first, like the week view. 2026-11-16 is a Monday.
     let monday = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap_or_default();
