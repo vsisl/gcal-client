@@ -1,7 +1,7 @@
 //! The window: turns the cache into what the week view shows and wires up its controls.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::time::Duration as StdDuration;
 
@@ -11,7 +11,7 @@ use chrono_tz::Tz;
 use gcal_core::month::{MonthLayout, layout_month};
 use gcal_core::recurrence::{
     Series, end_series_before, occurrences_before, remaining_series, shift_weekdays,
-    single_instance,
+    single_instance, split_dates,
 };
 use gcal_core::schedule::{DayPart, schedule};
 use gcal_core::text::plain_text;
@@ -352,6 +352,7 @@ fn plan_drag(
                 series_id: occurrence.series_id.clone(),
                 original_start: occurrence.original_start,
                 known_id: occurrence.changed.then(|| target.event_id.clone()),
+                etag: target.etag.clone().filter(|_| occurrence.changed),
                 changes: time_changes(&resource, start, end),
             },
             Some(UndoKind::Occurrence(time_changes(
@@ -367,7 +368,12 @@ fn plan_drag(
         // The series is split: it ends before this occurrence, and a copy of it starts
         // at the occurrence's new time with what was left of its rule.
         let earlier = occurrences_before(&master, occurrence.original_start);
-        let rules = shift_weekdays(&remaining_series(&master.recurrence, earlier), drag.days);
+        let left = split_dates(
+            &remaining_series(&master.recurrence, earlier),
+            occurrence.original_start,
+            true,
+        );
+        let rules = shift_weekdays(&left, drag.days);
         let mut copy = resource.clone();
         let new_times = time_changes(&resource, start, end);
         copy["start"] = new_times["start"].clone();
@@ -378,6 +384,7 @@ fn plan_drag(
                 series_id: master.id.clone(),
                 etag: master.etag.clone(),
                 recurrence: end_series_before(&master.recurrence, occurrence.original_start),
+                old_recurrence: master.recurrence.clone(),
                 resource: copy,
             },
             // Taking this back would mean deleting the new series and restoring the
@@ -539,6 +546,7 @@ fn plan_deletion(
                 series_id: occurrence.series_id.clone(),
                 original_start: occurrence.original_start,
                 known_id: occurrence.changed.then(|| target.event_id.clone()),
+                etag: target.etag.clone().filter(|_| occurrence.changed),
             },
             // Google keeps a deleted occurrence as a cancelled event.
             UndoKind::Occurrence(serde_json::json!({ "status": "confirmed" })),
@@ -582,6 +590,12 @@ struct Editing {
     target: Option<Target>,
     opened: Form,
     kept: Kept,
+    /// The event, and the series it belongs to, as they were when the editor opened.
+    /// What is saved is a change to these versions: should a sync bring newer ones
+    /// while the editor is open, Google refuses the change rather than have it
+    /// overwrite something the user never saw.
+    own: Option<serde_json::Value>,
+    series: Option<serde_json::Value>,
 }
 
 /// What the editor was closed with.
@@ -595,6 +609,9 @@ struct Saved {
     /// All fields as the form was opened, and as it was saved.
     before: serde_json::Value,
     after: serde_json::Value,
+    /// The event and its series as they were when the editor opened.
+    own: Option<serde_json::Value>,
+    series: Option<serde_json::Value>,
 }
 
 fn to_window(form: &Form) -> EditorForm {
@@ -681,6 +698,7 @@ fn plan_form(
                 series_id: occurrence.series_id.clone(),
                 original_start: occurrence.original_start,
                 known_id: occurrence.changed.then(|| target.event_id.clone()),
+                etag: target.etag.clone().filter(|_| occurrence.changed),
                 changes,
             },
             Some(UndoKind::Occurrence(was)),
@@ -706,12 +724,14 @@ fn plan_form(
                 series_id: master.id.clone(),
                 etag: master.etag.clone(),
                 recurrence: end_series_before(&master.recurrence, occurrence.original_start),
+                old_recurrence: master.recurrence.clone(),
                 resource: editor::following_series(
                     &resource,
                     &saved.changes,
                     &saved.after,
                     earlier,
                     days,
+                    occurrence.original_start,
                 ),
             },
             None,
@@ -719,8 +739,8 @@ fn plan_form(
     }
     let changes = editor::for_series(
         &saved.changes,
-        &saved.form,
-        &saved.opened,
+        &saved.before,
+        &saved.after,
         &kept,
         &master,
         zone,
@@ -738,11 +758,29 @@ fn plan_form(
     )))
 }
 
-/// What undoing a deletion needs.
+/// What undoing a change needs.
 struct Undo {
     account: AccountId,
     calendar_id: String,
     kind: UndoKind,
+    /// The version the change left the event in, once the worker has said. The undo
+    /// is then made only if nothing else changed the event since.
+    etag: Option<String>,
+}
+
+/// A change sent to the worker and not answered yet. The worker makes changes one at
+/// a time in the order they were sent, so its answers match these in order.
+struct Pending {
+    undo: Option<Undo>,
+    /// For a new event: what to show again should it not be created.
+    retry: Option<Retry>,
+}
+
+/// A new event as it was sent, to give back what was typed if creating it fails.
+struct Retry {
+    form: Form,
+    calendar: usize,
+    draft: Draft,
 }
 
 #[derive(Debug, PartialEq)]
@@ -763,6 +801,7 @@ enum UndoKind {
 }
 
 /// A new event being typed in.
+#[derive(Clone)]
 struct Draft {
     start: EventTime,
     end: EventTime,
@@ -842,8 +881,12 @@ struct View {
     /// A change to a repeating event while the window asks how much of the series it is
     /// meant for.
     asked: RefCell<Option<Asked>>,
-    /// Where the event being created goes, to take the creation back.
-    creating: RefCell<Option<(AccountId, String)>>,
+    /// Changes the worker has not answered yet, oldest first.
+    pending: RefCell<VecDeque<Pending>>,
+    /// Counts the redraws from the cache. The window notes it when a drag starts and
+    /// drops the drag if it has changed by the end: the dragged block may by then stand
+    /// for another event.
+    generation: Cell<i32>,
     /// The event the editor is open for.
     editing: RefCell<Option<Editing>>,
     /// Hides the message about the last change after a while.
@@ -1213,9 +1256,14 @@ impl View {
             })
             .collect();
         self.targets.replace(targets);
-        // What they described may have moved or gone.
+        self.generation.set(self.generation.get().wrapping_add(1));
+        ui.set_generation(self.generation.get());
+        // What they described may have moved or gone. The question about a change from
+        // the editor stays: that change carries its event with it.
         ui.set_detail_visible(false);
-        ui.set_delete_ask_visible(false);
+        if !matches!(*self.asked.borrow(), Some(Asked::Form(_))) {
+            ui.set_delete_ask_visible(false);
+        }
         // A drag refers to an instance on screen, which may now be another one. An
         // edit from the editor carries its event with it and stays.
         if matches!(*self.asked.borrow(), Some(Asked::Drag(_))) {
@@ -1336,11 +1384,24 @@ impl View {
         let Some((deletion, kind)) = plan_deletion(&target, scope, own, series) else {
             return;
         };
-        self.undo.replace(Some(Undo {
-            account: target.account,
-            calendar_id: target.calendar_id.clone(),
-            kind,
-        }));
+        // A whole series is brought back from its own resource, which does not hold
+        // what was changed or deleted in single occurrences. With such occurrences the
+        // undo would bring back another schedule than the one deleted; none is offered.
+        let incomplete = matches!(kind, UndoKind::Recreate(_))
+            && target.occurrence.as_ref().is_some_and(|occurrence| {
+                self.store
+                    .has_occurrences(target.account, &target.calendar_id, &occurrence.series_id)
+                    .unwrap_or(true)
+            });
+        self.pending.borrow_mut().push_back(Pending {
+            undo: (!incomplete).then(|| Undo {
+                account: target.account,
+                calendar_id: target.calendar_id.clone(),
+                kind,
+                etag: None,
+            }),
+            retry: None,
+        });
         if let Some(ui) = self.ui.upgrade() {
             ui.set_detail_visible(false);
             ui.set_delete_ask_visible(false);
@@ -1404,11 +1465,15 @@ impl View {
 
     /// Sends a change to Google and remembers how to take it back.
     fn send_edit(&self, target: &Target, edit: Edit, undo: Option<UndoKind>) {
-        self.undo.replace(undo.map(|kind| Undo {
-            account: target.account,
-            calendar_id: target.calendar_id.clone(),
-            kind,
-        }));
+        self.pending.borrow_mut().push_back(Pending {
+            undo: undo.map(|kind| Undo {
+                account: target.account,
+                calendar_id: target.calendar_id.clone(),
+                kind,
+                etag: None,
+            }),
+            retry: None,
+        });
         if let Some(ui) = self.ui.upgrade() {
             ui.set_toast(SharedString::new());
         }
@@ -1451,10 +1516,13 @@ impl View {
         };
         // An unchanged occurrence is described by its series.
         let changed = target.occurrence.as_ref().is_none_or(|o| o.changed);
-        let Some(resource) = (if changed { own } else { series }) else {
+        let Some(resource) = (if changed { own.clone() } else { series.clone() }) else {
             return;
         };
-        let (form, kept) = editor::form_of(&resource, target.start, target.end, self.zone);
+        let (mut form, mut kept) = editor::form_of(&resource, target.start, target.end, self.zone);
+        if let (true, Some(series)) = (target.occurrence.is_some() && changed, &series) {
+            editor::adopt_series_rule(&mut form, &mut kept, series, self.zone);
+        }
         let detail = self.details.borrow().get(instance).cloned();
         let calendar_color = {
             let loaded = self.loaded.borrow();
@@ -1468,6 +1536,10 @@ impl View {
         ui.set_editor_new(false);
         ui.set_editor_calendar_name(detail.map(|d| d.calendar).unwrap_or_default());
         self.show_editor(&ui, form, kept, Some(target), calendar_color);
+        if let Some(editing) = self.editing.borrow_mut().as_mut() {
+            editing.own = own;
+            editing.series = series;
+        }
     }
 
     /// Opens the editor for the new event of the quick card, with what was typed there.
@@ -1508,6 +1580,8 @@ impl View {
             target,
             opened: form,
             kept,
+            own: None,
+            series: None,
         }));
         ui.set_detail_visible(false);
         ui.set_editor_visible(true);
@@ -1535,13 +1609,15 @@ impl View {
                 return;
             };
             let _ = self.store.set_setting(NEW_EVENT_CALENDAR, &key);
-            self.creating.replace(Some((account, calendar_id.clone())));
+            let Some(draft) = self.draft.take() else {
+                return;
+            };
+            self.creating(account, &calendar_id, form, calendar, draft);
             let _ = self.commands.send(Command::CreateEvent {
                 account,
                 calendar_id,
                 resource: editor::creation(after),
             });
-            self.draft.take();
             return self.close_editor(&ui);
         };
         let before = match editor::fields(&editing.opened, &editing.kept, self.zone) {
@@ -1561,6 +1637,8 @@ impl View {
             changes,
             before,
             after,
+            own: editing.own,
+            series: editing.series,
         };
         if saved.target.occurrence.is_some() {
             self.asked.replace(Some(Asked::Form(Box::new(saved))));
@@ -1577,11 +1655,13 @@ impl View {
 
     /// Sends what the editor changed, for as much of a series as was chosen.
     fn send_form(&self, saved: Saved, scope: Scope) {
-        let (own, series) = match self.resources(&saved.target) {
-            Ok(resources) => resources,
-            Err(error) => return self.show_error(&error),
-        };
-        match plan_form(&saved, scope, own, series, self.zone) {
+        match plan_form(
+            &saved,
+            scope,
+            saved.own.clone(),
+            saved.series.clone(),
+            self.zone,
+        ) {
             Ok(Some((edit, undo))) => self.send_edit(&saved.target, edit, undo),
             Ok(None) => {}
             Err(problem) => {
@@ -1635,61 +1715,101 @@ impl View {
         }
     }
 
-    /// The worker has created the event that was asked for last: say so, and offer to
-    /// take it back.
-    fn event_created(&self, id: &str) {
-        let undo = self.creating.take().map(|(account, calendar_id)| Undo {
-            account,
-            calendar_id,
-            kind: UndoKind::Delete(id.to_owned()),
+    /// Notes a new event as sent: how to take it back once it exists, and what to show
+    /// again should it not come into being.
+    fn creating(
+        &self,
+        account: AccountId,
+        calendar_id: &str,
+        form: Form,
+        calendar: usize,
+        draft: Draft,
+    ) {
+        self.pending.borrow_mut().push_back(Pending {
+            undo: Some(Undo {
+                account,
+                calendar_id: calendar_id.to_owned(),
+                // Which event, the worker says when it has created it.
+                kind: UndoKind::Delete(String::new()),
+                etag: None,
+            }),
+            retry: Some(Retry {
+                form,
+                calendar,
+                draft,
+            }),
+        });
+    }
+
+    /// The worker has answered the oldest change still waiting. Makes its undo the one
+    /// on offer, completed with the event `id` and version `etag` the worker names,
+    /// and says whether there is one; hands back what a failed creation was made from.
+    fn answered(&self, ok: bool, id: &str, etag: &str) -> (bool, Option<Retry>) {
+        let Some(Pending { undo, retry }) = self.pending.borrow_mut().pop_front() else {
+            return (false, None);
+        };
+        if !ok {
+            return (false, retry);
+        }
+        let undo = undo.and_then(|mut undo| {
+            undo.etag = (!etag.is_empty()).then(|| etag.to_owned());
+            undo.kind = match undo.kind {
+                // These wait to learn which event it is; without that, no undo.
+                UndoKind::Occurrence(_) | UndoKind::Delete(_) if id.is_empty() => return None,
+                UndoKind::Occurrence(changes) => UndoKind::Patch {
+                    event_id: id.to_owned(),
+                    changes,
+                },
+                UndoKind::Delete(_) => UndoKind::Delete(id.to_owned()),
+                complete => complete,
+            };
+            Some(undo)
         });
         let can_undo = undo.is_some();
         self.undo.replace(undo);
-        self.show_toast("Event saved", can_undo);
+        (can_undo, None)
+    }
+
+    /// The worker has answered the creation of an event: say so and offer to take it
+    /// back, or give back what was typed.
+    fn event_created(&self, created: bool, id: &str, etag: &str) {
+        let (can_undo, retry) = self.answered(created, id, etag);
+        if created {
+            return self.show_toast("Event saved", can_undo);
+        }
+        // A dialog says why. The editor comes back with everything that was entered.
+        let (Some(retry), Some(ui)) = (retry, self.ui.upgrade()) else {
+            return;
+        };
+        let color = ui
+            .get_draft_calendars()
+            .row_data(retry.calendar)
+            .map_or(FALLBACK_COLOR, |c| c.color);
+        self.draft.replace(Some(retry.draft));
+        ui.set_editor_new(true);
+        ui.set_draft_calendar(retry.calendar as i32);
+        self.show_editor(&ui, retry.form, Kept::default(), None, color);
     }
 
     /// The worker has answered a change. `occurrence` is the event it was made to, if
-    /// that was one occurrence of a series.
-    fn change_finished(&self, changed: bool, occurrence: &str) {
+    /// that was one occurrence of a series, and `etag` the version the event now has.
+    fn change_finished(&self, changed: bool, occurrence: &str, etag: &str) {
+        let (can_undo, _) = self.answered(changed, occurrence, etag);
         if changed {
-            let can_undo = self.name_occurrence(occurrence);
             self.show_toast("Event saved", can_undo);
         } else {
             // A dialog says why. Put the event back where it is.
-            self.undo.take();
             self.refresh();
         }
-    }
-
-    /// Completes an undo that was waiting to learn which event an occurrence is, and
-    /// says whether there is something to undo.
-    fn name_occurrence(&self, occurrence: &str) -> bool {
-        let mut undo = self.undo.borrow_mut();
-        if let Some(Undo { kind, .. }) = undo.as_mut()
-            && let UndoKind::Occurrence(changes) = kind
-        {
-            if occurrence.is_empty() {
-                undo.take();
-            } else {
-                *kind = UndoKind::Patch {
-                    event_id: occurrence.to_owned(),
-                    changes: changes.take(),
-                };
-            }
-        }
-        undo.is_some()
     }
 
     /// The worker has answered a deletion: offer to undo it, for a while. `occurrence`
     /// is the event that was removed, if it was one occurrence of a series.
     fn delete_finished(&self, deleted: bool, occurrence: &str) {
-        if !deleted {
-            // A dialog says why; there is nothing to undo.
-            self.undo.take();
-            return;
+        let (can_undo, _) = self.answered(deleted, occurrence, "");
+        if deleted {
+            self.show_toast("Event deleted", can_undo);
         }
-        let can_undo = self.name_occurrence(occurrence);
-        self.show_toast("Event deleted", can_undo);
     }
 
     /// Says what just happened, for a while; with "Undo" if it can be taken back.
@@ -1821,11 +1941,14 @@ impl View {
         };
         // Remembered for the next new event; failing to remember is no reason not to save.
         let _ = self.store.set_setting(NEW_EVENT_CALENDAR, &key);
-        self.creating.replace(Some((account, calendar_id.clone())));
+        let resource = event_resource(title, draft.start, draft.end, self.zone);
+        let mut form = editor::new_form(draft.start, draft.end, self.zone);
+        form.title = title.to_owned();
+        self.creating(account, &calendar_id, form, calendar, draft);
         let _ = self.commands.send(Command::CreateEvent {
             account,
             calendar_id,
-            resource: event_resource(title, draft.start, draft.end, self.zone),
+            resource,
         });
     }
 
@@ -1838,6 +1961,7 @@ impl View {
             account,
             calendar_id,
             kind,
+            etag,
         }) = self.undo.take()
         else {
             return;
@@ -1851,16 +1975,14 @@ impl View {
             UndoKind::Delete(event_id) => Command::DeleteEvent {
                 account,
                 calendar_id,
-                deletion: Deletion::Event {
-                    event_id,
-                    etag: None,
-                },
+                deletion: Deletion::Event { event_id, etag },
                 notify: false,
             },
             UndoKind::Patch { event_id, changes } => Command::PatchEvent {
                 account,
                 calendar_id,
                 event_id,
+                etag,
                 changes,
             },
             // The worker has not said which occurrence it was.
@@ -1898,7 +2020,8 @@ pub fn run() -> Result<()> {
         undo: RefCell::default(),
         asked: RefCell::default(),
         editing: RefCell::default(),
-        creating: RefCell::default(),
+        pending: RefCell::default(),
+        generation: Cell::new(0),
         toast_timer: Timer::default(),
         commands: commands.clone(),
         all_day: Rc::default(),
@@ -1995,7 +2118,7 @@ pub fn run() -> Result<()> {
     });
     ui.on_change_finished({
         let view = view.clone();
-        move |changed, occurrence| view.change_finished(changed, &occurrence)
+        move |changed, occurrence, etag| view.change_finished(changed, &occurrence, &etag)
     });
     ui.on_editor_requested({
         let view = view.clone();
@@ -2038,7 +2161,7 @@ pub fn run() -> Result<()> {
     });
     ui.on_event_created({
         let view = view.clone();
-        move |id| view.event_created(&id)
+        move |created, id, etag| view.event_created(created, &id, &etag)
     });
     ui.on_undo({
         let view = view.clone();
@@ -2442,6 +2565,7 @@ mod tests {
                     series_id: "m".into(),
                     original_start: instant("2026-11-23T10:00:00Z"),
                     known_id: None,
+                    etag: None,
                     changes: moved.clone(),
                 },
                 Some(UndoKind::Occurrence(was)),
@@ -2480,6 +2604,7 @@ mod tests {
             etag,
             recurrence,
             resource,
+            ..
         } = edit
         else {
             panic!("not a split");
@@ -2596,6 +2721,7 @@ mod tests {
                     series_id: "m".into(),
                     original_start: third.original_start,
                     known_id: None,
+                    etag: None,
                 },
                 UndoKind::Occurrence(json!({"status": "confirmed"})),
             ))

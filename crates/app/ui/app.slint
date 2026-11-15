@@ -555,7 +555,13 @@ export component AppWindow inherits Window {
     // many minutes. The worker answers with change-finished.
     callback event-moved(int, int, int);
     callback event-resized(int, int);
-    callback change-finished(bool, string);
+    // Whether it was made, the occurrence it was made to if it was a single one, and
+    // the version the event now has.
+    callback change-finished(bool, string, string);
+    // Counted up by Rust whenever the views are redrawn from the cache. A drag notes it
+    // at its start and is dropped if it has changed by its end: the block dragged may
+    // then stand for another event.
+    in property <int> generation;
     // A repeating event was dragged: the question card asks how much of the series is
     // meant and answers with edit-scope-chosen (0 this, 1 this and following, 2 all).
     property <bool> ask-edit;
@@ -607,8 +613,9 @@ export component AppWindow inherits Window {
     callback draft-requested(int, int, bool, int);
     // Title and the position of the chosen calendar.
     callback draft-save(string, int);
-    // The worker created an event; its identifier allows taking that back.
-    callback event-created(string);
+    // The worker's answer to creating an event: whether it exists now, and its
+    // identifier and version, which allow taking it back.
+    callback event-created(bool, string, string);
     in-out property <bool> draft-visible;
     in property <string> draft-when;
     in property <[DraftCalendar]> draft-calendars;
@@ -704,30 +711,9 @@ export component AppWindow inherits Window {
 
     keys := FocusScope {
         key-pressed(event) => {
-            if (root.editor-visible) {
-                // Keys its fields did not take. Everything else waits until it closes.
-                if (event.text == Key.Escape) {
-                    root.editor-visible = false;
-                } else if (event.modifiers.control && (event.text == "s" || event.text == Key.Return)) {
-                    root.editor-save(root.editor, root.draft-calendar);
-                }
-                return accept;
-            }
-            if (event.modifiers.control && (event.text == "+" || event.text == "=")) {
-                root.zoom-by(1);
-                return accept;
-            }
-            if (event.modifiers.control && event.text == "-") {
-                root.zoom-by(-1);
-                return accept;
-            }
-            if (event.modifiers.control && event.text == "0") {
-                root.set-hour-height(48px);
-                return accept;
-            }
-            if (event.modifiers.control || event.modifiers.alt || event.modifiers.meta) {
-                return reject;
-            }
+            // What is open on top takes the keys, and nothing behind it does: a key
+            // meant for a card must never act on the calendar underneath (Delete with
+            // an event's details open behind the settings would delete that event).
             if (root.notice != "") {
                 // The dialog is all there is until it is dismissed.
                 if (event.text == Key.Escape || event.text == Key.Return) {
@@ -748,16 +734,51 @@ export component AppWindow inherits Window {
                 }
                 return accept;
             }
-            if (event.text == Key.Escape && root.settings-visible) {
-                root.settings-visible = false;
+            if (root.editor-visible) {
+                // Keys its fields did not take.
+                if (event.text == Key.Escape) {
+                    root.editor-visible = false;
+                } else if (event.modifiers.control && (event.text == "s" || event.text == Key.Return)) {
+                    root.editor-save(root.editor, root.draft-calendar);
+                }
+                return accept;
+            }
+            if (root.draft-visible) {
+                // Keys its title did not take.
+                if (event.text == Key.Escape) {
+                    root.close-draft();
+                }
+                return accept;
+            }
+            if (event.modifiers.control && (event.text == "+" || event.text == "=")) {
+                root.zoom-by(1);
+                return accept;
+            }
+            if (event.modifiers.control && event.text == "-") {
+                root.zoom-by(-1);
+                return accept;
+            }
+            if (event.modifiers.control && event.text == "0") {
+                root.set-hour-height(48px);
+                return accept;
+            }
+            if (event.modifiers.control || event.modifiers.alt || event.modifiers.meta) {
+                return reject;
+            }
+            if (root.settings-visible) {
+                if (event.text == Key.Escape || event.text == "s") {
+                    root.settings-visible = false;
+                }
+                return accept;
+            }
+            if (root.help-visible) {
+                if (event.text == Key.Escape || event.text == "?") {
+                    root.help-visible = false;
+                }
                 return accept;
             }
             if (event.text == "s") {
-                root.settings-visible = !root.settings-visible;
-                return accept;
-            }
-            if (event.text == Key.Escape && root.help-visible) {
-                root.help-visible = false;
+                root.settings-visible = true;
                 return accept;
             }
             if (event.text == Key.Escape && root.detail-visible) {
@@ -1254,6 +1275,7 @@ export component AppWindow inherits Window {
                             property <bool> dragging;
                             property <int> drag-days;
                             property <length> press-x;
+                            property <int> press-generation;
 
                             x: gutter + (item.first-day + self.drag-days) * day-w + 2px;
                             y: head-h + 2px + item.row * bar-h;
@@ -1272,9 +1294,10 @@ export component AppWindow inherits Window {
                                     }
                                     if (event.kind == PointerEventKind.down) {
                                         parent.press-x = self.absolute-position.x + self.mouse-x;
+                                        parent.press-generation = root.generation;
                                     } else if (event.kind == PointerEventKind.up) {
                                         if (parent.dragging) {
-                                            if (parent.drag-days != 0) {
+                                            if (parent.drag-days != 0 && parent.press-generation == root.generation) {
                                                 root.event-moved(item.instance, parent.drag-days, 0);
                                             }
                                             parent.dragging = false;
@@ -1420,6 +1443,7 @@ export component AppWindow inherits Window {
                                 property <int> grow-min;
                                 property <length> press-x;
                                 property <length> press-y;
+                                property <int> press-generation;
 
                                 x: self.dragging ? gutter + (item.day + self.drag-days) * day-w + 1px : gutter + item.day * day-w + 1px + item.col * slot-w;
                                 y: (item.start-min + self.drag-min) / 60.0 * hour-h;
@@ -1453,9 +1477,10 @@ export component AppWindow inherits Window {
                                         if (event.kind == PointerEventKind.down) {
                                             parent.press-x = self.absolute-position.x + self.mouse-x;
                                             parent.press-y = self.absolute-position.y + self.mouse-y;
+                                            parent.press-generation = root.generation;
                                         } else if (event.kind == PointerEventKind.up) {
                                             if (parent.dragging) {
-                                                if (parent.drag-days != 0 || parent.drag-min != 0) {
+                                                if ((parent.drag-days != 0 || parent.drag-min != 0) && parent.press-generation == root.generation) {
                                                     root.event-moved(item.instance, parent.drag-days, parent.drag-min);
                                                 }
                                                 parent.dragging = false;
@@ -1488,8 +1513,9 @@ export component AppWindow inherits Window {
                                         }
                                         if (event.kind == PointerEventKind.down) {
                                             parent.press-y = self.absolute-position.y + self.mouse-y;
+                                            parent.press-generation = root.generation;
                                         } else if (event.kind == PointerEventKind.up) {
-                                            if (parent.grow-min != 0) {
+                                            if (parent.grow-min != 0 && parent.press-generation == root.generation) {
                                                 root.event-resized(item.instance, parent.grow-min);
                                             }
                                             parent.grow-min = 0;
@@ -2654,8 +2680,7 @@ export component AppWindow inherits Window {
             }
         }
 
-        // Keyboard shortcuts. Like the details card, an overlay that takes no focus, so
-        // the shortcuts it lists keep working while it is open.
+        // Keyboard shortcuts. Until it is closed, keys do nothing else.
         if root.help-visible: TouchArea {
             clicked => {
                 root.help-visible = false;

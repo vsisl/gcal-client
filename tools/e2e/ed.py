@@ -109,6 +109,16 @@ time.sleep(3); print("   undo offered:", "Undo" in [label(b) for b in find("Butt
 wait("undo edit: as before", lambda: ev("AT edit")["end"]["dateTime"] == old_end and not ev("AT edit").get("recurrence"))
 time.sleep(11)
 
+# 2b. All day and back: the other kind of time must go, both ways.
+call("click_element", elementHandle=items("AT edit")[0]); time.sleep(0.4)
+key("e"); time.sleep(0.5)
+click("Checkbox", "All day")
+click("Button", "Save")
+wait("all day: has a date and no time", lambda: ev("AT edit")["start"].get("date") and not ev("AT edit")["start"].get("dateTime"))
+time.sleep(3); key("z")
+wait("undo all day: timed again", lambda: ev("AT edit")["start"].get("dateTime") == start and not ev("AT edit")["start"].get("date"))
+time.sleep(11)
+
 # 3. A wrong date is refused in words and nothing is sent.
 call("click_element", elementHandle=items("AT edit")[0]); time.sleep(0.4)
 key("e"); time.sleep(0.5)

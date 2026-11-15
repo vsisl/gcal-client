@@ -8,7 +8,7 @@
 
 use chrono::{DateTime, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
-use gcal_core::recurrence::{remaining_series, shift_weekdays};
+use gcal_core::recurrence::{remaining_series, shift_weekdays, split_dates};
 use gcal_core::text::plain_text;
 use gcal_core::{Event, EventTime};
 use serde_json::{Value, json};
@@ -203,18 +203,6 @@ pub fn start_day(form: &Form) -> Result<NaiveDate, String> {
     parse_date(&form.start_date, "start")
 }
 
-/// The form with its dates moved by whole days.
-pub fn moved_by(form: &Form, days: i64) -> Result<Form, String> {
-    let moved = |text: &str, what| {
-        parse_date(text, what).map(|day| (day + Duration::days(days)).to_string())
-    };
-    Ok(Form {
-        start_date: moved(&form.start_date, "start")?,
-        end_date: moved(&form.end_date, "end")?,
-        ..form.clone()
-    })
-}
-
 /// Everything the form says about an event, as the fields of Google's event resource.
 /// Fails with a sentence for the user when a date or time cannot be understood.
 pub fn fields(form: &Form, kept: &Kept, zone: Tz) -> Result<Value, String> {
@@ -279,6 +267,27 @@ pub fn fields(form: &Form, kept: &Kept, zone: Tz) -> Result<Value, String> {
     }))
 }
 
+/// A start or end as a change to send. Google merges a change into what the event
+/// has, so a time that turns from all-day into timed (or back) must say that the other
+/// kind's fields go; else the event would have both and be refused.
+fn whole_time(mut time: Value) -> Value {
+    if time.get("date").is_some_and(|date| !date.is_null()) {
+        time["dateTime"] = Value::Null;
+        time["timeZone"] = Value::Null;
+    } else if time.get("dateTime").is_some() {
+        time["date"] = Value::Null;
+    }
+    time
+}
+
+fn whole_times(changes: &mut Value) {
+    for name in ["start", "end"] {
+        if let Some(time) = changes.get(name).cloned() {
+            changes[name] = whole_time(time);
+        }
+    }
+}
+
 /// The fields that differ between two sets, with their new values.
 pub fn diff(before: &Value, after: &Value) -> Value {
     let mut changes = serde_json::Map::new();
@@ -289,7 +298,9 @@ pub fn diff(before: &Value, after: &Value) -> Value {
             }
         }
     }
-    Value::Object(changes)
+    let mut changes = Value::Object(changes);
+    whole_times(&mut changes);
+    changes
 }
 
 /// What takes `changes` back: the values those fields have in `resource`. A field the
@@ -306,7 +317,9 @@ pub fn inverse(changes: &Value, resource: &Value) -> Value {
             before.insert(name.clone(), was);
         }
     }
-    Value::Object(before)
+    let mut before = Value::Object(before);
+    whole_times(&mut before);
+    before
 }
 
 /// The resource to create a new event from: the fields without those that say nothing.
@@ -327,53 +340,164 @@ pub fn creation(fields: Value) -> Value {
     Value::Object(fields)
 }
 
+/// Shows a changed occurrence as repeating the way its series does. On its own it has
+/// no rule, and would read "does not repeat"; saved for the whole series, that would
+/// have ended the series.
+pub fn adopt_series_rule(form: &mut Form, kept: &mut Kept, series: &Value, zone: Tz) {
+    let (Some(start), Some(end)) = serde_json::from_value::<Event>(series.clone())
+        .ok()
+        .map(|event| (event.start_time(), event.end_time()))
+        .unwrap_or_default()
+    else {
+        return;
+    };
+    let (of_series, kept_of_series) = form_of(series, start, end, zone);
+    form.repeat = of_series.repeat;
+    kept.recurrence = kept_of_series.recurrence;
+}
+
+fn instant_of(time: &Value) -> Option<DateTime<Utc>> {
+    time["dateTime"].as_str()?.parse().ok()
+}
+
+fn day_of(time: &Value) -> Option<NaiveDate> {
+    time["date"].as_str()?.parse().ok()
+}
+
 /// `changes` made in the form to one occurrence, turned into changes to its whole
-/// series: other fields apply as they are; new times are taken from `form` moved to the
-/// series' first day, so the series moves by as much as the occurrence did.
+/// series: other fields apply as they are; the series' first occurrence moves by as
+/// much as the opened one did (`before` and `after` are all the form's fields as it
+/// was opened and saved), and gets its new length.
+///
+/// The move is measured on the clock of the series' own time zone. Measured on the
+/// viewer's clock and applied to a first occurrence in another season, it would be off
+/// by an hour whenever one of the two zones changes its clocks and the other does not.
 pub fn for_series(
     changes: &Value,
-    form: &Form,
-    opened: &Form,
+    before: &Value,
+    after: &Value,
     kept: &Kept,
     series: &Event,
     zone: Tz,
 ) -> Result<Value, String> {
     let mut changes = changes.clone();
     let moved = changes.get("start").is_some() || changes.get("end").is_some();
-    if !moved {
+    let (Some(first), true) = (series.start_time(), moved) else {
         return Ok(changes);
+    };
+    let series_zone: Tz = kept
+        .start_zone
+        .as_deref()
+        .and_then(|name| name.parse().ok())
+        .unwrap_or(zone);
+    let on_clock = |instant: DateTime<Utc>| instant.with_timezone(&series_zone).naive_local();
+    let field = |instant: DateTime<Utc>, kept_zone: &Option<String>| {
+        json!({
+            "dateTime": instant.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "timeZone": kept_zone.clone().unwrap_or_else(|| zone.name().to_owned()),
+        })
+    };
+    let (was, now) = (&before["start"], &after["start"]);
+    let days;
+    match (
+        first,
+        instant_of(was),
+        instant_of(now),
+        day_of(was),
+        day_of(now),
+    ) {
+        // Timed before and after.
+        (EventTime::Timed(first), Some(was), Some(now), _, _) => {
+            let Some(end) = instant_of(&after["end"]) else {
+                return Ok(changes);
+            };
+            let by = on_clock(now) - on_clock(was);
+            let moved_local = on_clock(first) + by;
+            let start = series_zone
+                .from_local_datetime(&moved_local)
+                .earliest()
+                .map(|start| start.with_timezone(&Utc))
+                .unwrap_or(first + by);
+            days = (moved_local.date() - on_clock(first).date()).num_days();
+            changes["start"] = field(start, &kept.start_zone);
+            changes["end"] = field(start + (end - now), &kept.end_zone);
+        }
+        // All-day before and after.
+        (EventTime::AllDay(first), _, _, Some(was), Some(now)) => {
+            let Some(end) = day_of(&after["end"]) else {
+                return Ok(changes);
+            };
+            days = (now - was).num_days();
+            let start = first + Duration::days(days);
+            changes["start"] = json!({ "date": start.to_string() });
+            changes["end"] = json!({ "date": (start + (end - now)).to_string() });
+        }
+        // Between all-day and timed: the new times as the form has them, on the
+        // series' first day.
+        (first, ..) => {
+            let first_day = match first {
+                EventTime::AllDay(day) => day,
+                EventTime::Timed(instant) => date(instant, zone),
+            };
+            let (was_day, now_day) = match (day_of(was), day_of(now)) {
+                (Some(was), _) => (was, instant_of(now).map(|now| date(now, zone))),
+                (None, now) => (
+                    instant_of(was)
+                        .map(|was| date(was, zone))
+                        .unwrap_or(first_day),
+                    now,
+                ),
+            };
+            days = now_day.map_or(0, |now| (now - was_day).num_days());
+            let shift = |time: &Value| -> Value {
+                let back = (first_day - was_day).num_days();
+                match (day_of(time), instant_of(time)) {
+                    (Some(day), _) => json!({ "date": (day + Duration::days(back)).to_string() }),
+                    (None, Some(instant)) => {
+                        let local =
+                            instant.with_timezone(&zone).naive_local() + Duration::days(back);
+                        let moved = zone
+                            .from_local_datetime(&local)
+                            .earliest()
+                            .map(|moved| moved.with_timezone(&Utc))
+                            .unwrap_or(instant + Duration::days(back));
+                        field(moved, &None)
+                    }
+                    _ => time.clone(),
+                }
+            };
+            changes["start"] = shift(&after["start"]);
+            changes["end"] = shift(&after["end"]);
+        }
     }
-    let first_day = match series.start_time() {
-        Some(EventTime::AllDay(day)) => day,
-        Some(EventTime::Timed(instant)) => date(instant, zone),
-        None => return Ok(changes),
-    };
-    // From the occurrence as it was opened to the series' first day; the form as saved
-    // moved by that lands where the series now starts.
-    let back = (first_day - start_day(opened)?).num_days();
-    let days = (start_day(form)? - start_day(opened)?).num_days();
-    let kept = Kept {
-        recurrence: shift_weekdays(&kept.recurrence, days),
-        ..kept.clone()
-    };
-    let at_first = fields(&moved_by(form, back)?, &kept, zone)?;
-    changes["start"] = at_first["start"].clone();
-    changes["end"] = at_first["end"].clone();
-    if days != 0 || changes.get("recurrence").is_some() {
-        changes["recurrence"] = at_first["recurrence"].clone();
+    whole_times(&mut changes);
+    // A series moved to another weekday repeats on that one.
+    match changes.get("recurrence").cloned() {
+        Some(chosen) => {
+            let chosen: Vec<String> = serde_json::from_value(chosen).unwrap_or_default();
+            // A rule picked in the form was made for the opened occurrence's weekday,
+            // which is the series' own as long as the form's rule is one of its lists.
+            changes["recurrence"] = json!(chosen);
+        }
+        None if days != 0 => {
+            changes["recurrence"] = json!(shift_weekdays(&kept.recurrence, days));
+        }
+        None => {}
     }
     Ok(changes)
 }
 
-/// The new series that "this and following" makes from an occurrence: a copy of the
-/// old one with what the form changed, starting at the occurrence's new time, with the
-/// form's rule if that was changed and else what was left of the old one.
+/// The new series that "this and following" makes from an occurrence that would have
+/// started at `boundary`: a copy of the old one with what the form changed, starting at
+/// the occurrence's new time, with the form's rule if that was changed and else what
+/// was left of the old one.
 pub fn following_series(
     series: &Value,
     changes: &Value,
     all: &Value,
     earlier: u32,
     days: i64,
+    boundary: EventTime,
 ) -> Value {
     let mut copy = series.clone();
     if let Some(changes) = changes.as_object() {
@@ -393,7 +517,8 @@ pub fn following_series(
                     .collect()
             })
             .unwrap_or_default();
-        copy["recurrence"] = json!(shift_weekdays(&remaining_series(&old, earlier), days));
+        let left = split_dates(&remaining_series(&old, earlier), boundary, true);
+        copy["recurrence"] = json!(shift_weekdays(&left, days));
     }
     copy
 }
@@ -563,12 +688,15 @@ mod tests {
             changes,
             json!({
                 "summary": "Long lunch",
-                "end": {"dateTime": "2026-11-17T12:30:00Z", "timeZone": "Europe/Zurich"},
+                "end": {"dateTime": "2026-11-17T12:30:00Z", "timeZone": "Europe/Zurich", "date": null},
             })
         );
         assert_eq!(
             inverse(&changes, &lunch()),
-            json!({"summary": "Lunch", "end": lunch()["end"]})
+            json!({
+                "summary": "Lunch",
+                "end": {"dateTime": "2026-11-17T13:00:00+01:00", "timeZone": "Europe/Zurich", "date": null},
+            })
         );
         // A field the event did not have is removed again by null.
         let plain = json!({"id": "e", "summary": "x"});
@@ -632,6 +760,123 @@ mod tests {
     }
 
     #[test]
+    fn turning_an_event_all_day_and_back_clears_the_other_kind_of_time() {
+        let (start, end) = (timed("2026-11-17T11:00:00Z"), timed("2026-11-17T12:00:00Z"));
+        let event = json!({
+            "id": "e",
+            "start": {"dateTime": "2026-11-17T12:00:00+01:00", "timeZone": "Europe/Prague"},
+            "end": {"dateTime": "2026-11-17T13:00:00+01:00", "timeZone": "Europe/Prague"},
+        });
+        let (form, kept) = form_of(&event, start, end, zone());
+        let before = fields(&form, &kept, zone()).unwrap();
+        let mut all_day = form.clone();
+        all_day.all_day = true;
+        let changes = diff(&before, &fields(&all_day, &kept, zone()).unwrap());
+        assert_eq!(
+            changes,
+            json!({
+                "start": {"date": "2026-11-17", "dateTime": null, "timeZone": null},
+                "end": {"date": "2026-11-18", "dateTime": null, "timeZone": null},
+            })
+        );
+        // And the way back says that the date goes.
+        assert_eq!(
+            inverse(&changes, &event),
+            json!({
+                "start": {"dateTime": "2026-11-17T12:00:00+01:00", "timeZone": "Europe/Prague", "date": null},
+                "end": {"dateTime": "2026-11-17T13:00:00+01:00", "timeZone": "Europe/Prague", "date": null},
+            })
+        );
+    }
+
+    #[test]
+    fn a_changed_occurrence_repeats_as_its_series_does() {
+        let series = json!({
+            "id": "m",
+            "start": {"dateTime": "2026-11-16T10:00:00+01:00", "timeZone": "Europe/Prague"},
+            "end": {"dateTime": "2026-11-16T10:30:00+01:00", "timeZone": "Europe/Prague"},
+            "recurrence": ["RRULE:FREQ=WEEKLY;INTERVAL=2"]
+        });
+        let master: Event = serde_json::from_value(series.clone()).unwrap();
+        // The occurrence of 30 November was moved to 11:00 before; it has no rule.
+        let occurrence = json!({
+            "id": "m_x", "recurringEventId": "m",
+            "start": {"dateTime": "2026-11-30T11:00:00+01:00", "timeZone": "Europe/Prague"},
+            "end": {"dateTime": "2026-11-30T11:30:00+01:00", "timeZone": "Europe/Prague"},
+        });
+        let (mut opened, mut kept) = form_of(
+            &occurrence,
+            timed("2026-11-30T10:00:00Z"),
+            timed("2026-11-30T10:30:00Z"),
+            zone(),
+        );
+        assert_eq!(opened.repeat, REPEAT_NONE);
+        adopt_series_rule(&mut opened, &mut kept, &series, zone());
+        assert_eq!(opened.repeat, REPEAT_CUSTOM);
+
+        // Moved a day on and saved for the whole series: the series moves and goes on
+        // repeating.
+        let before = fields(&opened, &kept, zone()).unwrap();
+        let mut moved = opened.clone();
+        moved.start_date = "2026-12-01".into();
+        moved.end_date = "2026-12-01".into();
+        let after = fields(&moved, &kept, zone()).unwrap();
+        let changes = for_series(
+            &diff(&before, &after),
+            &before,
+            &after,
+            &kept,
+            &master,
+            zone(),
+        )
+        .unwrap();
+        assert_eq!(changes["start"]["dateTime"], "2026-11-17T09:00:00Z");
+        assert_eq!(
+            changes["recurrence"],
+            json!(["RRULE:FREQ=WEEKLY;INTERVAL=2"])
+        );
+    }
+
+    #[test]
+    fn a_series_in_another_zone_moves_by_its_own_clock() {
+        // Ten o'clock UTC every day from January; in Prague that is 11:00 in winter
+        // and 12:00 in summer.
+        let series = json!({
+            "id": "m",
+            "start": {"dateTime": "2026-01-05T10:00:00Z", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-01-05T11:00:00Z", "timeZone": "UTC"},
+            "recurrence": ["RRULE:FREQ=DAILY"]
+        });
+        let master: Event = serde_json::from_value(series.clone()).unwrap();
+        // Opened in July, where it shows as 12:00, and moved an hour later.
+        let (opened, kept) = form_of(
+            &series,
+            timed("2026-07-06T10:00:00Z"),
+            timed("2026-07-06T11:00:00Z"),
+            zone(),
+        );
+        assert_eq!(opened.start_time, "12:00");
+        let before = fields(&opened, &kept, zone()).unwrap();
+        let mut later = opened.clone();
+        later.start_time = "13:00".into();
+        later.end_time = "14:00".into();
+        let after = fields(&later, &kept, zone()).unwrap();
+        let changes = for_series(
+            &diff(&before, &after),
+            &before,
+            &after,
+            &kept,
+            &master,
+            zone(),
+        )
+        .unwrap();
+        // An hour later on the series' clock, not Prague's winter one.
+        assert_eq!(changes["start"]["dateTime"], "2026-01-05T11:00:00Z");
+        assert_eq!(changes["end"]["dateTime"], "2026-01-05T12:00:00Z");
+        assert!(changes.get("recurrence").is_none());
+    }
+
+    #[test]
     fn a_change_to_one_occurrence_is_carried_over_to_the_series() {
         let series = json!({
             "id": "m", "summary": "Standup",
@@ -654,7 +899,7 @@ mod tests {
         renamed.title = "Daily".into();
         let changes = diff(&before, &fields(&renamed, &kept, zone()).unwrap());
         assert_eq!(
-            for_series(&changes, &renamed, &opened, &kept, &master, zone()).unwrap(),
+            for_series(&changes, &before, &before, &kept, &master, zone()).unwrap(),
             json!({"summary": "Daily"})
         );
 
@@ -667,17 +912,24 @@ mod tests {
         let after = fields(&moved, &kept, zone()).unwrap();
         let changes = diff(&before, &after);
         assert_eq!(
-            for_series(&changes, &moved, &opened, &kept, &master, zone()).unwrap(),
+            for_series(&changes, &before, &after, &kept, &master, zone()).unwrap(),
             json!({
-                "start": {"dateTime": "2026-11-17T09:00:00Z", "timeZone": "Europe/Prague"},
-                "end": {"dateTime": "2026-11-17T10:30:00Z", "timeZone": "Europe/Prague"},
+                "start": {"dateTime": "2026-11-17T09:00:00Z", "timeZone": "Europe/Prague", "date": null},
+                "end": {"dateTime": "2026-11-17T10:30:00Z", "timeZone": "Europe/Prague", "date": null},
                 "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=TU,TH"],
             })
         );
 
         // This and following: a copy from the occurrence's new time on, with what was
         // left of the rule.
-        let copy = following_series(&series, &changes, &after, 3, 1);
+        let copy = following_series(
+            &series,
+            &changes,
+            &after,
+            3,
+            1,
+            timed("2026-11-25T09:00:00Z"),
+        );
         assert_eq!(copy["summary"], "Standup");
         assert_eq!(copy["start"]["dateTime"], "2026-11-26T09:00:00Z");
         assert_eq!(copy["end"]["dateTime"], "2026-11-26T10:30:00Z");

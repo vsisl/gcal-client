@@ -110,11 +110,19 @@ wait("cleanup plain", lambda: not named("AT plain"))
 time.sleep(11)  # let the toast go
 key("w")
 
-# 3 series: this
 def series(): return [e for e in events() if e.get("summary") == "AT series" and e.get("recurrence")]
 def cancelled():
     ids = {e["id"] for e in series()}
     return [e for e in events() if e.get("recurringEventId") in ids and e.get("status") == "cancelled"]
+# 3 series: all, while nothing in it was changed: undo brings it back
+wait("series: six occurrences shown", lambda: len(items("AT series")) == 6)
+delete_first("AT series", downs=2, ask=True, index=1)
+wait("all: series gone", lambda: not series() and not items("AT series"))
+time.sleep(3); key("z")
+wait("undo all: series back", lambda: len(series()) == 1 and len(items("AT series")) == 6)
+time.sleep(11)
+
+# 3 series: this
 wait("series: six occurrences shown", lambda: len(items("AT series")) == 6)
 delete_first("AT series", ask=True, index=2)
 wait("this: one occurrence cancelled at Google", lambda: len(cancelled()) == 1)
@@ -137,13 +145,11 @@ wait("undo following: rule back", lambda: series()[0]["recurrence"] == ["RRULE:F
 wait("undo following: six shown", lambda: len(items("AT series")) == 6)
 time.sleep(11)
 
-# 5 series: all
-delete_first("AT series", downs=2, ask=True, index=1)
-wait("all: series gone", lambda: not series() and not items("AT series"))
-key("z")
-wait("undo all: series back", lambda: len(series()) == 1 and len(items("AT series")) == 6)
-time.sleep(1)
+# 6 series: all, after occurrences were changed: no undo, which would bring back
+# another schedule than the one deleted
 delete_first("AT series", downs=2, ask=True, index=0)
-wait("cleanup series", lambda: not series())
+wait("all (with changed occurrences): series gone", lambda: not series())
+time.sleep(3)
+print("PASS no undo offered" if "Undo" not in [label(b) for b in find("Button")] else "FAIL undo offered")
 print("left in calendar:", [e.get("summary") for e in events() if e.get("status") != "cancelled"])
 shot("e2e-end")

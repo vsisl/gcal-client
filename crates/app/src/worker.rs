@@ -51,11 +51,13 @@ pub enum Command {
         calendar_id: String,
         edit: Edit,
     },
-    /// Changes fields of an event to take an earlier change back.
+    /// Changes fields of an event to take an earlier change back; with an `etag`, only
+    /// if nothing else changed it since.
     PatchEvent {
         account: AccountId,
         calendar_id: String,
         event_id: String,
+        etag: Option<String>,
         changes: Value,
     },
     /// Creates an event from a resource the window put together.
@@ -86,16 +88,20 @@ pub enum Edit {
     Occurrence {
         series_id: String,
         original_start: EventTime,
-        /// Its own identifier, when the cache has it (a changed occurrence).
+        /// Its own identifier and version, when the cache has them (a changed
+        /// occurrence).
         known_id: Option<String>,
+        etag: Option<String>,
         changes: Value,
     },
     /// An occurrence and all later ones: the series ends before it (`recurrence` is
-    /// its shortened rule) and `resource` becomes a new series from there on.
+    /// its shortened rule, `old_recurrence` the one it had) and `resource` becomes a
+    /// new series from there on.
     Following {
         series_id: String,
         etag: Option<String>,
         recurrence: Vec<String>,
+        old_recurrence: Vec<String>,
         resource: Value,
     },
 }
@@ -113,8 +119,10 @@ pub enum Deletion {
     Occurrence {
         series_id: String,
         original_start: EventTime,
-        /// Its own identifier, when the cache has it (a changed occurrence).
+        /// Its own identifier and version, when the cache has them (a changed
+        /// occurrence).
         known_id: Option<String>,
+        etag: Option<String>,
     },
     /// An occurrence and all later ones: the series gets the shortened `recurrence`.
     Following {
@@ -227,6 +235,14 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
                 Command::RestoreEvent { .. } => Some("The event could not be brought back."),
                 _ => None,
             };
+            // Changes run one at a time, in the order they were asked for, and never
+            // while a sync is saving what it fetched: a sync that started earlier could
+            // otherwise put back the older version of an event just changed. The window
+            // relies on the order too, to match each answer with its undo.
+            let _cache = match command {
+                Command::AddAccount | Command::SyncAll | Command::RemoveAccount(_) => None,
+                _ => Some(worker.cache.lock().await),
+            };
             let result = match command {
                 Command::AddAccount => worker.add_account().await,
                 Command::SyncAll => worker.sync_all().await,
@@ -260,37 +276,41 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
                     // The window may have drawn the change already and takes it back on
                     // failure; to undo a change to one occurrence it needs to know
                     // which event that is.
-                    let (ok, id) = match &changed {
-                        Ok(id) => (true, id.clone()),
-                        Err(_) => (false, String::new()),
+                    // The version it now has makes the undo conditional as well.
+                    let (ok, id, etag) = match &changed {
+                        Ok((id, etag)) => (true, id.clone(), etag.clone()),
+                        Err(_) => (false, String::new(), String::new()),
                     };
-                    let _ = worker
-                        .ui
-                        .upgrade_in_event_loop(move |ui| ui.invoke_change_finished(ok, id.into()));
+                    let _ = worker.ui.upgrade_in_event_loop(move |ui| {
+                        ui.invoke_change_finished(ok, id.into(), etag.into())
+                    });
                     changed.map(|_| ())
                 }
                 Command::PatchEvent {
                     account,
                     calendar_id,
                     event_id,
+                    etag,
                     changes,
-                } => {
-                    worker
-                        .patch_event(account, &calendar_id, &event_id, changes, None)
-                        .await
-                }
+                } => worker
+                    .patch_event(account, &calendar_id, &event_id, changes, etag.as_deref())
+                    .await
+                    .map(|_| ()),
                 Command::CreateEvent {
                     account,
                     calendar_id,
                     resource,
                 } => {
                     let created = worker.insert_event(account, &calendar_id, resource).await;
-                    if let Ok(id) = &created {
-                        let id = id.clone();
-                        let _ = worker
-                            .ui
-                            .upgrade_in_event_loop(move |ui| ui.invoke_event_created(id.into()));
-                    }
+                    // Always answered: on failure the window gives back what was
+                    // typed.
+                    let (ok, id, etag) = match &created {
+                        Ok((id, etag)) => (true, id.clone(), etag.clone()),
+                        Err(_) => (false, String::new(), String::new()),
+                    };
+                    let _ = worker.ui.upgrade_in_event_loop(move |ui| {
+                        ui.invoke_event_created(ok, id.into(), etag.into())
+                    });
                     created.map(|_| ())
                 }
                 Command::RestoreEvent {
@@ -447,10 +467,16 @@ impl Worker {
     }
 
     async fn sync_all(&self) -> Result<()> {
-        // Something is already syncing or removing an account; that run's status stands.
+        // Something is already syncing, changing an event or removing an account. A
+        // change syncs when it is done, and a running sync's status stands.
         let Ok(_cache) = self.cache.try_lock() else {
             return Ok(());
         };
+        self.sync_accounts().await
+    }
+
+    /// Syncs every account. The caller holds the cache lock.
+    async fn sync_accounts(&self) -> Result<()> {
         let mut store = open_store()?;
         let accounts = store.accounts()?;
         if accounts.is_empty() {
@@ -562,12 +588,15 @@ impl Worker {
                 series_id,
                 original_start,
                 known_id,
+                etag,
             } => {
                 let id = match known_id {
                     Some(id) => id,
                     None => occurrence_id(&client, calendar_id, &series_id, original_start).await?,
                 };
-                let deleted = client.delete_event(calendar_id, &id, None, notify).await;
+                let deleted = client
+                    .delete_event(calendar_id, &id, etag.as_deref(), notify)
+                    .await;
                 self.written(deleted).await?;
                 id
             }
@@ -594,7 +623,7 @@ impl Worker {
         // Google answers a change inside a series with other changes (the occurrence
         // marked as cancelled, changed occurrences past the new end removed): fetch them.
         drop(saving);
-        let _ = self.sync_all().await;
+        let _ = self.sync_accounts().await;
         Ok(removed)
     }
 
@@ -606,7 +635,7 @@ impl Worker {
             Ok(answer) => Ok(Some(answer)),
             Err(ApiError::Gone) => Ok(None),
             Err(ApiError::Changed) => {
-                let _ = self.sync_all().await;
+                let _ = self.sync_accounts().await;
                 bail!(
                     "it was changed somewhere else in the meantime. The calendar now shows its current version; try again if you still want to"
                 );
@@ -615,28 +644,31 @@ impl Worker {
         }
     }
 
-    /// Applies a change and returns the identifier of the occurrence it was made to, if
-    /// it was a single one of a series (empty otherwise).
+    /// Applies a change. Returns the identifier of the occurrence it was made to, if it
+    /// was a single one of a series (empty otherwise), and the version the changed event
+    /// now has (empty after a split).
     async fn edit_event(
         &self,
         account: AccountId,
         calendar_id: &str,
         edit: Edit,
-    ) -> Result<String> {
+    ) -> Result<(String, String)> {
         match edit {
             Edit::Event {
                 event_id,
                 etag,
                 changes,
             } => {
-                self.patch_event(account, calendar_id, &event_id, changes, etag.as_deref())
+                let now = self
+                    .patch_event(account, calendar_id, &event_id, changes, etag.as_deref())
                     .await?;
-                Ok(String::new())
+                Ok((String::new(), now))
             }
             Edit::Occurrence {
                 series_id,
                 original_start,
                 known_id,
+                etag,
                 changes,
             } => {
                 let id = match known_id {
@@ -647,14 +679,16 @@ impl Worker {
                         occurrence_id(&client, calendar_id, &series_id, original_start).await?
                     }
                 };
-                self.patch_event(account, calendar_id, &id, changes, None)
+                let now = self
+                    .patch_event(account, calendar_id, &id, changes, etag.as_deref())
                     .await?;
-                Ok(id)
+                Ok((id, now))
             }
             Edit::Following {
                 series_id,
                 etag,
                 recurrence,
+                old_recurrence,
                 resource,
             } => {
                 // First the old series ends; only then does the new one begin, so that
@@ -667,14 +701,35 @@ impl Worker {
                     etag.as_deref(),
                 )
                 .await?;
-                self.insert_event(account, calendar_id, restorable(resource))
-                    .await?;
-                Ok(String::new())
+                let Err(failed) = self
+                    .insert_event(account, calendar_id, restorable(resource))
+                    .await
+                else {
+                    return Ok((String::new(), String::new()));
+                };
+                // The second half did not come into being, and the first must not stay
+                // cut: its later occurrences would simply be gone. Give it its rule back.
+                let restored = self
+                    .patch_event(
+                        account,
+                        calendar_id,
+                        &series_id,
+                        serde_json::json!({ "recurrence": old_recurrence }),
+                        None,
+                    )
+                    .await;
+                match restored {
+                    Ok(_) => Err(failed),
+                    Err(also) => bail!(
+                        "the series was cut at this event, but its later part could not be created ({failed:#}), and the cut could not be taken back ({also:#}). The later events are missing: set the series' end date back by hand"
+                    ),
+                }
             }
         }
     }
 
-    /// Changes fields of an event and saves what Google made of it.
+    /// Changes fields of an event, saves what Google made of it and returns the version
+    /// it now has.
     async fn patch_event(
         &self,
         account: AccountId,
@@ -682,7 +737,7 @@ impl Worker {
         event_id: &str,
         changes: Value,
         etag: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<String> {
         self.clear_error();
         let saving = self.start(|activity| &mut activity.saving);
         let mut store = open_store()?;
@@ -691,30 +746,31 @@ impl Worker {
             .patch_event(calendar_id, event_id, &changes, etag, false)
             .await;
         let Some(changed) = self.written(answer).await? else {
-            let _ = self.sync_all().await;
+            let _ = self.sync_accounts().await;
             bail!("it no longer exists");
         };
         store.apply_event(account, calendar_id, &changed)?;
         drop(saving);
-        let _ = self.sync_all().await;
-        Ok(())
+        let _ = self.sync_accounts().await;
+        Ok(changed["etag"].as_str().unwrap_or_default().to_owned())
     }
 
     /// Creates an event at Google, saves what Google made of it and returns its
-    /// identifier.
+    /// identifier and version.
     async fn insert_event(
         &self,
         account: AccountId,
         calendar_id: &str,
         resource: Value,
-    ) -> Result<String> {
+    ) -> Result<(String, String)> {
         self.clear_error();
         let _saving = self.start(|activity| &mut activity.saving);
         let mut store = open_store()?;
         let client = self.account_client(&store, account).await?;
         let created = client.insert_event(calendar_id, &resource).await?;
         store.apply_event(account, calendar_id, &created)?;
-        Ok(created["id"].as_str().unwrap_or_default().to_owned())
+        let text = |name: &str| created[name].as_str().unwrap_or_default().to_owned();
+        Ok((text("id"), text("etag")))
     }
 
     async fn remove_account(&self, email: &str) -> Result<()> {
