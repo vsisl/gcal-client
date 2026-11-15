@@ -247,6 +247,8 @@ impl View {
         let mut sidebar = Vec::new();
         for account in accounts {
             sidebar.push(SidebarRow {
+                account_id: account.id as i32,
+                calendar_id: SharedString::new(),
                 is_account: true,
                 text: account.email.as_str().into(),
                 email: account.email.as_str().into(),
@@ -256,6 +258,8 @@ impl View {
             for calendar in calendars.iter().filter(|c| c.account_id == account.id) {
                 let entry = &calendar.entry;
                 sidebar.push(SidebarRow {
+                    account_id: account.id as i32,
+                    calendar_id: entry.id.as_str().into(),
                     is_account: false,
                     text: entry.display_name().into(),
                     email: account.email.as_str().into(),
@@ -264,17 +268,15 @@ impl View {
                         .as_deref()
                         .and_then(parse_color)
                         .unwrap_or(FALLBACK_COLOR),
-                    shown: entry.selected,
+                    shown: calendar.shown,
                 });
             }
         }
         patch(&self.sidebar, sidebar);
 
-        // Only calendars ticked in Google's own interface are shown for now; ticking them
-        // here arrives with the M2 sidebar.
         let shown: HashMap<(AccountId, &str), &CalendarListEntry> = calendars
             .iter()
-            .filter(|c| c.entry.selected)
+            .filter(|c| c.shown)
             .map(|c| ((c.account_id, c.entry.id.as_str()), &c.entry))
             .collect();
 
@@ -369,6 +371,22 @@ impl View {
         }
     }
 
+    /// Shows or hides a calendar, remembers the choice, and redraws.
+    fn set_calendar_shown(&self, account: AccountId, calendar_id: &str, shown: bool) {
+        let saved = self
+            .store
+            .set_calendar_shown(account, calendar_id, shown)
+            .and_then(|()| self.store.calendars());
+        match saved {
+            Ok(calendars) => {
+                // Only the calendar list changed; the series need no re-reading.
+                self.loaded.borrow_mut().calendars = calendars;
+                self.refresh();
+            }
+            Err(error) => self.show_error(&error.into()),
+        }
+    }
+
     fn show(&self, anchor: NaiveDate) {
         self.anchor.set(anchor);
         self.refresh();
@@ -422,6 +440,12 @@ pub fn run() -> Result<()> {
                 view.span.set(*span);
                 view.refresh();
             }
+        }
+    });
+    ui.on_toggle_calendar({
+        let view = view.clone();
+        move |account, calendar_id, shown| {
+            view.set_calendar_shown(AccountId::from(account), &calendar_id, shown);
         }
     });
     ui.on_data_changed({

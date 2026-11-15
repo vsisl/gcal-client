@@ -33,6 +33,9 @@ export struct DayHeader {
 
 // The sidebar is one flat list: an account row followed by that account's calendars.
 export struct SidebarRow {
+    account-id: int,
+    // Empty on account rows.
+    calendar-id: string,
     is-account: bool,
     text: string,
     email: string,
@@ -125,6 +128,8 @@ export component AppWindow inherits Window {
     callback go-previous();
     callback go-next();
     callback set-view(int);
+    // Account, calendar, and whether it should now be shown.
+    callback toggle-calendar(int, string, bool);
     callback add-account();
     callback remove-account(string);
     callback sync-now();
@@ -291,6 +296,23 @@ export component AppWindow inherits Window {
 
                         for row in root.sidebar: Rectangle {
                             height: row.is-account ? 44px : 30px;
+
+                            // A calendar row is one big tick box, drawn under its content.
+                            if !row.is-account: Rectangle {
+                                background: tick.has-hover ? Theme.hover : transparent;
+                                accessible-role: checkbox;
+                                accessible-label: row.text;
+                                accessible-checked: row.shown;
+                                accessible-action-default => {
+                                    tick.clicked();
+                                }
+
+                                tick := TouchArea {
+                                    clicked => {
+                                        root.toggle-calendar(row.account-id, row.calendar-id, !row.shown);
+                                    }
+                                }
+                            }
 
                             if row.is-account: HorizontalLayout {
                                 padding-left: 16px;
