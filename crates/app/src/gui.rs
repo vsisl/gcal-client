@@ -25,6 +25,8 @@ slint::include_modules!();
 /// How often changes are fetched from Google while the window is open. (Google can only
 /// push changes to a public web server, so a desktop app has to ask.)
 const SYNC_INTERVAL: StdDuration = StdDuration::from_secs(5 * 60);
+/// The sidebar's small month always shows six weeks.
+const MINI_MONTH_DAYS: i64 = 42;
 /// How many days ahead the schedule view lists.
 const SCHEDULE_DAYS: i64 = 30;
 /// Hour at the top of the grid when the window opens, like the web interface.
@@ -256,6 +258,10 @@ struct View {
     zone: Tz,
     /// The day the user is looking at; which days are shown follows from it and `span`.
     anchor: Cell<NaiveDate>,
+    /// A day of the month the sidebar's small month shows. It follows `anchor`, but can
+    /// be paged on its own to pick a day further away.
+    mini_month: Cell<NaiveDate>,
+    mini_days: Rc<VecModel<MiniDay>>,
     span: Cell<Span>,
     /// The date the day headers were last drawn for, to notice midnight passing.
     drawn_today: Cell<Option<NaiveDate>>,
@@ -341,6 +347,7 @@ impl View {
             );
         }
         self.update_now(ui);
+        self.update_mini_month(ui);
 
         let loaded = self.loaded.borrow();
         let (accounts, calendars) = (&loaded.accounts, &loaded.calendars);
@@ -621,7 +628,49 @@ impl View {
 
     fn show(&self, anchor: NaiveDate) {
         self.anchor.set(anchor);
+        self.mini_month.set(anchor);
         self.refresh();
+    }
+
+    /// Draws the sidebar's small month: always six weeks, so its height never changes.
+    fn update_mini_month(&self, ui: &AppWindow) {
+        let month = self.mini_month.get();
+        let (first, _) = Span::Month.range(month);
+        let (shown_first, shown_days) = self.range();
+        let today = self.today();
+        // Marking every day of a month or of the schedule would say nothing.
+        let marks_range = !matches!(self.span.get(), Span::Month | Span::Schedule);
+        ui.set_mini_title(month.format("%B %Y").to_string().into());
+        patch(
+            &self.mini_days,
+            (0..MINI_MONTH_DAYS)
+                .map(|offset| {
+                    let day = first + Duration::days(offset);
+                    MiniDay {
+                        label: day.day().to_string().into(),
+                        today: day == today,
+                        dim: day.month() != month.month(),
+                        shown: marks_range
+                            && (0..shown_days).contains(&(day - shown_first).num_days()),
+                    }
+                })
+                .collect(),
+        );
+    }
+
+    /// Pages the small month back (-1) or forward (1) without moving the main view.
+    fn step_mini_month(&self, direction: i64) {
+        self.mini_month
+            .set(Span::Month.step(self.mini_month.get(), direction));
+        if let Some(ui) = self.ui.upgrade() {
+            self.update_mini_month(&ui);
+        }
+    }
+
+    /// Shows the day picked in the small month, in the view that is open.
+    fn pick_mini_day(&self, cell: i64) {
+        let (first, _) = Span::Month.range(self.mini_month.get());
+        self.show(first + Duration::days(cell));
     }
 
     /// Moves one screenful back (-1) or forward (1).
@@ -646,6 +695,8 @@ pub fn run() -> Result<()> {
         loaded: RefCell::default(),
         zone,
         anchor: Cell::new(Utc::now().with_timezone(&zone).date_naive()),
+        mini_month: Cell::new(Utc::now().with_timezone(&zone).date_naive()),
+        mini_days: Rc::default(),
         span: Cell::new(Span::Week),
         drawn_today: Cell::new(None),
         days: Rc::default(),
@@ -697,6 +748,15 @@ pub fn run() -> Result<()> {
                 view.refresh();
             }
         }
+    });
+    ui.set_mini_days(ModelRc::from(view.mini_days.clone()));
+    ui.on_mini_step({
+        let view = view.clone();
+        move |direction| view.step_mini_month(i64::from(direction))
+    });
+    ui.on_mini_pick({
+        let view = view.clone();
+        move |cell| view.pick_mini_day(i64::from(cell))
     });
     ui.on_open_day({
         let view = view.clone();

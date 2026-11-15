@@ -80,6 +80,16 @@ export struct ScheduleRow {
     color: color,
 }
 
+// A day of the sidebar's small month.
+export struct MiniDay {
+    label: string,
+    today: bool,
+    // Belongs to the month before or after.
+    dim: bool,
+    // Among the days the main view is showing.
+    shown: bool,
+}
+
 export struct DayHeader {
     weekday: string,
     number: string,
@@ -113,6 +123,7 @@ global Theme {
     out property <color> text-dim: #70757a;
     out property <color> hover: #f1f3f4;
     out property <color> pressed: #e8eaed;
+    out property <color> selected: #d2e3fc;
     out property <color> accent: #1a73e8;
     out property <color> now: #ea4335;
     out property <color> danger: #d93025;
@@ -173,6 +184,11 @@ export component AppWindow inherits Window {
     property <bool> is-month: root.view-index == 2;
     property <bool> is-schedule: root.view-index == 4;
     in property <[ScheduleRow]> schedule;
+    // The sidebar's small month: 42 days, paged on its own, picks the day to show.
+    in property <string> mini-title;
+    in property <[MiniDay]> mini-days;
+    callback mini-step(int);
+    callback mini-pick(int);
     // The month view: seven names, one cell per day, one chip per line of an event.
     in property <[string]> weekday-names;
     in property <[MonthCell]> month-cells;
@@ -404,6 +420,88 @@ export component AppWindow inherits Window {
                     rows := VerticalLayout {
                         alignment: start;
                         padding-top: 8px;
+
+                        // The small month.
+                        Rectangle {
+                            property <length> cell: 30px;
+                            property <length> left: (self.width - 7 * self.cell) / 2;
+                            height: 36px + 7 * self.cell + 12px;
+
+                            Text {
+                                x: parent.left + 8px;
+                                y: 0;
+                                height: 36px;
+                                text: root.mini-title;
+                                font-size: 14px;
+                                font-weight: 500;
+                                color: Theme.text;
+                                vertical-alignment: center;
+                            }
+
+                            TextButton {
+                                x: parent.left + 7 * parent.cell - 60px;
+                                y: 4px;
+                                width: 28px;
+                                height: 28px;
+                                text: "‹";
+                                accessible-label: @tr("Previous month");
+                                clicked => {
+                                    root.mini-step(-1);
+                                }
+                            }
+
+                            TextButton {
+                                x: parent.left + 7 * parent.cell - 30px;
+                                y: 4px;
+                                width: 28px;
+                                height: 28px;
+                                text: "›";
+                                accessible-label: @tr("Next month");
+                                clicked => {
+                                    root.mini-step(1);
+                                }
+                            }
+
+                            for name[d] in root.weekday-names: Text {
+                                x: parent.left + d * parent.cell;
+                                y: 36px;
+                                width: parent.cell;
+                                height: parent.cell;
+                                text: name;
+                                font-size: 9px;
+                                color: Theme.text-dim;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            for day[i] in root.mini-days: Rectangle {
+                                x: parent.left + Math.mod(i, 7) * parent.cell + 2px;
+                                y: 36px + parent.cell + Math.floor(i / 7) * parent.cell + 2px;
+                                width: parent.cell - 4px;
+                                height: parent.cell - 4px;
+                                border-radius: self.height / 2;
+                                background: day.today ? Theme.accent : day.shown ? Theme.selected : pick.has-hover ? Theme.hover : transparent;
+                                accessible-role: button;
+                                accessible-label: day.label;
+                                accessible-action-default => {
+                                    root.mini-pick(i);
+                                }
+
+                                Text {
+                                    text: day.label;
+                                    font-size: 11px;
+                                    color: day.today ? white : day.dim ? Theme.text-dim : Theme.text;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+
+                                pick := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        root.mini-pick(i);
+                                    }
+                                }
+                            }
+                        }
 
                         for row in root.sidebar: Rectangle {
                             height: row.is-account ? 44px : 30px;
