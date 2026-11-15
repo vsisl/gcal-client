@@ -114,6 +114,9 @@ pub struct Event {
     pub description: Option<String>,
     /// Address of the event in Google's web interface.
     pub html_link: Option<String>,
+    /// "default" for ordinary events; others are birthdays, out-of-office, focus time,
+    /// working location and entries created from Gmail.
+    pub event_type: Option<String>,
     /// Guests, including the organiser when there are any.
     #[serde(default)]
     pub attendees: Vec<Attendee>,

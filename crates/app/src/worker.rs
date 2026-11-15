@@ -9,8 +9,12 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use gcal_google::{ClientConfig, Endpoints, GoogleClient, HttpClient, SCOPE_CALENDAR, TokenSet};
+use gcal_google::{
+    ApiError, ClientConfig, Endpoints, GoogleClient, HttpClient, SCOPE_CALENDAR, TokenSet,
+};
+use gcal_store::{AccountId, Store};
 use gcal_sync::{SyncError, SyncReport};
+use serde_json::Value;
 use slint::Weak;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::{Mutex, watch};
@@ -31,6 +35,20 @@ pub enum Command {
     AddAccount,
     SyncAll,
     RemoveAccount(String),
+    /// Deletes an event at Google and then from the cache. With an `etag`, only if the
+    /// event still is the version the window showed.
+    DeleteEvent {
+        account: AccountId,
+        calendar_id: String,
+        event_id: String,
+        etag: Option<String>,
+    },
+    /// Undoes a deletion: creates the event again from its saved resource.
+    RestoreEvent {
+        account: AccountId,
+        calendar_id: String,
+        resource: Value,
+    },
 }
 
 /// Starts the worker thread and returns the channel for sending it commands.
@@ -56,6 +74,8 @@ pub fn spawn(ui: Weak<AppWindow>) -> UnboundedSender<Command> {
 struct Activity {
     waiting_for_browser: u32,
     syncing: u32,
+    /// Changes being sent to Google.
+    saving: u32,
     /// The latest failure, shown until the user starts something new.
     error: Option<String>,
 }
@@ -123,6 +143,27 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
                 Command::AddAccount => worker.add_account().await,
                 Command::SyncAll => worker.sync_all().await,
                 Command::RemoveAccount(email) => worker.remove_account(&email).await,
+                Command::DeleteEvent {
+                    account,
+                    calendar_id,
+                    event_id,
+                    etag,
+                } => {
+                    let deleted = worker
+                        .delete_event(account, &calendar_id, &event_id, etag.as_deref())
+                        .await;
+                    // The window offers to undo only what really happened.
+                    let ok = deleted.is_ok();
+                    let _ = worker
+                        .ui
+                        .upgrade_in_event_loop(move |ui| ui.invoke_delete_finished(ok));
+                    deleted
+                }
+                Command::RestoreEvent {
+                    account,
+                    calendar_id,
+                    resource,
+                } => worker.restore_event(account, &calendar_id, resource).await,
             };
             if let Err(error) = result
                 && !error.is::<Superseded>()
@@ -158,6 +199,8 @@ impl Worker {
             let activity = self.activity.borrow();
             if activity.waiting_for_browser > 0 {
                 (StatusKind::WaitingForBrowser, String::new())
+            } else if activity.saving > 0 {
+                (StatusKind::Saving, String::new())
             } else if activity.syncing > 0 {
                 (StatusKind::Syncing, String::new())
             } else if let Some(error) = &activity.error {
@@ -298,6 +341,68 @@ impl Worker {
         Ok(())
     }
 
+    /// A client for the account that owns what is being changed.
+    async fn account_client(&self, store: &Store, account: AccountId) -> Result<GoogleClient> {
+        let email = store
+            .accounts()?
+            .into_iter()
+            .find(|a| a.id == account)
+            .map(|a| a.email)
+            .context("the account is no longer signed in")?;
+        let config = load_config()?;
+        let refresh_token = Vault::open()
+            .await?
+            .load(&email)
+            .await?
+            .with_context(|| format!("{email}: not signed in"))?;
+        Ok(self.client(config, refresh_token))
+    }
+
+    async fn delete_event(
+        &self,
+        account: AccountId,
+        calendar_id: &str,
+        event_id: &str,
+        etag: Option<&str>,
+    ) -> Result<()> {
+        self.clear_error();
+        let _saving = self.start(|activity| &mut activity.saving);
+        let store = open_store()?;
+        let client = self.account_client(&store, account).await?;
+        match client.delete_event(calendar_id, event_id, etag).await {
+            // Already deleted elsewhere: what the user wanted has happened.
+            Ok(()) | Err(ApiError::Gone) => {}
+            Err(ApiError::Changed) => {
+                // Someone changed it since the window showed it. Nothing was deleted;
+                // fetch the new version so the user sees what they would be deleting.
+                let _ = self.sync_all().await;
+                bail!(
+                    "the event was changed elsewhere and has not been deleted; check it and try again"
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+        store.remove_event(account, calendar_id, event_id)?;
+        Ok(())
+    }
+
+    async fn restore_event(
+        &self,
+        account: AccountId,
+        calendar_id: &str,
+        resource: Value,
+    ) -> Result<()> {
+        self.clear_error();
+        let _saving = self.start(|activity| &mut activity.saving);
+        let mut store = open_store()?;
+        let client = self.account_client(&store, account).await?;
+        let created = client
+            .insert_event(calendar_id, &restorable(resource))
+            .await?;
+        store.apply_event(account, calendar_id, &created)?;
+        Ok(())
+    }
+
     async fn remove_account(&self, email: &str) -> Result<()> {
         self.clear_error();
         // Waits for a running sync to finish rather than pulling the account from under it.
@@ -314,9 +419,58 @@ impl Worker {
     }
 }
 
+/// A deleted event's resource in the form it can be created from again: without what
+/// Google assigns itself. The identifier cannot be reused, so the event comes back as a
+/// new one with the same content.
+fn restorable(mut resource: Value) -> Value {
+    if let Some(fields) = resource.as_object_mut() {
+        for assigned in [
+            "id",
+            "etag",
+            "kind",
+            "status",
+            "htmlLink",
+            "iCalUID",
+            "created",
+            "updated",
+            "creator",
+            "organizer",
+            "sequence",
+        ] {
+            fields.remove(assigned);
+        }
+    }
+    resource
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_restored_event_keeps_its_content_but_not_what_google_assigns() {
+        let deleted = json!({
+            "id": "e1", "etag": "\"1\"", "kind": "calendar#event", "status": "confirmed",
+            "htmlLink": "https://example.com/e1", "iCalUID": "e1@google.com",
+            "created": "2026-11-01T10:00:00Z", "updated": "2026-11-02T10:00:00Z",
+            "creator": {"email": "me@example.com"}, "organizer": {"email": "me@example.com"},
+            "sequence": 3,
+            "summary": "Lunch", "location": "Canteen", "colorId": "5",
+            "start": {"dateTime": "2026-11-17T12:00:00+01:00", "timeZone": "Europe/Prague"},
+            "end": {"dateTime": "2026-11-17T13:00:00+01:00", "timeZone": "Europe/Prague"},
+            "reminders": {"useDefault": true}
+        });
+        assert_eq!(
+            restorable(deleted),
+            json!({
+                "summary": "Lunch", "location": "Canteen", "colorId": "5",
+                "start": {"dateTime": "2026-11-17T12:00:00+01:00", "timeZone": "Europe/Prague"},
+                "end": {"dateTime": "2026-11-17T13:00:00+01:00", "timeZone": "Europe/Prague"},
+                "reminders": {"useDefault": true}
+            })
+        );
+    }
 
     #[test]
     fn sync_problem_reports_errors_and_unsynced_calendars_but_not_success() {

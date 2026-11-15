@@ -38,6 +38,8 @@ export struct EventDetail {
     color: color,
     // Address of the event in Google's web interface; empty if unknown.
     link: string,
+    // Whether the app can delete it itself.
+    can-delete: bool,
 }
 
 // A day of the month view.
@@ -112,6 +114,7 @@ export enum StatusKind {
     idle,
     waiting-for-browser,
     syncing,
+    saving,
     failed,
 }
 
@@ -226,7 +229,17 @@ export component AppWindow inherits Window {
     property <length> detail-x;
     property <length> detail-y;
 
+    // Which instance the details card is about.
+    property <int> detail-instance;
+    // Deletes the event behind an instance; the worker answers with delete-finished.
+    callback delete-event(int);
+    callback delete-finished(bool);
+    // A short message about the last change, with "Undo"; empty when there is none.
+    in property <string> toast;
+    callback undo();
+
     function show-detail(instance: int, x: length, y: length) {
+        detail-instance = instance;
         detail-x = x;
         detail-y = y;
         root.event-clicked(instance);
@@ -265,6 +278,14 @@ export component AppWindow inherits Window {
             }
             if (event.text == Key.Escape && root.detail-visible) {
                 root.detail-visible = false;
+                return accept;
+            }
+            if ((event.text == Key.Delete || event.text == Key.Backspace) && root.detail-visible && root.detail.can-delete) {
+                root.delete-event(root.detail-instance);
+                return accept;
+            }
+            if (event.text == "z" && root.toast != "") {
+                root.undo();
                 return accept;
             }
             if (event.text == "?") {
@@ -366,7 +387,7 @@ export component AppWindow inherits Window {
                 }
 
                 status := Text {
-                    text: root.status-kind == StatusKind.waiting-for-browser ? @tr("Finish signing in in your browser…") : root.status-kind == StatusKind.syncing ? @tr("Syncing…") : root.status-kind == StatusKind.failed ? root.status-detail : "";
+                    text: root.status-kind == StatusKind.waiting-for-browser ? @tr("Finish signing in in your browser…") : root.status-kind == StatusKind.syncing ? @tr("Syncing…") : root.status-kind == StatusKind.saving ? @tr("Saving…") : root.status-kind == StatusKind.failed ? root.status-detail : "";
                     font-size: 13px;
                     color: root.status-kind == StatusKind.failed ? Theme.danger : Theme.text-dim;
                     vertical-alignment: center;
@@ -1099,6 +1120,14 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     alignment: end;
                     spacing: 4px;
+                    if root.detail.can-delete: TextButton {
+                        text: @tr("Delete");
+                        height: 32px;
+                        text-color: Theme.danger;
+                        clicked => {
+                            root.delete-event(root.detail-instance);
+                        }
+                    }
                     if root.detail.link != "": TextButton {
                         text: @tr("Open in browser");
                         height: 32px;
@@ -1172,6 +1201,46 @@ export component AppWindow inherits Window {
             }
         }
 
+        // What just happened, with the way back. Bottom left, as on the web.
+        if root.toast != "": Rectangle {
+            x: 24px;
+            y: root.height - self.height - 24px;
+            width: toast-row.preferred-width;
+            height: 48px;
+            border-radius: 4px;
+            background: #323232;
+            drop-shadow-blur: 12px;
+            drop-shadow-offset-y: 3px;
+            drop-shadow-color: #00000040;
+            accessible-role: groupbox;
+            accessible-label: root.toast;
+
+            toast-row := HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 8px;
+                spacing: 16px;
+
+                Text {
+                    text: root.toast;
+                    font-size: 14px;
+                    color: white;
+                    vertical-alignment: center;
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    TextButton {
+                        text: @tr("Undo");
+                        height: 32px;
+                        text-color: #8ab4f8;
+                        clicked => {
+                            root.undo();
+                        }
+                    }
+                }
+            }
+        }
+
         // Keyboard shortcuts. Like the details card, an overlay that takes no focus, so
         // the shortcuts it lists keep working while it is open.
         if root.help-visible: TouchArea {
@@ -1220,6 +1289,8 @@ export component AppWindow inherits Window {
                     { keys: "a / 5", what: @tr("Schedule view") },
                     { keys: "r", what: @tr("Refresh") },
                     { keys: "Esc", what: @tr("Close event details") },
+                    { keys: "Delete", what: @tr("Delete the open event") },
+                    { keys: "z", what: @tr("Undo the deletion") },
                     { keys: "?", what: @tr("Show or hide this list") },
                 ]: HorizontalLayout {
                     spacing: 12px;

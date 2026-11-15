@@ -19,12 +19,15 @@ use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMo
 
 use crate::open_store;
 use crate::worker::{self, Command};
+use tokio::sync::mpsc::UnboundedSender;
 
 slint::include_modules!();
 
 /// How often changes are fetched from Google while the window is open. (Google can only
 /// push changes to a public web server, so a desktop app has to ask.)
 const SYNC_INTERVAL: StdDuration = StdDuration::from_secs(5 * 60);
+/// How long "Undo" stays on offer after a deletion.
+const UNDO_PERIOD: StdDuration = StdDuration::from_secs(10);
 /// The sidebar's small month always shows six weeks.
 const MINI_MONTH_DAYS: i64 = 42;
 /// How many days ahead the schedule view lists.
@@ -262,6 +265,34 @@ impl Loaded {
     }
 }
 
+/// A stored event an instance on screen belongs to.
+#[derive(Clone)]
+struct Target {
+    account: AccountId,
+    calendar_id: String,
+    event_id: String,
+    etag: Option<String>,
+}
+
+/// What undoing a deletion needs: the event as it was.
+struct Undo {
+    account: AccountId,
+    calendar_id: String,
+    resource: serde_json::Value,
+}
+
+/// Whether the app itself can delete this event. Not yet: single occurrences and whole
+/// series (which need the "this / following / all" question), events with guests (who
+/// would have to be told) and the special kinds of entry (birthdays, out of office, ...).
+/// Those are still opened in the browser.
+fn can_delete(event: &Event, calendar: &CalendarListEntry) -> bool {
+    calendar.is_writable()
+        && matches!(event.event_type.as_deref(), None | Some("default"))
+        && event.recurrence.is_empty()
+        && event.recurring_event_id.is_none()
+        && event.attendees.is_empty()
+}
+
 struct View {
     ui: slint::Weak<AppWindow>,
     store: Store,
@@ -280,6 +311,13 @@ struct View {
     timed: Rc<VecModel<TimedItem>>,
     /// Details of every instance now on screen, by the index its block or bar carries.
     details: RefCell<Vec<EventDetail>>,
+    /// Which stored event each of those instances is, for acting on it.
+    targets: RefCell<Vec<Target>>,
+    /// The event deleted last, while its deletion can still be undone.
+    undo: RefCell<Option<Undo>>,
+    /// Hides the message about the last change after a while.
+    toast_timer: Timer,
+    commands: UnboundedSender<Command>,
     all_day: Rc<VecModel<AllDayItem>>,
     month_cells: Rc<VecModel<MonthCell>>,
     month_chips: Rc<VecModel<MonthChip>>,
@@ -605,10 +643,24 @@ impl View {
                     account: email.into(),
                     color: color(index),
                     link: web_link(event, email).into(),
+                    can_delete: can_delete(event, &calendar.entry),
                 }
             })
             .collect();
         self.details.replace(details);
+        let targets = instances
+            .iter()
+            .map(|instance| {
+                let calendar = &calendars[instance.key];
+                Target {
+                    account: calendar.account_id,
+                    calendar_id: calendar.entry.id.clone(),
+                    event_id: instance.event.id.clone(),
+                    etag: instance.event.etag.clone(),
+                }
+            })
+            .collect();
+        self.targets.replace(targets);
         // What it described may have moved or gone.
         ui.set_detail_visible(false);
         Ok(())
@@ -701,6 +753,71 @@ impl View {
         self.show(self.span.get().step(self.anchor.get(), direction));
     }
 
+    /// Deletes the event behind an instance on screen. The copy kept for undoing is taken
+    /// from the cache before anything is sent.
+    fn delete_event(&self, instance: usize) {
+        let Some(target) = self.targets.borrow().get(instance).cloned() else {
+            return;
+        };
+        let resource =
+            match self
+                .store
+                .event_json(target.account, &target.calendar_id, &target.event_id)
+            {
+                Ok(Some(resource)) => resource,
+                // Gone from the cache already: a sync has removed it meanwhile.
+                Ok(None) => return,
+                Err(error) => return self.show_error(&error.into()),
+            };
+        self.undo.replace(Some(Undo {
+            account: target.account,
+            calendar_id: target.calendar_id.clone(),
+            resource,
+        }));
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_detail_visible(false);
+            ui.set_toast(SharedString::new());
+        }
+        let _ = self.commands.send(Command::DeleteEvent {
+            account: target.account,
+            calendar_id: target.calendar_id,
+            event_id: target.event_id,
+            etag: target.etag,
+        });
+    }
+
+    /// The worker has answered a deletion: offer to undo it, for a while.
+    fn delete_finished(&self, deleted: bool) {
+        if !deleted {
+            // The status line says why; there is nothing to undo.
+            self.undo.take();
+            return;
+        }
+        let Some(ui) = self.ui.upgrade() else { return };
+        ui.set_toast("Event deleted".into());
+        let ui = self.ui.clone();
+        self.toast_timer
+            .start(TimerMode::SingleShot, UNDO_PERIOD, move || {
+                if let Some(ui) = ui.upgrade() {
+                    ui.set_toast(SharedString::new());
+                }
+            });
+    }
+
+    /// Brings back the event deleted last.
+    fn undo_delete(&self) {
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_toast(SharedString::new());
+        }
+        if let Some(undo) = self.undo.take() {
+            let _ = self.commands.send(Command::RestoreEvent {
+                account: undo.account,
+                calendar_id: undo.calendar_id,
+                resource: undo.resource,
+            });
+        }
+    }
+
     /// Opens the day view on the day of a cell of the month grid.
     fn open_day(&self, cell: i64) {
         let day = self.range().0 + Duration::days(cell);
@@ -712,6 +829,7 @@ impl View {
 pub fn run() -> Result<()> {
     let ui = AppWindow::new()?;
     let zone = local_zone();
+    let commands = worker::spawn(ui.as_weak());
     let view = Rc::new(View {
         ui: ui.as_weak(),
         store: open_store()?,
@@ -725,6 +843,10 @@ pub fn run() -> Result<()> {
         days: Rc::default(),
         timed: Rc::default(),
         details: RefCell::default(),
+        targets: RefCell::default(),
+        undo: RefCell::default(),
+        toast_timer: Timer::default(),
+        commands: commands.clone(),
         all_day: Rc::default(),
         month_cells: Rc::default(),
         month_chips: Rc::default(),
@@ -749,8 +871,18 @@ pub fn run() -> Result<()> {
             .collect::<Vec<_>>(),
     ))));
 
-    let commands = worker::spawn(ui.as_weak());
-
+    ui.on_delete_event({
+        let view = view.clone();
+        move |instance| view.delete_event(instance as usize)
+    });
+    ui.on_delete_finished({
+        let view = view.clone();
+        move |deleted| view.delete_finished(deleted)
+    });
+    ui.on_undo({
+        let view = view.clone();
+        move || view.undo_delete()
+    });
     ui.on_go_today({
         let view = view.clone();
         move || view.show(view.today())
@@ -985,6 +1117,37 @@ mod tests {
             "https://www.google.com/calendar/event?eid=abc&authuser=me@example.com"
         );
         assert_eq!(web_link(&Event::default(), "me@example.com"), "");
+    }
+
+    #[test]
+    fn only_plain_events_in_writable_calendars_can_be_deleted_here() {
+        let calendar = |role: &str| -> CalendarListEntry {
+            serde_json::from_value(serde_json::json!({"id": "c", "accessRole": role})).unwrap()
+        };
+        let event = |extra: serde_json::Value| -> Event {
+            let mut value = serde_json::json!({"id": "e"});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(value).unwrap()
+        };
+        let plain = event(serde_json::json!({}));
+        assert!(can_delete(&plain, &calendar("owner")));
+        assert!(can_delete(&plain, &calendar("writer")));
+        assert!(!can_delete(&plain, &calendar("reader")));
+        assert!(!can_delete(&plain, &calendar("freeBusyReader")));
+        let owner = calendar("owner");
+        let series = event(serde_json::json!({"recurrence": ["RRULE:FREQ=DAILY"]}));
+        let occurrence = event(serde_json::json!({"recurringEventId": "m"}));
+        let with_guests = event(serde_json::json!({"attendees": [{"email": "a@example.com"}]}));
+        assert!(!can_delete(&series, &owner));
+        assert!(!can_delete(&occurrence, &owner));
+        assert!(!can_delete(&with_guests, &owner));
+        let birthday = event(serde_json::json!({"eventType": "birthday"}));
+        let ordinary = event(serde_json::json!({"eventType": "default"}));
+        assert!(!can_delete(&birthday, &owner));
+        assert!(can_delete(&ordinary, &owner));
     }
 
     #[test]
