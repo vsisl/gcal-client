@@ -216,10 +216,12 @@ pub fn split_dates(recurrence: &[String], boundary: EventTime, later: bool) -> V
             let kept: Vec<&str> = values
                 .split(',')
                 .filter(|value| {
-                    let value = digits(value);
+                    // Compared as bytes: the lines come from calendars other people
+                    // share, and text cut in the middle of a character would panic.
+                    let value = digits(value).as_bytes();
                     // A date without a time is compared with the boundary's day.
                     let length = value.len().min(boundary.len());
-                    (value[..length] >= boundary[..length]) == later
+                    (value[..length] >= boundary.as_bytes()[..length]) == later
                 })
                 .collect();
             (!kept.is_empty()).then(|| format!("{head}:{}", kept.join(",")))
@@ -318,6 +320,11 @@ pub fn shift_weekdays(recurrence: &[String], days: i64) -> Vec<String> {
             .split(',')
             .map(|entry| {
                 // An entry may carry a number in front: "2MO" is the second Monday.
+                // Anything that is not plain letters and digits is left as it is
+                // (and must not be cut in the middle of a character).
+                if !entry.is_ascii() {
+                    return entry.to_owned();
+                }
                 let split = entry.len().saturating_sub(2);
                 let (ordinal, name) = entry.split_at(split);
                 match NAMES.iter().position(|n| n.eq_ignore_ascii_case(name)) {
@@ -1077,6 +1084,21 @@ mod tests {
                 "EXDATE:20261123T100000Z"
             ])
         );
+    }
+
+    #[test]
+    fn rules_with_text_that_is_not_ascii_are_left_alone_not_panicked_on() {
+        let lines = |lines: &[&str]| lines.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+        let odd = lines(&[
+            "RRULE:FREQ=WEEKLY;BYDAY=Mé,ÿ",
+            "RDATE:2026é1121,ÿ,20261121T100000Z",
+        ]);
+        let cut = EventTime::Timed(instant("2026-11-19T10:00:00Z"));
+        assert_eq!(shift_weekdays(&odd, 1)[0], "RRULE:FREQ=WEEKLY;BYDAY=Mé,ÿ");
+        // No particular answer is promised for nonsense; only that it returns.
+        let _ = split_dates(&odd, cut, true);
+        let _ = end_series_before(&odd, cut);
+        let _ = remaining_series(&odd, 2);
     }
 
     #[test]
