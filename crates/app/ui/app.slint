@@ -38,6 +38,8 @@ export struct AllDayItem {
 export struct EventDetail {
     title: string,
     when: string,
+    // The event's own time zone, when it is not the one the times are shown in.
+    zone: string,
     location: string,
     description: string,
     calendar: string,
@@ -478,6 +480,15 @@ export component AppWindow inherits Window {
     property <bool> is-month: root.view-index == 2;
     property <bool> is-schedule: root.view-index == 4;
     property <bool> is-year: root.view-index == 5;
+    // The views in the order of their numbers, and the key of each. The fourth has as
+    // many days as the settings say.
+    in property <int> custom-days: 4;
+    property <[string]> view-labels: [@tr("Day"), @tr("Week"), @tr("Month"), @tr("{} days", root.custom-days), @tr("Schedule"), @tr("Year")];
+    property <[string]> view-keys: ["D", "W", "M", "X", "A", "Y"];
+    property <bool> view-menu-visible;
+    property <length> view-menu-x;
+    in-out property <int> custom-days-choice: 2;
+    callback custom-days-chosen(int);
     // All events of one day of the month view, behind its "N more": Rust fills the
     // list for the cell asked for and shows it where the click was.
     callback day-list-requested(int);
@@ -835,6 +846,14 @@ export component AppWindow inherits Window {
                 root.goto-visible = true;
                 return accept;
             }
+            if (root.view-menu-visible) {
+                if (event.text == Key.Escape) {
+                    root.view-menu-visible = false;
+                    return accept;
+                }
+                // A view's key picks it, as with the menu closed.
+                root.view-menu-visible = false;
+            }
             if (event.text == Key.Escape && root.day-list-visible && !root.detail-visible) {
                 root.day-list-visible = false;
                 return accept;
@@ -971,14 +990,16 @@ export component AppWindow inherits Window {
                     max-width: 420px;
                 }
 
-                for label[index] in [@tr("Day"), @tr("Week"), @tr("Month"), @tr("4 days"), @tr("Schedule"), @tr("Year")]: VerticalLayout {
+                // The view, as a button that opens the list of views, as on the web.
+                VerticalLayout {
                     alignment: center;
                     TextButton {
-                        text: label;
-                        outlined: root.view-index == index;
-                        text-color: root.view-index == index ? Theme.accent : Theme.text;
+                        text: "\{root.view-labels[root.view-index]}  ▾";
+                        outlined: true;
+                        accessible-label: @tr("View: {}", root.view-labels[root.view-index]);
                         clicked => {
-                            root.set-view(index);
+                            root.view-menu-x = self.absolute-position.x;
+                            root.view-menu-visible = true;
                         }
                     }
                 }
@@ -1994,6 +2015,71 @@ export component AppWindow inherits Window {
             }
         }
 
+        // The list of views, under its button.
+        if root.view-menu-visible: TouchArea {
+            clicked => {
+                root.view-menu-visible = false;
+            }
+        }
+        if root.view-menu-visible: Rectangle {
+            x: Math.max(12px, Math.min(root.view-menu-x, root.width - self.width - 12px));
+            y: 56px;
+            width: 200px;
+            height: view-menu-box.preferred-height;
+            background: Theme.card;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: Theme.line;
+            drop-shadow-blur: 16px;
+            drop-shadow-offset-y: 4px;
+            drop-shadow-color: #00000040;
+            clip: true;
+            accessible-role: groupbox;
+            accessible-label: @tr("View");
+
+            view-menu-box := VerticalLayout {
+                padding-top: 6px;
+                padding-bottom: 6px;
+
+                for label[index] in root.view-labels: Rectangle {
+                    height: 36px;
+                    background: root.view-index == index ? Theme.selected : view-touch.has-hover ? Theme.hover : transparent;
+                    accessible-role: list-item;
+                    accessible-label: label;
+                    accessible-item-selected: root.view-index == index;
+                    accessible-action-default => {
+                        root.view-menu-visible = false;
+                        root.set-view(index);
+                    }
+
+                    view-touch := TouchArea {
+                        clicked => {
+                            root.view-menu-visible = false;
+                            root.set-view(index);
+                        }
+                    }
+
+                    Text {
+                        x: 16px;
+                        height: parent.height;
+                        text: label;
+                        font-size: 14px;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                    }
+
+                    Text {
+                        x: parent.width - 16px - self.width;
+                        height: parent.height;
+                        text: root.view-keys[index];
+                        font-size: 12px;
+                        color: Theme.text-dim;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
         // All events of a day of the month view. Under the details card, which opens
         // from it.
         if root.day-list-visible: TouchArea {
@@ -2186,6 +2272,13 @@ export component AppWindow inherits Window {
                             text: root.detail.when;
                             font-size: 13px;
                             color: Theme.text;
+                            wrap: word-wrap;
+                        }
+
+                        if root.detail.zone != "": Text {
+                            text: root.detail.zone;
+                            font-size: 12px;
+                            color: Theme.text-dim;
                             wrap: word-wrap;
                         }
                     }
@@ -2949,6 +3042,26 @@ export component AppWindow inherits Window {
                 }
 
                 Text {
+                    text: @tr("Days in the custom view (X)");
+                    font-size: 12px;
+                    font-weight: 500;
+                    color: Theme.text-dim;
+                }
+
+                Choice {
+                    options: [@tr("2 days"), @tr("3 days"), @tr("4 days"), @tr("5 days"), @tr("6 days"), @tr("7 days")];
+                    current: root.custom-days-choice;
+                    chosen(i) => {
+                        root.custom-days-choice = i;
+                        root.custom-days-chosen(i);
+                    }
+                }
+
+                Rectangle {
+                    height: 8px;
+                }
+
+                Text {
                     text: @tr("Time format");
                     font-size: 12px;
                     font-weight: 500;
@@ -3074,7 +3187,7 @@ export component AppWindow inherits Window {
                     { keys: "d / 1", what: @tr("Day view") },
                     { keys: "w / 2", what: @tr("Week view") },
                     { keys: "m / 3", what: @tr("Month view") },
-                    { keys: "x / 4", what: @tr("4 days view") },
+                    { keys: "x / 4", what: @tr("Custom view (a few days)") },
                     { keys: "a / 5", what: @tr("Schedule view") },
                     { keys: "y / 6", what: @tr("Year view") },
                     { keys: "r", what: @tr("Refresh") },

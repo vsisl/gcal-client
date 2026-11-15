@@ -42,6 +42,8 @@ const THEME: &str = "theme";
 const WEEK_START: &str = "week_start";
 const TWELVE_HOUR: &str = "twelve_hour";
 const LAST_VIEW: &str = "last_view";
+/// Setting: how many days the custom view shows.
+const CUSTOM_DAYS: &str = "custom_days";
 /// Setting: the height of an hour in the day columns, in pixels (the zoom).
 const HOUR_HEIGHT: &str = "hour_height";
 /// How long "Undo" stays on offer after a deletion.
@@ -154,6 +156,8 @@ struct Prefs {
     /// The first day of the week, counted from Monday (0) to Sunday (6).
     week_start: u32,
     twelve_hour: bool,
+    /// How many days the custom view shows: 2 to 7.
+    custom_days: i64,
 }
 
 thread_local! {
@@ -161,7 +165,13 @@ thread_local! {
     /// does so in dozens of places far from the window's state; the choice is kept
     /// here for them rather than handed through every one. Tests, each on a thread of
     /// its own, see the defaults: Monday and the 24-hour clock.
-    static PREFS: Cell<Prefs> = const { Cell::new(Prefs { week_start: 0, twelve_hour: false }) };
+    static PREFS: Cell<Prefs> = const {
+        Cell::new(Prefs {
+            week_start: 0,
+            twelve_hour: false,
+            custom_days: 4,
+        })
+    };
 }
 
 fn prefs() -> Prefs {
@@ -214,7 +224,7 @@ impl Span {
     fn range(self, anchor: NaiveDate) -> (NaiveDate, i64) {
         match self {
             Span::Day => (anchor, 1),
-            Span::FourDays => (anchor, 4),
+            Span::FourDays => (anchor, prefs().custom_days),
             Span::Schedule => (anchor, SCHEDULE_DAYS),
             Span::Week => (week_start_of(anchor), 7),
             Span::Year => {
@@ -309,6 +319,33 @@ fn when_text(start: EventTime, end: EventTime, zone: Tz) -> String {
 
 /// The event's page in Google's web interface, opened for the account that owns it (the
 /// browser may be signed in to several).
+/// For an event made in another time zone than the one times are shown in: its times
+/// on its own clock, as "10:00 – 11:00 in Asia/Tokyo". Empty otherwise.
+fn own_zone_text(event: &Event, start: EventTime, end: EventTime, shown_in: Tz) -> String {
+    let (EventTime::Timed(start), EventTime::Timed(end)) = (start, end) else {
+        return String::new();
+    };
+    let Some(own) = event
+        .start
+        .as_ref()
+        .and_then(|start| start.time_zone.as_deref())
+        .and_then(|name| name.parse::<Tz>().ok())
+    else {
+        return String::new();
+    };
+    // Zones with other names may still keep the same time (Prague and Zurich).
+    let offset = |zone: Tz, at: DateTime<Utc>| at.with_timezone(&zone).naive_local();
+    if offset(own, start) == offset(shown_in, start) && offset(own, end) == offset(shown_in, end) {
+        return String::new();
+    }
+    format!(
+        "{} – {} in {}",
+        clock(start, own),
+        clock(end, own),
+        own.name().replace('_', " ")
+    )
+}
+
 fn web_link(event: &Event, account_email: &str) -> String {
     match &event.html_link {
         Some(link) => {
@@ -1020,7 +1057,10 @@ impl View {
         let Prefs {
             week_start,
             twelve_hour,
+            custom_days,
         } = prefs();
+        ui.set_custom_days(custom_days as i32);
+        ui.set_custom_days_choice(custom_days as i32 - 2);
         // 2026-11-16 is a Monday.
         let monday = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap_or_default();
         let names: Vec<SharedString> = (0..7)
@@ -1400,6 +1440,7 @@ impl View {
                 EventDetail {
                     title: title(index),
                     when: when_text(instance.start, instance.end, self.zone).into(),
+                    zone: own_zone_text(event, instance.start, instance.end, self.zone).into(),
                     location: event.location.as_deref().unwrap_or("").into(),
                     description: plain_text(event.description.as_deref().unwrap_or("")).into(),
                     calendar: calendar.entry.display_name().into(),
@@ -2279,6 +2320,9 @@ pub fn run() -> Result<()> {
     PREFS.set(Prefs {
         week_start: number(WEEK_START).filter(|day| *day < 7).unwrap_or(0),
         twelve_hour: number(TWELVE_HOUR) == Some(1),
+        custom_days: number(CUSTOM_DAYS)
+            .filter(|days| (2..=7).contains(days))
+            .map_or(4, i64::from),
     });
     view.apply_prefs();
     if let Some(span) = number(LAST_VIEW).and_then(|index| Span::ALL.get(index as usize)) {
@@ -2294,6 +2338,22 @@ pub fn run() -> Result<()> {
                 ..prefs()
             });
             let _ = view.store.set_setting(WEEK_START, &week_start.to_string());
+            view.apply_prefs();
+            view.refresh();
+        }
+    });
+    ui.on_custom_days_chosen({
+        let view = view.clone();
+        move |choice| {
+            // The list offers 2 to 7 days.
+            let custom_days = i64::from(choice.clamp(0, 5)) + 2;
+            PREFS.set(Prefs {
+                custom_days,
+                ..prefs()
+            });
+            let _ = view
+                .store
+                .set_setting(CUSTOM_DAYS, &custom_days.to_string());
             view.apply_prefs();
             view.refresh();
         }
@@ -2727,6 +2787,39 @@ mod tests {
             all_day("2026-11-17", "2026-11-20"),
             "17 November 2026 – 19 November 2026"
         );
+    }
+
+    #[test]
+    fn an_event_from_another_time_zone_says_its_own_time() {
+        let prague: Tz = "Europe/Prague".parse().unwrap();
+        let event = |zone: &str| -> Event {
+            serde_json::from_value(serde_json::json!({
+                "id": "e",
+                "start": {"dateTime": "2026-11-17T01:00:00Z", "timeZone": zone},
+                "end": {"dateTime": "2026-11-17T02:00:00Z", "timeZone": zone}
+            }))
+            .unwrap()
+        };
+        let (start, end) = (
+            EventTime::Timed("2026-11-17T01:00:00Z".parse().unwrap()),
+            EventTime::Timed("2026-11-17T02:00:00Z".parse().unwrap()),
+        );
+        assert_eq!(
+            own_zone_text(&event("Asia/Tokyo"), start, end, prague),
+            "10:00 – 11:00 in Asia/Tokyo"
+        );
+        assert_eq!(
+            own_zone_text(&event("America/New_York"), start, end, prague),
+            "20:00 – 21:00 in America/New York"
+        );
+        // The same clock under another name, no zone at all, or nonsense: nothing.
+        assert_eq!(
+            own_zone_text(&event("Europe/Zurich"), start, end, prague),
+            ""
+        );
+        assert_eq!(own_zone_text(&event("Not/AZone"), start, end, prague), "");
+        let day = EventTime::AllDay(date("2026-11-17"));
+        assert_eq!(own_zone_text(&event("Asia/Tokyo"), day, day, prague), "");
     }
 
     #[test]
