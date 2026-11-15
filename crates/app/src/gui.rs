@@ -108,6 +108,41 @@ fn local_zone() -> Tz {
         .unwrap_or(chrono_tz::UTC)
 }
 
+/// The date someone typed into "go to date", if it can be read as one: `2026-11-17`,
+/// `17.11.2026`, `17/11/2026`, `17.11.` (this year), or today, tomorrow, yesterday.
+fn typed_date(text: &str, today: NaiveDate) -> Option<NaiveDate> {
+    let text = text.trim().to_lowercase();
+    match text.as_str() {
+        "today" => return Some(today),
+        "tomorrow" => return Some(today + Duration::days(1)),
+        "yesterday" => return Some(today - Duration::days(1)),
+        _ => {}
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(&text, "%Y-%m-%d") {
+        return Some(date);
+    }
+    // Day first, as in most of the world; the separator may be a dot, slash or dash.
+    let parts: Vec<&str> = text
+        .split(['.', '/', '-', ' '])
+        .filter(|part| !part.is_empty())
+        .collect();
+    let number = |part: &&str| part.parse::<u32>().ok();
+    match parts.as_slice() {
+        [day, month] => NaiveDate::from_ymd_opt(today.year(), number(month)?, number(day)?),
+        [day, month, year] => {
+            let year = year.parse::<i32>().ok()?;
+            // "26" means 2026.
+            let year = if (0..100).contains(&year) {
+                2000 + year
+            } else {
+                year
+            };
+            NaiveDate::from_ymd_opt(year, number(month)?, number(day)?)
+        }
+        _ => None,
+    }
+}
+
 /// The Monday on or before `day`. (The first day of the week becomes a setting in M2.)
 fn week_start_of(day: NaiveDate) -> NaiveDate {
     day - Duration::days(i64::from(day.weekday().num_days_from_monday()))
@@ -2167,6 +2202,22 @@ pub fn run() -> Result<()> {
         let view = view.clone();
         move || view.undo_delete()
     });
+    ui.on_goto_date({
+        let view = view.clone();
+        move |text| {
+            let Some(ui) = view.ui.upgrade() else { return };
+            match typed_date(&text, view.today()) {
+                Some(date) => {
+                    ui.set_goto_error(SharedString::new());
+                    ui.set_goto_visible(false);
+                    view.show(date);
+                }
+                None => ui.set_goto_error(
+                    "That is not a date this understands. Try 17.11.2026 or 2026-11-17.".into(),
+                ),
+            }
+        }
+    });
     ui.on_go_today({
         let view = view.clone();
         move || view.show(view.today())
@@ -2302,6 +2353,22 @@ mod tests {
 
     fn date(text: &str) -> NaiveDate {
         text.parse().unwrap()
+    }
+
+    #[test]
+    fn a_typed_date_is_read_in_the_usual_ways() {
+        let today = date("2026-11-15");
+        let read = |text: &str| typed_date(text, today);
+        assert_eq!(read("2026-11-17"), Some(date("2026-11-17")));
+        assert_eq!(read(" 17.11.2026 "), Some(date("2026-11-17")));
+        assert_eq!(read("17/11/26"), Some(date("2026-11-17")));
+        assert_eq!(read("1. 2."), Some(date("2026-02-01")));
+        assert_eq!(read("Tomorrow"), Some(date("2026-11-16")));
+        assert_eq!(read("today"), Some(today));
+        assert_eq!(read("yesterday"), Some(date("2026-11-14")));
+        for nonsense in ["", "soon", "31.2.2026", "17", "1.2.3.4", "é.ÿ"] {
+            assert_eq!(read(nonsense), None, "{nonsense}");
+        }
     }
 
     #[test]
