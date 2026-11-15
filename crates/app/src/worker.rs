@@ -11,6 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use gcal_google::{ClientConfig, Endpoints, GoogleClient, HttpClient, SCOPE_CALENDAR};
 use slint::Weak;
+use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::gui::{AppWindow, StatusKind};
@@ -48,16 +49,30 @@ pub fn spawn(ui: Weak<AppWindow>) -> UnboundedSender<Command> {
 struct Worker {
     ui: Weak<AppWindow>,
     http: HttpClient,
-    /// Set while a sign-in or a sync is under way, so a second one is not started on top.
-    signing_in: Rc<Cell<bool>>,
+    /// Wakes a sign-in that is waiting on the browser, telling it to give up: asking to add
+    /// an account again replaces the earlier attempt (the user may have closed its tab).
+    cancel_sign_in: Rc<Notify>,
+    /// Set while a sync is under way, so a second one is not started on top.
     syncing: Rc<Cell<bool>>,
 }
+
+/// Returned by a sign-in that was replaced by a newer one; not shown to the user.
+#[derive(Debug)]
+struct Superseded;
+
+impl std::fmt::Display for Superseded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("sign-in replaced by a newer attempt")
+    }
+}
+
+impl std::error::Error for Superseded {}
 
 async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
     let worker = Worker {
         ui,
         http: HttpClient::new(),
-        signing_in: Rc::default(),
+        cancel_sign_in: Rc::default(),
         syncing: Rc::default(),
     };
     while let Some(command) = commands.recv().await {
@@ -72,6 +87,8 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
             };
             match result {
                 Ok(()) => worker.report(StatusKind::Idle, String::new()),
+                // The newer attempt owns the status line now.
+                Err(error) if error.is::<Superseded>() => return,
                 Err(error) => worker.report(StatusKind::Failed, format!("{error:#}")),
             }
             worker.data_changed();
@@ -101,15 +118,9 @@ impl Worker {
     }
 
     async fn add_account(&self) -> Result<()> {
-        if self.signing_in.replace(true) {
-            return Ok(());
-        }
-        let result = self.sign_in_and_sync().await;
-        self.signing_in.set(false);
-        result
-    }
-
-    async fn sign_in_and_sync(&self) -> Result<()> {
+        // Only attempts already waiting on the browser are listening, so this never
+        // cancels the attempt being started here.
+        self.cancel_sign_in.notify_waiters();
         let config = load_config()?;
         let endpoints = Endpoints::default();
         let vault = Vault::open().await?;
@@ -118,9 +129,12 @@ impl Worker {
         self.report(StatusKind::WaitingForBrowser, String::new());
         open::that_detached(&pending.auth_url).context("cannot open your browser")?;
         let finish = pending.finish(&self.http, &config, &endpoints);
-        let tokens = tokio::time::timeout(SIGN_IN_TIMEOUT, finish)
-            .await
-            .context("sign-in was not finished in the browser")??;
+        let tokens = tokio::select! {
+            finished = tokio::time::timeout(SIGN_IN_TIMEOUT, finish) => {
+                finished.context("sign-in was not finished in the browser")??
+            }
+            () = self.cancel_sign_in.notified() => return Err(Superseded.into()),
+        };
         let refresh_token = tokens
             .refresh_token
             .context("Google sent no refresh token")?;
