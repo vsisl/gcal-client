@@ -303,6 +303,8 @@ impl Worker {
         };
         Vault::open().await?.delete(email).await?;
         store.remove_account(account.id)?;
+        // The account is gone either way; a file left larger than needed is no failure.
+        let _ = store.compact();
         Ok(())
     }
 }

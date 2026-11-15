@@ -136,6 +136,13 @@ impl Store {
         Ok(())
     }
 
+    /// Gives the space of deleted rows back to the disk. SQLite otherwise keeps the file
+    /// at its largest size, and removing an account can free most of it.
+    pub fn compact(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM")?;
+        Ok(())
+    }
+
     pub fn accounts(&self) -> Result<Vec<Account>> {
         let mut stmt = self
             .conn
