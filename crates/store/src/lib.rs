@@ -84,6 +84,13 @@ const MIGRATIONS: &[&str] = &[
     -- the JSON so that syncing the calendar list does not overwrite it.
     ALTER TABLE calendars ADD COLUMN shown_override INTEGER;
 ",
+    "
+    -- What this app remembers for the user on this computer.
+    CREATE TABLE settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+",
 ];
 
 pub struct Store {
@@ -263,6 +270,25 @@ impl Store {
                 ))
         });
         Ok(calendars)
+    }
+
+    /// A value this app remembers on this computer, if it was ever set.
+    pub fn setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()?)
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
     }
 
     /// Remembers the user's choice to show or hide a calendar in this app.
@@ -654,6 +680,15 @@ mod tests {
 
         store.remove_event(account, "cal", "e").unwrap();
         assert_eq!(store.event_json(account, "cal", "e").unwrap(), None);
+    }
+
+    #[test]
+    fn settings_are_remembered_and_can_be_changed() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.setting("k").unwrap(), None);
+        store.set_setting("k", "one").unwrap();
+        store.set_setting("k", "two").unwrap();
+        assert_eq!(store.setting("k").unwrap().as_deref(), Some("two"));
     }
 
     #[test]

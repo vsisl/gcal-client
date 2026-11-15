@@ -92,6 +92,13 @@ export struct MiniDay {
     shown: bool,
 }
 
+// A calendar a new event can be put in.
+export struct DraftCalendar {
+    name: string,
+    account: string,
+    color: color,
+}
+
 export struct DayHeader {
     weekday: string,
     number: string,
@@ -236,6 +243,32 @@ export component AppWindow inherits Window {
     callback delete-finished(bool);
     // A short message about the last change, with "Undo"; empty when there is none.
     in property <string> toast;
+    in property <bool> toast-undo;
+    // A new event: asked for with a day (counted from the first one shown; negative for
+    // "about now"), the minute of the day, and whether it is to last all day. Rust fills
+    // in the card's properties and shows it.
+    callback draft-requested(int, int, bool);
+    // Title and the position of the chosen calendar.
+    callback draft-save(string, int);
+    callback event-created();
+    in-out property <bool> draft-visible;
+    in property <string> draft-when;
+    in property <[DraftCalendar]> draft-calendars;
+    in-out property <int> draft-calendar;
+    // Where the new event's ghost is drawn in the day columns; day -1 for none.
+    in property <int> draft-day: -1;
+    in property <int> draft-min;
+
+    function ask-draft(day: int, minute: int, all-day: bool, x: length, y: length) {
+        detail-x = x;
+        detail-y = y;
+        root.draft-requested(day, minute, all-day);
+    }
+
+    function close-draft() {
+        root.draft-visible = false;
+        keys.focus();
+    }
     callback undo();
 
     function show-detail(instance: int, x: length, y: length) {
@@ -284,7 +317,11 @@ export component AppWindow inherits Window {
                 root.delete-event(root.detail-instance);
                 return accept;
             }
-            if (event.text == "z" && root.toast != "") {
+            if (event.text == "c") {
+                root.ask-draft(-1, 0, false, root.width / 2 - 200px, root.height / 3);
+                return accept;
+            }
+            if (event.text == "z" && root.toast != "" && root.toast-undo) {
                 root.undo();
                 return accept;
             }
@@ -730,6 +767,17 @@ export component AppWindow inherits Window {
                             content-width: self.width;
                             content-height: hour-h * 24;
 
+                            // Empty time: a click starts a new event there. Events are drawn
+                            // later, so theirs come first.
+                            TouchArea {
+                                x: gutter;
+                                width: parent.width - gutter;
+                                height: hour-h * 24;
+                                clicked => {
+                                    root.ask-draft(Math.floor(self.mouse-x / day-w), Math.floor(self.mouse-y / (hour-h / 2)) * 30, false, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                }
+                            }
+
                             for h in 24: Rectangle {
                                 x: gutter - 8px;
                                 y: h * hour-h;
@@ -813,6 +861,17 @@ export component AppWindow inherits Window {
                                 }
                             }
 
+                            // The new event being typed in.
+                            if root.draft-visible && root.draft-day >= 0: Rectangle {
+                                x: gutter + root.draft-day * day-w + 1px;
+                                y: root.draft-min / 60.0 * hour-h;
+                                width: day-w - 10px;
+                                height: hour-h - 1px;
+                                border-radius: 4px;
+                                background: Theme.accent;
+                                opacity: 0.6;
+                            }
+
                             // Current time.
                             if root.now-day >= 0: Rectangle {
                                 x: gutter + root.now-day * day-w;
@@ -853,6 +912,13 @@ export component AppWindow inherits Window {
                             y: month-names-h + Math.floor(i / 7) * month-row-h;
                             width: month-col-w;
                             height: month-row-h;
+
+                            // An empty part of the cell: a click starts an all-day event.
+                            TouchArea {
+                                clicked => {
+                                    root.ask-draft(i, 0, true, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                                }
+                            }
 
                             Rectangle {
                                 x: 0;
@@ -1201,6 +1267,150 @@ export component AppWindow inherits Window {
             }
         }
 
+        // A new event. Unlike the other cards this one is typed into, so its text field
+        // takes the keyboard until the card closes.
+        if root.draft-visible: TouchArea {
+            clicked => {
+                root.close-draft();
+            }
+        }
+        if root.draft-visible: Rectangle {
+            property <length> margin: 12px;
+            width: Math.min(400px, root.width - 2 * self.margin);
+            height: Math.min(draft.preferred-height, root.height - 2 * self.margin);
+            x: Math.max(self.margin, Math.min(root.detail-x + 12px, root.width - self.width - self.margin));
+            y: Math.max(self.margin, Math.min(root.detail-y - 24px, root.height - self.height - self.margin));
+            background: Theme.surface;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.line;
+            drop-shadow-blur: 24px;
+            drop-shadow-offset-y: 6px;
+            drop-shadow-color: #00000040;
+            clip: true;
+            accessible-role: groupbox;
+            accessible-label: @tr("New event");
+
+            TouchArea { }
+
+            draft := VerticalLayout {
+                padding: 16px;
+                spacing: 10px;
+
+                Rectangle {
+                    height: 40px;
+                    border-radius: 4px;
+                    background: Theme.hover;
+
+                    if draft-title.text == "": Text {
+                        x: 12px;
+                        text: @tr("Add title");
+                        font-size: 18px;
+                        color: Theme.text-dim;
+                        vertical-alignment: center;
+                    }
+                    draft-title := TextInput {
+                        x: 12px;
+                        width: parent.width - 24px;
+                        font-size: 18px;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                        single-line: true;
+                        accessible-label: @tr("Title");
+                        init => {
+                            self.focus();
+                        }
+                        accepted => {
+                            root.draft-save(self.text, root.draft-calendar);
+                            root.close-draft();
+                        }
+                        key-pressed(event) => {
+                            if (event.text == Key.Escape) {
+                                root.close-draft();
+                                return accept;
+                            }
+                            reject
+                        }
+                    }
+                }
+
+                Text {
+                    text: root.draft-when;
+                    font-size: 13px;
+                    color: Theme.text;
+                    wrap: word-wrap;
+                }
+
+                // Which calendar it goes into, of all accounts.
+                Flickable {
+                    height: Math.min(5, root.draft-calendars.length) * 30px;
+                    interactive: false;
+                    content-height: root.draft-calendars.length * 30px;
+
+                    for calendar[i] in root.draft-calendars: Rectangle {
+                        y: i * 30px;
+                        height: 30px;
+                        border-radius: 4px;
+                        background: root.draft-calendar == i ? Theme.selected : choose.has-hover ? Theme.hover : transparent;
+                        accessible-role: list-item;
+                        accessible-label: "\{calendar.name}, \{calendar.account}";
+                        accessible-action-default => {
+                            root.draft-calendar = i;
+                        }
+
+                        choose := TouchArea {
+                            clicked => {
+                                root.draft-calendar = i;
+                            }
+                        }
+
+                        Rectangle {
+                            x: 8px;
+                            y: (parent.height - self.height) / 2;
+                            width: 12px;
+                            height: 12px;
+                            border-radius: 6px;
+                            background: calendar.color;
+                        }
+
+                        Text {
+                            x: 28px;
+                            width: parent.width - 36px;
+                            height: parent.height;
+                            text: calendar.name == calendar.account ? calendar.name : "\{calendar.name} · \{calendar.account}";
+                            font-size: 13px;
+                            color: Theme.text;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 4px;
+                    TextButton {
+                        text: @tr("Cancel");
+                        height: 32px;
+                        clicked => {
+                            root.close-draft();
+                        }
+                    }
+
+                    TextButton {
+                        text: @tr("Save");
+                        height: 32px;
+                        outlined: true;
+                        text-color: Theme.accent;
+                        clicked => {
+                            root.draft-save(draft-title.text, root.draft-calendar);
+                            root.close-draft();
+                        }
+                    }
+                }
+            }
+        }
+
         // What just happened, with the way back. Bottom left, as on the web.
         if root.toast != "": Rectangle {
             x: 24px;
@@ -1227,7 +1437,7 @@ export component AppWindow inherits Window {
                     vertical-alignment: center;
                 }
 
-                VerticalLayout {
+                if root.toast-undo: VerticalLayout {
                     alignment: center;
                     TextButton {
                         text: @tr("Undo");
@@ -1288,6 +1498,7 @@ export component AppWindow inherits Window {
                     { keys: "x / 4", what: @tr("4 days view") },
                     { keys: "a / 5", what: @tr("Schedule view") },
                     { keys: "r", what: @tr("Refresh") },
+                    { keys: "c", what: @tr("Create an event") },
                     { keys: "Esc", what: @tr("Close event details") },
                     { keys: "Delete", what: @tr("Delete the open event") },
                     { keys: "z", what: @tr("Undo the deletion") },

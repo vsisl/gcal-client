@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::time::Duration as StdDuration;
 
 use anyhow::Result;
-use chrono::{DateTime, Datelike, Duration, Months, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, Months, NaiveDate, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use gcal_core::month::{MonthLayout, layout_month};
 use gcal_core::recurrence::{Series, single_instance};
@@ -26,6 +26,8 @@ slint::include_modules!();
 /// How often changes are fetched from Google while the window is open. (Google can only
 /// push changes to a public web server, so a desktop app has to ask.)
 const SYNC_INTERVAL: StdDuration = StdDuration::from_secs(5 * 60);
+/// The setting that remembers which calendar the previous new event went to.
+const NEW_EVENT_CALENDAR: &str = "new_event_calendar";
 /// How long "Undo" stays on offer after a deletion.
 const UNDO_PERIOD: StdDuration = StdDuration::from_secs(10);
 /// The sidebar's small month always shows six weeks.
@@ -281,6 +283,52 @@ struct Undo {
     resource: serde_json::Value,
 }
 
+/// A new event being typed in.
+struct Draft {
+    start: EventTime,
+    end: EventTime,
+    /// The calendars on offer, in the order shown: account, calendar, and the text under
+    /// which the choice is remembered.
+    calendars: Vec<(AccountId, String, String)>,
+}
+
+/// When a new event starts and ends: an hour from the time clicked, or the whole day.
+fn draft_times(day: NaiveDate, minute: i32, all_day: bool, zone: Tz) -> (EventTime, EventTime) {
+    if all_day {
+        return (
+            EventTime::AllDay(day),
+            EventTime::AllDay(day + Duration::days(1)),
+        );
+    }
+    let local = day.and_time(chrono::NaiveTime::MIN) + Duration::minutes(i64::from(minute));
+    // A time skipped by the clocks going forward starts at the day's first valid instant.
+    let start = zone
+        .from_local_datetime(&local)
+        .earliest()
+        .map(|start| start.with_timezone(&Utc))
+        .unwrap_or_else(|| local_day_start(day, zone));
+    (
+        EventTime::Timed(start),
+        EventTime::Timed(start + Duration::hours(1)),
+    )
+}
+
+/// The resource Google creates an event from.
+fn event_resource(title: &str, start: EventTime, end: EventTime, zone: Tz) -> serde_json::Value {
+    let time = |time: EventTime| match time {
+        EventTime::AllDay(day) => serde_json::json!({ "date": day.to_string() }),
+        EventTime::Timed(instant) => serde_json::json!({
+            "dateTime": instant.with_timezone(&zone).to_rfc3339(),
+            "timeZone": zone.name(),
+        }),
+    };
+    serde_json::json!({
+        "summary": title.trim(),
+        "start": time(start),
+        "end": time(end),
+    })
+}
+
 /// Whether the app itself can delete this event. Not yet: single occurrences and whole
 /// series (which need the "this / following / all" question), events with guests (who
 /// would have to be told) and the special kinds of entry (birthdays, out of office, ...).
@@ -313,6 +361,8 @@ struct View {
     details: RefCell<Vec<EventDetail>>,
     /// Which stored event each of those instances is, for acting on it.
     targets: RefCell<Vec<Target>>,
+    /// The new event being typed in, if its card is open.
+    draft: RefCell<Option<Draft>>,
     /// The event deleted last, while its deletion can still be undone.
     undo: RefCell<Option<Undo>>,
     /// Hides the message about the last change after a while.
@@ -793,8 +843,14 @@ impl View {
             self.undo.take();
             return;
         }
+        self.show_toast("Event deleted", true);
+    }
+
+    /// Says what just happened, for a while; with "Undo" if it can be taken back.
+    fn show_toast(&self, text: &str, undo: bool) {
         let Some(ui) = self.ui.upgrade() else { return };
-        ui.set_toast("Event deleted".into());
+        ui.set_toast(text.into());
+        ui.set_toast_undo(undo);
         let ui = self.ui.clone();
         self.toast_timer
             .start(TimerMode::SingleShot, UNDO_PERIOD, move || {
@@ -802,6 +858,105 @@ impl View {
                     ui.set_toast(SharedString::new());
                 }
             });
+    }
+
+    /// Opens the card for a new event. `day` counts from the first day shown; a negative
+    /// one means "about now" (the `c` key).
+    fn open_draft(&self, day: i32, minute: i32, all_day: bool) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let (first, days) = self.range();
+        let has_columns = !matches!(self.span.get(), Span::Month | Span::Schedule);
+        let (day, minute) = if day < 0 {
+            // The next half hour, today if today is on screen.
+            let now = Utc::now().with_timezone(&self.zone);
+            let offset = (now.date_naive() - first).num_days();
+            let offset = if (0..days).contains(&offset) {
+                offset
+            } else {
+                0
+            };
+            let minute = ((now.hour() * 60 + now.minute()) / 30 + 1) * 30;
+            (offset, (minute as i32).min(23 * 60))
+        } else {
+            (i64::from(day), minute)
+        };
+        let (start, end) = draft_times(first + Duration::days(day), minute, all_day, self.zone);
+
+        let loaded = self.loaded.borrow();
+        let emails: HashMap<AccountId, &str> = loaded
+            .accounts
+            .iter()
+            .map(|a| (a.id, a.email.as_str()))
+            .collect();
+        let writable: Vec<&StoredCalendar> = loaded
+            .calendars
+            .iter()
+            .filter(|c| c.entry.is_writable())
+            .collect();
+        if writable.is_empty() {
+            return self.show_error(&anyhow::anyhow!(
+                "there is no calendar this app may add events to"
+            ));
+        }
+        // The calendar the previous event was created in, else the first account's own.
+        let remembered = self.store.setting(NEW_EVENT_CALENDAR).ok().flatten();
+        let key = |c: &StoredCalendar| {
+            let email = emails.get(&c.account_id).copied().unwrap_or("");
+            format!("{email}\t{}", c.entry.id)
+        };
+        let chosen = writable
+            .iter()
+            .position(|c| Some(key(c)) == remembered)
+            .or_else(|| writable.iter().position(|c| c.entry.primary))
+            .unwrap_or(0);
+
+        let rows: Vec<DraftCalendar> = writable
+            .iter()
+            .map(|c| DraftCalendar {
+                name: c.entry.display_name().into(),
+                account: emails.get(&c.account_id).copied().unwrap_or("").into(),
+                color: c
+                    .entry
+                    .background_color
+                    .as_deref()
+                    .and_then(parse_color)
+                    .unwrap_or(FALLBACK_COLOR),
+            })
+            .collect();
+        self.draft.replace(Some(Draft {
+            start,
+            end,
+            calendars: writable
+                .iter()
+                .map(|c| (c.account_id, c.entry.id.clone(), key(c)))
+                .collect(),
+        }));
+        ui.set_draft_calendars(ModelRc::from(Rc::new(VecModel::from(rows))));
+        ui.set_draft_calendar(chosen as i32);
+        ui.set_draft_when(when_text(start, end, self.zone).into());
+        // A ghost of the new event where it will go, in the views that have columns.
+        let ghost = has_columns && !all_day;
+        ui.set_draft_day(if ghost { day as i32 } else { -1 });
+        ui.set_draft_min(minute);
+        ui.set_detail_visible(false);
+        ui.set_draft_visible(true);
+    }
+
+    /// Creates the event the open card describes.
+    fn save_draft(&self, title: &str, calendar: usize) {
+        let Some(draft) = self.draft.take() else {
+            return;
+        };
+        let Some((account, calendar_id, key)) = draft.calendars.get(calendar).cloned() else {
+            return;
+        };
+        // Remembered for the next new event; failing to remember is no reason not to save.
+        let _ = self.store.set_setting(NEW_EVENT_CALENDAR, &key);
+        let _ = self.commands.send(Command::CreateEvent {
+            account,
+            calendar_id,
+            resource: event_resource(title, draft.start, draft.end, self.zone),
+        });
     }
 
     /// Brings back the event deleted last.
@@ -844,6 +999,7 @@ pub fn run() -> Result<()> {
         timed: Rc::default(),
         details: RefCell::default(),
         targets: RefCell::default(),
+        draft: RefCell::default(),
         undo: RefCell::default(),
         toast_timer: Timer::default(),
         commands: commands.clone(),
@@ -878,6 +1034,18 @@ pub fn run() -> Result<()> {
     ui.on_delete_finished({
         let view = view.clone();
         move |deleted| view.delete_finished(deleted)
+    });
+    ui.on_draft_requested({
+        let view = view.clone();
+        move |day, minute, all_day| view.open_draft(day, minute, all_day)
+    });
+    ui.on_draft_save({
+        let view = view.clone();
+        move |title, calendar| view.save_draft(&title, calendar as usize)
+    });
+    ui.on_event_created({
+        let view = view.clone();
+        move || view.show_toast("Event saved", false)
     });
     ui.on_undo({
         let view = view.clone();
@@ -1148,6 +1316,43 @@ mod tests {
         let ordinary = event(serde_json::json!({"eventType": "default"}));
         assert!(!can_delete(&birthday, &owner));
         assert!(can_delete(&ordinary, &owner));
+    }
+
+    #[test]
+    fn a_new_event_lasts_an_hour_from_the_time_clicked_or_the_whole_day() {
+        let zone = chrono_tz::Europe::Prague;
+        let day = date("2026-11-17");
+        let (start, end) = draft_times(day, 9 * 60 + 30, false, zone);
+        assert_eq!(
+            start,
+            EventTime::Timed("2026-11-17T08:30:00Z".parse().unwrap())
+        );
+        assert_eq!(
+            end,
+            EventTime::Timed("2026-11-17T09:30:00Z".parse().unwrap())
+        );
+        assert_eq!(
+            event_resource(" Lunch ", start, end, zone),
+            serde_json::json!({
+                "summary": "Lunch",
+                "start": {"dateTime": "2026-11-17T09:30:00+01:00", "timeZone": "Europe/Prague"},
+                "end": {"dateTime": "2026-11-17T10:30:00+01:00", "timeZone": "Europe/Prague"},
+            })
+        );
+
+        let (start, end) = draft_times(day, 0, true, zone);
+        assert_eq!(
+            event_resource("Trip", start, end, zone),
+            serde_json::json!({
+                "summary": "Trip",
+                "start": {"date": "2026-11-17"},
+                "end": {"date": "2026-11-18"},
+            })
+        );
+
+        // 02:30 does not exist on the night clocks go forward.
+        let (start, _) = draft_times(date("2027-03-28"), 150, false, zone);
+        assert!(matches!(start, EventTime::Timed(_)));
     }
 
     #[test]

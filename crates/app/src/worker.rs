@@ -43,6 +43,12 @@ pub enum Command {
         event_id: String,
         etag: Option<String>,
     },
+    /// Creates an event from a resource the window put together.
+    CreateEvent {
+        account: AccountId,
+        calendar_id: String,
+        resource: Value,
+    },
     /// Undoes a deletion: creates the event again from its saved resource.
     RestoreEvent {
         account: AccountId,
@@ -159,11 +165,28 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
                         .upgrade_in_event_loop(move |ui| ui.invoke_delete_finished(ok));
                     deleted
                 }
+                Command::CreateEvent {
+                    account,
+                    calendar_id,
+                    resource,
+                } => {
+                    let created = worker.insert_event(account, &calendar_id, resource).await;
+                    if created.is_ok() {
+                        let _ = worker
+                            .ui
+                            .upgrade_in_event_loop(|ui| ui.invoke_event_created());
+                    }
+                    created
+                }
                 Command::RestoreEvent {
                     account,
                     calendar_id,
                     resource,
-                } => worker.restore_event(account, &calendar_id, resource).await,
+                } => {
+                    worker
+                        .insert_event(account, &calendar_id, restorable(resource))
+                        .await
+                }
             };
             if let Err(error) = result
                 && !error.is::<Superseded>()
@@ -386,7 +409,8 @@ impl Worker {
         Ok(())
     }
 
-    async fn restore_event(
+    /// Creates an event at Google and saves what Google made of it.
+    async fn insert_event(
         &self,
         account: AccountId,
         calendar_id: &str,
@@ -396,9 +420,7 @@ impl Worker {
         let _saving = self.start(|activity| &mut activity.saving);
         let mut store = open_store()?;
         let client = self.account_client(&store, account).await?;
-        let created = client
-            .insert_event(calendar_id, &restorable(resource))
-            .await?;
+        let created = client.insert_event(calendar_id, &resource).await?;
         store.apply_event(account, calendar_id, &created)?;
         Ok(())
     }
