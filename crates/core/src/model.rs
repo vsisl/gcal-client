@@ -97,6 +97,11 @@ pub struct Event {
     pub start: Option<EventDateTime>,
     pub end: Option<EventDateTime>,
     pub color_id: Option<String>,
+    pub location: Option<String>,
+    /// May contain a small subset of HTML.
+    pub description: Option<String>,
+    /// Address of the event in Google's web interface.
+    pub html_link: Option<String>,
     /// RRULE/EXDATE/RDATE lines; present only on the master event of a series.
     #[serde(default)]
     pub recurrence: Vec<String>,

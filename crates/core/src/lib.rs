@@ -2,6 +2,7 @@
 
 pub mod model;
 pub mod recurrence;
+pub mod text;
 pub mod week;
 
 pub use model::{CalendarListEntry, Event, EventDateTime, EventStatus, EventTime};

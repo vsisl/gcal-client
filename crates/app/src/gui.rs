@@ -9,6 +9,7 @@ use anyhow::Result;
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Timelike, Utc};
 use chrono_tz::Tz;
 use gcal_core::recurrence::expand;
+use gcal_core::text::plain_text;
 use gcal_core::week::{layout_days, local_day_start};
 use gcal_core::{CalendarListEntry, Event, EventTime};
 use gcal_store::{Account, AccountId, Store, StoredCalendar, StoredEvent};
@@ -129,6 +130,56 @@ fn period_title(first: NaiveDate, days: i64) -> String {
     }
 }
 
+/// When an event happens, as shown in its details: "Tuesday, 17 November · 9:00 – 12:00".
+fn when_text(start: EventTime, end: EventTime, zone: Tz) -> String {
+    const DAY: &str = "%A, %-d %B";
+    const DATE: &str = "%-d %B %Y";
+    match (start, end) {
+        (EventTime::Timed(start), EventTime::Timed(end)) => {
+            let (first, last) = (start.with_timezone(&zone), end.with_timezone(&zone));
+            if first.date_naive() == last.date_naive() {
+                format!(
+                    "{} · {} – {}",
+                    first.format(DAY),
+                    clock(start, zone),
+                    clock(end, zone)
+                )
+            } else {
+                format!(
+                    "{}, {} – {}, {}",
+                    first.format(DATE),
+                    clock(start, zone),
+                    last.format(DATE),
+                    clock(end, zone)
+                )
+            }
+        }
+        (EventTime::AllDay(first), EventTime::AllDay(past_last)) => {
+            // The end of an all-day event is the day after its last day.
+            let last = past_last - Duration::days(1);
+            if last <= first {
+                first.format(DAY).to_string()
+            } else {
+                format!("{} – {}", first.format(DATE), last.format(DATE))
+            }
+        }
+        // Google never mixes the two kinds within one event.
+        _ => String::new(),
+    }
+}
+
+/// The event's page in Google's web interface, opened for the account that owns it (the
+/// browser may be signed in to several).
+fn web_link(event: &Event, account_email: &str) -> String {
+    match &event.html_link {
+        Some(link) => {
+            let separator = if link.contains('?') { '&' } else { '?' };
+            format!("{link}{separator}authuser={account_email}")
+        }
+        None => String::new(),
+    }
+}
+
 fn clock(instant: DateTime<Utc>, zone: Tz) -> String {
     let local = instant.with_timezone(&zone);
     format!("{}:{:02}", local.hour(), local.minute())
@@ -172,6 +223,8 @@ struct View {
     drawn_today: Cell<Option<NaiveDate>>,
     days: Rc<VecModel<DayHeader>>,
     timed: Rc<VecModel<TimedItem>>,
+    /// Details of every instance now on screen, by the index its block or bar carries.
+    details: RefCell<Vec<EventDetail>>,
     all_day: Rc<VecModel<AllDayItem>>,
     sidebar: Rc<VecModel<SidebarRow>>,
 }
@@ -324,6 +377,7 @@ impl View {
                         _ => String::new(),
                     };
                     TimedItem {
+                        instance: block.index as i32,
                         title: title(block.index),
                         time: time.into(),
                         day: block.day,
@@ -345,6 +399,7 @@ impl View {
                 .map(|bar| {
                     let color = color(bar.index);
                     AllDayItem {
+                        instance: bar.index as i32,
                         title: title(bar.index),
                         first_day: bar.first_day,
                         last_day: bar.last_day,
@@ -356,6 +411,30 @@ impl View {
                 .collect(),
         );
         ui.set_all_day_rows(layout.all_day_rows);
+
+        let emails: HashMap<AccountId, &str> =
+            accounts.iter().map(|a| (a.id, a.email.as_str())).collect();
+        let details = instances
+            .iter()
+            .enumerate()
+            .map(|(index, instance)| {
+                let event = instance.event;
+                let email = emails.get(&instance.key.0).copied().unwrap_or("");
+                EventDetail {
+                    title: title(index),
+                    when: when_text(instance.start, instance.end, self.zone).into(),
+                    location: event.location.as_deref().unwrap_or("").into(),
+                    description: plain_text(event.description.as_deref().unwrap_or("")).into(),
+                    calendar: shown[&instance.key].display_name().into(),
+                    account: email.into(),
+                    color: color(index),
+                    link: web_link(event, email).into(),
+                }
+            })
+            .collect();
+        self.details.replace(details);
+        // What it described may have moved or gone.
+        ui.set_detail_visible(false);
         Ok(())
     }
 
@@ -411,6 +490,7 @@ pub fn run() -> Result<()> {
         drawn_today: Cell::new(None),
         days: Rc::default(),
         timed: Rc::default(),
+        details: RefCell::default(),
         all_day: Rc::default(),
         sidebar: Rc::default(),
     });
@@ -447,6 +527,20 @@ pub fn run() -> Result<()> {
         move |account, calendar_id, shown| {
             view.set_calendar_shown(AccountId::from(account), &calendar_id, shown);
         }
+    });
+    ui.on_event_clicked({
+        let view = view.clone();
+        move |instance| {
+            let detail = view.details.borrow().get(instance as usize).cloned();
+            if let (Some(detail), Some(ui)) = (detail, view.ui.upgrade()) {
+                ui.set_detail(detail);
+                ui.set_detail_visible(true);
+            }
+        }
+    });
+    ui.on_open_link(|link| {
+        // Nothing useful to do if no browser can be started.
+        let _ = open::that_detached(link.as_str());
     });
     ui.on_data_changed({
         let view = view.clone();
@@ -541,6 +635,52 @@ mod tests {
     fn text_is_dark_on_light_colours_and_white_on_dark_ones() {
         assert_eq!(text_color_on(rgb(0xf6bf26)), rgb(0x202124));
         assert_eq!(text_color_on(rgb(0x3f51b5)), rgb(0xffffff));
+    }
+
+    #[test]
+    fn when_text_covers_timed_and_all_day_events() {
+        let zone = chrono_tz::Europe::Prague;
+        let timed = |start: &str, end: &str| {
+            (
+                EventTime::Timed(start.parse().unwrap()),
+                EventTime::Timed(end.parse().unwrap()),
+            )
+        };
+        let (start, end) = timed("2026-11-17T08:00:00Z", "2026-11-17T11:00:00Z");
+        assert_eq!(
+            when_text(start, end, zone),
+            "Tuesday, 17 November · 9:00 – 12:00"
+        );
+        let (start, end) = timed("2026-11-17T21:00:00Z", "2026-11-18T01:00:00Z");
+        assert_eq!(
+            when_text(start, end, zone),
+            "17 November 2026, 22:00 – 18 November 2026, 2:00"
+        );
+        let all_day = |first: &str, past_last: &str| {
+            when_text(
+                EventTime::AllDay(date(first)),
+                EventTime::AllDay(date(past_last)),
+                zone,
+            )
+        };
+        assert_eq!(all_day("2026-11-17", "2026-11-18"), "Tuesday, 17 November");
+        assert_eq!(
+            all_day("2026-11-17", "2026-11-20"),
+            "17 November 2026 – 19 November 2026"
+        );
+    }
+
+    #[test]
+    fn web_link_names_the_owning_account() {
+        let event = Event {
+            html_link: Some("https://www.google.com/calendar/event?eid=abc".into()),
+            ..Event::default()
+        };
+        assert_eq!(
+            web_link(&event, "me@example.com"),
+            "https://www.google.com/calendar/event?eid=abc&authuser=me@example.com"
+        );
+        assert_eq!(web_link(&Event::default(), "me@example.com"), "");
     }
 
     #[test]
