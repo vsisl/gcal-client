@@ -8,8 +8,9 @@ attachment links.
 
 1. **Guests in the details card**: names, answers, organiser, optional; "Join the video
    meeting". (`tools/e2e/rsvp.py`)
-2. **Answer an invitation**: Yes / No / Maybe, with undo. For an occurrence of a series
-   that was not changed on its own, the answer is for the whole series.
+2. **Answer an invitation**: Yes / No / Maybe, with undo, in the account's own calendar
+   only. For an occurrence of a series that was not changed on its own, the answer is
+   for the whole series, and the card says so.
 3. **Change events with guests** (drag, resize, editor), for the account that invited
    them; asks whether to send e-mails. A guest's own copy stays read-only.
 4. **Guests in the editor**: a field of e-mail addresses; inviting on a new event,

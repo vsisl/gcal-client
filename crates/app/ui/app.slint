@@ -70,6 +70,8 @@ export struct EventDetail {
     // This account's own answer to the invitation: 0 none yet, 1 yes, 2 no, 3 maybe;
     // -1 when it is not invited (or cannot answer here).
     rsvp: int,
+    // The answer is for every event of the series, not this one alone.
+    rsvp-series: bool,
 }
 
 // A day of the month view.
@@ -2410,7 +2412,7 @@ export component AppWindow inherits Window {
                     alignment: start;
 
                     Text {
-                        text: @tr("Going?");
+                        text: root.detail.rsvp-series ? @tr("Going to all events of the series?") : @tr("Going?");
                         font-size: 13px;
                         color: Theme.text;
                         vertical-alignment: center;

@@ -372,10 +372,31 @@ fn own_zone_text(event: &Event, start: EventTime, end: EventTime, shown_in: Tz) 
     )
 }
 
+/// The address that organises events created in a calendar, if it is the account's:
+/// that is so in the account's own calendar, whose identifier is the account's address.
+/// Events in any other calendar (another of the account's, or one shared by someone
+/// else) are organised by that calendar, and the account is not to invite itself.
+fn organiser_address(account_email: &str, calendar_id: &str) -> String {
+    if account_email.eq_ignore_ascii_case(calendar_id) {
+        account_email.to_owned()
+    } else {
+        String::new()
+    }
+}
+
+/// Whether the account itself is invited and can answer here: only in its own
+/// calendar. In a calendar shared by someone else, or a room's, the entry Google marks
+/// as "self" is that calendar's owner, and answering would answer for them.
+fn can_answer(event: &Event, calendar: &CalendarListEntry) -> bool {
+    calendar.primary
+        && calendar.is_writable()
+        && event.own_invitation().is_some_and(|own| !own.resource)
+}
+
 /// A guest's answer as the window counts it: 0 none yet, 1 yes, 2 no, 3 maybe.
 fn answer_number(answer: ResponseStatus) -> i32 {
     match answer {
-        ResponseStatus::NeedsAction => 0,
+        ResponseStatus::NeedsAction | ResponseStatus::Unknown => 0,
         ResponseStatus::Accepted => 1,
         ResponseStatus::Declined => 2,
         ResponseStatus::Tentative => 3,
@@ -486,6 +507,8 @@ struct Target {
     movable: bool,
     /// Whether this account invited guests to it, who can be told of a change.
     guests: bool,
+    /// Whether this account is invited to it and can answer.
+    can_answer: bool,
     /// When this instance starts and ends.
     start: EventTime,
     end: EventTime,
@@ -1546,11 +1569,14 @@ impl View {
                     meet: event.hangout_link.as_deref().unwrap_or("").into(),
                     // An answer is given in the account's own calendar.
                     rsvp: match event.own_invitation() {
-                        Some(own) if calendar.entry.is_writable() => {
+                        Some(own) if can_answer(event, &calendar.entry) => {
                             answer_number(own.response_status)
                         }
                         _ => -1,
                     },
+                    // An answer to an occurrence that was not changed on its own is
+                    // given for its whole series, which the card says.
+                    rsvp_series: event.is_recurring_master(),
                 }
             })
             .collect();
@@ -1567,6 +1593,7 @@ impl View {
                     occurrence: occurrence_of(instance.event, instance.start),
                     movable: can_move(instance.event, &calendar.entry),
                     guests: instance.event.has_guests_to_notify(),
+                    can_answer: can_answer(instance.event, &calendar.entry),
                     start: instance.start,
                     end: instance.end,
                 }
@@ -1838,6 +1865,9 @@ impl View {
         let Some(target) = self.targets.borrow().get(instance).cloned() else {
             return;
         };
+        if !target.can_answer {
+            return;
+        }
         let (own, series) = match self.resources(&target) {
             Ok(resources) => resources,
             Err(error) => return self.show_error(&error),
@@ -1938,7 +1968,7 @@ impl View {
             .accounts
             .iter()
             .find(|a| a.id == target.account)
-            .map(|a| a.email.clone())
+            .map(|a| organiser_address(&a.email, &target.calendar_id))
             .unwrap_or_default();
         self.show_editor(&ui, form, kept, Some(target), calendar_color);
         if let Some(editing) = self.editing.borrow_mut().as_mut() {
@@ -2057,9 +2087,10 @@ impl View {
                 .borrow()
                 .as_ref()
                 .and_then(|draft| draft.calendars.get(calendar))
-                .and_then(|(_, _, key)| key.split('\t').next())
-                .unwrap_or_default()
-                .to_owned();
+                .and_then(|(_, calendar_id, key)| {
+                    Some(organiser_address(key.split('\t').next()?, calendar_id))
+                })
+                .unwrap_or_default();
         }
         let after = match editor::fields(&form, &kept, self.zone) {
             Ok(after) => after,
@@ -3104,6 +3135,42 @@ mod tests {
     }
 
     #[test]
+    fn an_invitation_is_answered_only_in_the_accounts_own_calendar() {
+        use serde_json::json;
+        let calendar = |extra: serde_json::Value| -> CalendarListEntry {
+            let mut value = json!({"id": "me@x.org", "accessRole": "owner"});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(value).unwrap()
+        };
+        let invited = |own: serde_json::Value| -> Event {
+            serde_json::from_value(json!({"id": "e", "attendees": [own]})).unwrap()
+        };
+        let me = invited(json!({"email": "me@x.org", "self": true}));
+        assert!(can_answer(&me, &calendar(json!({"primary": true}))));
+        // A colleague's calendar shared with write access: "self" there is the colleague.
+        assert!(!can_answer(
+            &me,
+            &calendar(json!({"id": "colleague@x.org"}))
+        ));
+        // A room's calendar, and an event the account is not a guest of.
+        let room = invited(json!({"email": "room@x.org", "self": true, "resource": true}));
+        assert!(!can_answer(&room, &calendar(json!({"primary": true}))));
+        let other = invited(json!({"email": "you@x.org"}));
+        assert!(!can_answer(&other, &calendar(json!({"primary": true}))));
+
+        // The account joins the first guests only where it organises: its own calendar.
+        assert_eq!(organiser_address("me@x.org", "ME@x.org"), "me@x.org");
+        assert_eq!(
+            organiser_address("me@x.org", "family123@group.calendar.google.com"),
+            ""
+        );
+        assert_eq!(organiser_address("me@x.org", "colleague@x.org"), "");
+    }
+
+    #[test]
     fn answering_changes_only_this_accounts_entry() {
         use serde_json::json;
         let event = json!({
@@ -3280,6 +3347,7 @@ mod tests {
             }),
             movable: true,
             guests: false,
+            can_answer: false,
             start: instant("2026-11-23T10:00:00Z"),
             end: instant("2026-11-23T11:00:00Z"),
         };
@@ -3418,6 +3486,7 @@ mod tests {
             occurrence,
             movable: false,
             guests: false,
+            can_answer: false,
             start: instant("2026-11-18T10:00:00Z"),
             end: instant("2026-11-18T11:00:00Z"),
         };

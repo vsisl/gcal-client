@@ -100,13 +100,17 @@ pub enum ResponseStatus {
     Accepted,
     Declined,
     Tentative,
+    /// An answer this app does not know. Calendars shared by others are read too, and
+    /// one unfamiliar word must not make a whole calendar unreadable.
+    #[serde(other)]
+    Unknown,
 }
 
 impl ResponseStatus {
     /// As Google's API writes it.
     pub fn as_str(self) -> &'static str {
         match self {
-            ResponseStatus::NeedsAction => "needsAction",
+            ResponseStatus::NeedsAction | ResponseStatus::Unknown => "needsAction",
             ResponseStatus::Accepted => "accepted",
             ResponseStatus::Declined => "declined",
             ResponseStatus::Tentative => "tentative",
@@ -311,6 +315,13 @@ mod tests {
             Some("https://meet.google.com/abc-defg-hij")
         );
         assert_eq!(ResponseStatus::Tentative.as_str(), "tentative");
+
+        // A word for an answer that is new to this app is read, not refused.
+        let odd: Event = serde_json::from_str(
+            r#"{"id": "a", "attendees": [{"email": "x@x.org", "responseStatus": "delegated"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(odd.attendees[0].response_status, ResponseStatus::Unknown);
     }
 
     #[test]

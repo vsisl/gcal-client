@@ -34,7 +34,13 @@ def find(role):
             seen.add(k); unique.append(handle)
     return unique
 def label(h):
-    return json.loads(call("get_element_properties", elementHandle=h)["content"][0]["text"]).get("accessibleLabel", "")
+    # An element found a moment ago may be gone when it is asked about: the window
+    # redraws from the cache whenever a sync brings something. Such an element has no
+    # label.
+    try:
+        return json.loads(call("get_element_properties", elementHandle=h)["content"][0]["text"]).get("accessibleLabel", "")
+    except (ValueError, KeyError, IndexError):
+        return ""
 def items(prefix):
     return [h for h in find("ListItem") if label(h).startswith(prefix)]
 def events():

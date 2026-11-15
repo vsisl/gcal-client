@@ -67,9 +67,11 @@ pub struct Kept {
     /// The guests as the event has them, with their answers and whatever else Google
     /// keeps about each; a guest who stays in the form stays as it is here.
     pub attendees: Vec<Value>,
-    /// The address of the account the event belongs to. It is added to the guests
-    /// when the first ones are invited, as the web does, so that the organiser is
-    /// among them.
+    /// The address of the account, when the event is in that account's own calendar
+    /// and so organised by it; empty otherwise. It is added to the guests when the
+    /// first ones are invited, as the web does, so that the organiser is among them.
+    /// In a calendar shared by someone else the organiser is not this account, and it
+    /// must not invite itself.
     pub own_email: String,
     /// The event's video meeting as Google describes it; null if it has none.
     pub conference: Value,
@@ -337,20 +339,28 @@ fn guest_list(form: &Form, kept: &Kept) -> Result<Vec<Value>, String> {
             addresses.push(address);
         }
     }
-    let mut guests: Vec<Value> = addresses
+    let named = |guest: &Value, address: &str| {
+        guest["email"]
+            .as_str()
+            .is_some_and(|known| same(known, address))
+    };
+    // The guests the event had, in the order it had them: those still named, and those
+    // the field cannot name at all (a guest without an address), which stay. Then the
+    // new ones.
+    let mut guests: Vec<Value> = kept
+        .attendees
         .iter()
-        .map(|address| {
-            kept.attendees
-                .iter()
-                .find(|guest| {
-                    guest["email"]
-                        .as_str()
-                        .is_some_and(|known| same(known, address))
-                })
-                .cloned()
-                .unwrap_or_else(|| json!({ "email": address }))
+        .filter(|guest| {
+            guest["email"].as_str().is_none()
+                || addresses.iter().any(|address| named(guest, address))
         })
+        .cloned()
         .collect();
+    for address in &addresses {
+        if !kept.attendees.iter().any(|guest| named(guest, address)) {
+            guests.push(json!({ "email": address }));
+        }
+    }
     // The first guests of an event: the organiser joins them, as going.
     let own_among = addresses
         .iter()
@@ -956,6 +966,46 @@ mod tests {
         assert_eq!(
             inverse(&changes, &json!({"id": "e"})),
             json!({"attendees": []})
+        );
+
+        // The text's order does not matter; the event's does.
+        let mut shuffled = opened.clone();
+        shuffled.guests = "bob@x.org ann@x.org me@x.org".into();
+        assert_eq!(
+            fields(&shuffled, &kept, zone()).unwrap()["attendees"],
+            event["attendees"]
+        );
+
+        // A guest without an address cannot be named in the field, and stays when
+        // others are added or removed.
+        let odd = json!({
+            "id": "e",
+            "start": {"dateTime": "2026-11-17T12:00:00+01:00"},
+            "end": {"dateTime": "2026-11-17T13:00:00+01:00"},
+            "attendees": [
+                {"id": "1234", "displayName": "Someone", "responseStatus": "accepted"},
+                {"email": "ann@x.org", "responseStatus": "declined"}
+            ]
+        });
+        let (opened, kept) = form_of(&odd, start, end, zone());
+        assert_eq!(opened.guests, "ann@x.org");
+        let mut edited = opened.clone();
+        edited.guests = "cy@x.org".into();
+        assert_eq!(
+            fields(&edited, &kept, zone()).unwrap()["attendees"],
+            json!([
+                {"id": "1234", "displayName": "Someone", "responseStatus": "accepted"},
+                {"email": "cy@x.org"}
+            ])
+        );
+
+        // In a calendar that is not the account's own (no own address is handed in),
+        // the first guests are not joined by the account.
+        let mut form = new_form(start, end, zone());
+        form.guests = "ann@x.org".into();
+        assert_eq!(
+            fields(&form, &Kept::default(), zone()).unwrap()["attendees"],
+            json!([{"email": "ann@x.org"}])
         );
     }
 
