@@ -8,5 +8,6 @@ pub mod text;
 pub mod week;
 
 pub use model::{
-    Attendee, CalendarListEntry, Event, EventDateTime, EventStatus, EventTime, ResponseStatus,
+    Attachment, Attendee, CalendarListEntry, Event, EventDateTime, EventStatus, EventTime,
+    ResponseStatus,
 };

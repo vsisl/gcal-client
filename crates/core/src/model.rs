@@ -148,6 +148,14 @@ impl Attendee {
     }
 }
 
+/// A file attached to an event: a link, usually to Google Drive.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Attachment {
+    pub file_url: Option<String>,
+    pub title: Option<String>,
+}
+
 /// Who an event belongs to. Only what the app reads so far.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Organizer {
@@ -181,6 +189,8 @@ pub struct Event {
     pub organizer: Option<Organizer>,
     /// The address of the event's video meeting, if it has one.
     pub hangout_link: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
     /// RRULE/EXDATE/RDATE lines; present only on the master event of a series.
     #[serde(default)]
     pub recurrence: Vec<String>,

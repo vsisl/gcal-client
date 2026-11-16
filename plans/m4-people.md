@@ -27,6 +27,10 @@ attachment links.
 Sending e-mails has not been tried by the scripts on purpose: their guests are made-up
 addresses, and every question about e-mails is answered "no".
 
+7. **Attachments** in the details card: each file a link that opens in the browser.
+   Only web addresses are offered, and only web addresses are ever handed to the
+   desktop to open (also the event's own link and the video meeting's).
+
 ## Left
 
 - **Contact autocomplete** for the guests field: needs Google's People API and a further
@@ -36,7 +40,8 @@ addresses, and every question about e-mails is answered "no".
 - **Find a time**: other people's free/busy (`freebusy.query`) beside the event in the
   editor.
 - **Rooms**: adding a room by name or address (a room is a guest with `resource`).
-- **Attachment links.**
+- **Adding attachments** in the editor (Google takes links to Drive files; writes then
+  need `supportsAttachments=true`).
 - A guest's copy of an event: "propose a new time" has no API and goes to the browser.
 
 ## Known rough edges

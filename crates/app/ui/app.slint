@@ -35,6 +35,12 @@ export struct AllDayItem {
     text-color: color,
 }
 
+// A file attached to an event, opened in the browser.
+export struct Attachment {
+    title: string,
+    link: string,
+}
+
 // One guest of an event.
 export struct Guest {
     name: string,
@@ -67,6 +73,7 @@ export struct EventDetail {
     // Who is invited, and the address of the video meeting, if any.
     guests: [Guest],
     meet: string,
+    attachments: [Attachment],
     // This account's own answer to the invitation: 0 none yet, 1 yes, 2 no, 3 maybe;
     // -1 when it is not invited (or cannot answer here).
     rsvp: int,
@@ -2383,6 +2390,28 @@ export component AppWindow inherits Window {
                         filled: true;
                         clicked => {
                             root.open-link(root.detail.meet);
+                        }
+                    }
+                }
+                if root.detail.attachments.length > 0: VerticalLayout {
+                    spacing: 2px;
+
+                    Text {
+                        text: root.detail.attachments.length == 1 ? @tr("1 attachment") : @tr("{} attachments", root.detail.attachments.length);
+                        font-size: 12px;
+                        font-weight: 500;
+                        color: Theme.text-dim;
+                    }
+
+                    for file[i] in root.detail.attachments: HorizontalLayout {
+                        alignment: start;
+                        TextButton {
+                            text: file.title;
+                            height: 28px;
+                            text-color: Theme.accent;
+                            clicked => {
+                                root.open-link(file.link);
+                            }
                         }
                     }
                 }

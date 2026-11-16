@@ -476,6 +476,33 @@ fn plan_rsvp(
     ))
 }
 
+/// Whether a link from an event may be handed to the desktop to open. Events come
+/// from anyone who can invite the account, and "open this" is also how the desktop
+/// starts programs and opens files: only web addresses pass.
+fn is_web_address(link: &str) -> bool {
+    (link.starts_with("https://") || link.starts_with("http://"))
+        && !link.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
+/// The files attached to an event that can be opened: those with a web address.
+fn attachment_links(event: &Event) -> Vec<(String, String)> {
+    event
+        .attachments
+        .iter()
+        .filter_map(|file| {
+            let link = file
+                .file_url
+                .as_deref()
+                .filter(|link| is_web_address(link))?;
+            let title = file.title.as_deref().map(str::trim).unwrap_or("");
+            let title = if title.is_empty() { link } else { title };
+            // A name is one line of text, whatever was put into it.
+            let title: String = title.chars().filter(|c| !c.is_control()).collect();
+            Some((title, link.to_owned()))
+        })
+        .collect()
+}
+
 fn web_link(event: &Event, account_email: &str) -> String {
     match &event.html_link {
         Some(link) => {
@@ -1632,6 +1659,15 @@ impl View {
                             .collect::<Vec<_>>(),
                     ))),
                     meet: event.hangout_link.as_deref().unwrap_or("").into(),
+                    attachments: ModelRc::from(Rc::new(VecModel::from(
+                        attachment_links(event)
+                            .into_iter()
+                            .map(|(title, link)| Attachment {
+                                title: title.into(),
+                                link: link.into(),
+                            })
+                            .collect::<Vec<_>>(),
+                    ))),
                     // An answer is given in the account's own calendar.
                     rsvp: match event.own_invitation() {
                         Some(own) if can_answer(event, &calendar.entry) => {
@@ -2920,7 +2956,9 @@ pub fn run() -> Result<()> {
     });
     ui.on_open_link(|link| {
         // Nothing useful to do if no browser can be started.
-        let _ = open::that_detached(link.as_str());
+        if is_web_address(&link) {
+            let _ = open::that_detached(link.as_str());
+        }
     });
     ui.on_data_changed({
         let view = view.clone();
@@ -3352,6 +3390,52 @@ mod tests {
                 Some(foreign)
             ),
             None
+        );
+    }
+
+    #[test]
+    fn only_web_addresses_are_opened_and_offered_as_attachments() {
+        for good in [
+            "https://drive.google.com/file/d/abc/view",
+            "http://example.com/a?b=c",
+        ] {
+            assert!(is_web_address(good), "{good}");
+        }
+        for bad in [
+            "",
+            "file:///etc/passwd",
+            "/usr/bin/xterm",
+            "javascript:alert(1)",
+            "smb://server/share",
+            "https://example.com/a b",
+            "https://example.com/\n--flag",
+            " https://example.com",
+            "HTTPS-like.desktop",
+        ] {
+            assert!(!is_web_address(bad), "{bad}");
+        }
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "id": "e",
+            "attachments": [
+                {"fileUrl": "https://drive.google.com/file/d/abc/view", "title": "Agenda\u{1b}[2J.pdf"},
+                {"fileUrl": "https://docs.google.com/document/d/x", "title": "  "},
+                {"fileUrl": "file:///home/me/.ssh/id_rsa", "title": "Notes"},
+                {"title": "No link at all"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            attachment_links(&event),
+            vec![
+                (
+                    "Agenda[2J.pdf".to_owned(),
+                    "https://drive.google.com/file/d/abc/view".to_owned()
+                ),
+                (
+                    "https://docs.google.com/document/d/x".to_owned(),
+                    "https://docs.google.com/document/d/x".to_owned()
+                ),
+            ]
         );
     }
 
