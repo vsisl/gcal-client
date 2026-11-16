@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use gcal_core::{Event, EventTime};
 use gcal_google::{
-    ApiError, AuthError, ClientConfig, Endpoints, GoogleClient, HttpClient, TokenSet,
+    ApiError, AuthError, ClientConfig, Endpoints, GoogleClient, HttpClient, Permission, TokenSet,
 };
 use gcal_store::{AccountId, Store};
 use gcal_sync::{Progress, SyncError, SyncReport};
@@ -38,6 +38,12 @@ pub enum Command {
     AddAccount,
     SyncAll,
     RemoveAccount(String),
+    /// Asks an account that is signed in already, in the browser, to let the app do
+    /// one thing more.
+    Grant {
+        email: String,
+        permission: Permission,
+    },
     /// Looks up people to suggest as guests while a name is typed in the editor. The
     /// answer goes to the window only if `serial` is still the newest request there.
     SuggestGuests {
@@ -183,8 +189,16 @@ struct Activity {
     error: Option<String>,
 }
 
-/// An account and its connection to Google, kept between two suggestions.
-type Suggesting = (AccountId, Rc<GoogleClient>);
+/// An account, its connection to Google and where it lets the app look for people,
+/// kept between two suggestions.
+type Suggesting = (AccountId, Rc<GoogleClient>, Vec<Permission>);
+
+/// Where guests are looked up, each needing a permission of its own.
+const PEOPLE: [Permission; 3] = [
+    Permission::Contacts,
+    Permission::OtherContacts,
+    Permission::Directory,
+];
 
 #[derive(Clone)]
 struct Worker {
@@ -272,6 +286,7 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
                 Command::AddAccount
                 | Command::SyncAll
                 | Command::RemoveAccount(_)
+                | Command::Grant { .. }
                 | Command::SuggestGuests { .. } => None,
                 _ => Some(worker.cache.lock().await),
             };
@@ -279,6 +294,7 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
                 Command::AddAccount => worker.add_account().await,
                 Command::SyncAll => worker.sync_all().await,
                 Command::RemoveAccount(email) => worker.remove_account(&email).await,
+                Command::Grant { email, permission } => worker.grant(&email, permission).await,
                 Command::SuggestGuests {
                     account,
                     query,
@@ -461,19 +477,31 @@ impl Worker {
     async fn suggest_guests(&self, account: AccountId, query: &str, serial: i32) {
         let found = async {
             let known = self.suggesting.borrow().clone();
-            let client = match known {
-                Some((of, client)) if of == account => client,
+            let (client, sources) = match known {
+                Some((of, client, sources)) if of == account => (client, sources),
                 _ => {
-                    let client = Rc::new(self.account_client(&open_store()?, account).await?);
-                    self.suggesting.replace(Some((account, client.clone())));
-                    client
+                    let store = open_store()?;
+                    let client = Rc::new(self.account_client(&store, account).await?);
+                    let allowed = store
+                        .accounts()?
+                        .into_iter()
+                        .find(|a| a.id == account)
+                        .and_then(|a| a.scopes);
+                    let sources = people_sources(allowed.as_deref());
+                    self.suggesting
+                        .replace(Some((account, client.clone(), sources.clone())));
+                    (client, sources)
                 }
             };
-            Ok::<_, anyhow::Error>(client.search_people(query).await?)
+            if sources.is_empty() {
+                return Ok(None);
+            }
+            Ok::<_, anyhow::Error>(Some(client.search_people(query, &sources).await?))
         }
         .await;
         let (people, problem) = match found {
-            Ok(people) => (people, String::new()),
+            Ok(Some(people)) => (people, String::new()),
+            Ok(None) => (Vec::new(), NO_PEOPLE_PERMISSION.to_owned()),
             Err(error) => (Vec::new(), suggestion_problem(&error)),
         };
         let _ = self.ui.upgrade_in_event_loop(move |ui| {
@@ -501,26 +529,28 @@ impl Worker {
 
     async fn add_account(&self) -> Result<()> {
         self.clear_error();
-        let mut attempt = 0;
-        self.sign_in_attempt.send_modify(|newest| {
-            *newest += 1;
-            attempt = *newest;
-        });
-        let mut newest = self.sign_in_attempt.subscribe();
-
-        // Until Google has answered, a newer attempt replaces this one, wherever it is:
-        // unlocking the keyring, or waiting on a browser tab that may have been closed.
-        let (config, vault, tokens) = tokio::select! {
-            signed_in = self.sign_in() => signed_in?,
-            _ = newest.wait_for(|newest| *newest != attempt) => return Err(Superseded.into()),
-        };
+        let (config, vault, tokens) = self.newest_sign_in(&Permission::AT_SIGN_IN, None).await?;
         let refresh_token = tokens
             .refresh_token
             .context("Google sent no refresh token")?;
+        // Google lets each line of what is asked for be unticked.
+        if let Some(scopes) = &tokens.scopes
+            && !Permission::Calendar.is_in(scopes)
+        {
+            bail!(
+                "The account was not added: on Google's page the line about calendars was \
+                 left unticked, and without it there is nothing to show. Add the account \
+                 again and tick it."
+            );
+        }
 
         let client = self
             .client(config, refresh_token.clone())
-            .with_access_token(tokens.access_token, tokens.expires_at);
+            .with_access_token(
+                tokens.access_token,
+                tokens.expires_at,
+                tokens.scopes.clone(),
+            );
         let email = client.account_email().await?;
 
         let _syncing = self.start(|activity| &mut activity.syncing);
@@ -532,6 +562,11 @@ impl Worker {
         vault.save(&email, &refresh_token).await?;
         let mut store = open_store()?;
         let account = store.add_account(&email)?;
+        if let Some(scopes) = &tokens.scopes {
+            store.set_account_scopes(account, scopes)?;
+        }
+        // An account signed in again may allow something else than before.
+        self.suggesting.replace(None);
         self.data_changed();
         let result = self.sync_account(&client, &mut store, account).await;
         if let Some(problem) = sync_problem(&email, &result) {
@@ -540,18 +575,100 @@ impl Worker {
         Ok(())
     }
 
+    /// Asks the account `email`, which is signed in already, for one permission more.
+    /// What it gave before is asked for again along with it, so that nothing is lost
+    /// if Google does not carry it over.
+    async fn grant(&self, email: &str, permission: Permission) -> Result<()> {
+        self.clear_error();
+        let before = open_store()?
+            .accounts()?
+            .into_iter()
+            .find(|a| a.email == email)
+            .context("the account is no longer signed in")?
+            .scopes;
+        let wanted: Vec<Permission> = Permission::ALL
+            .into_iter()
+            .filter(|one| {
+                *one == permission
+                    || Permission::AT_SIGN_IN.contains(one)
+                    || before.as_ref().is_some_and(|scopes| one.is_in(scopes))
+            })
+            .collect();
+        let (config, vault, tokens) = self.newest_sign_in(&wanted, Some(email)).await?;
+        let refresh_token = tokens
+            .refresh_token
+            .context("Google sent no refresh token")?;
+        let client = self
+            .client(config, refresh_token.clone())
+            .with_access_token(
+                tokens.access_token,
+                tokens.expires_at,
+                tokens.scopes.clone(),
+            );
+        // Google offers the account, but any other can be chosen on its page. That
+        // one's sign-in must not be kept under this account's name.
+        let chosen = client.account_email().await?;
+        if !chosen.eq_ignore_ascii_case(email) {
+            bail!(
+                "Nothing was changed: the permission was asked for {email}, but in the \
+                 browser {chosen} was chosen."
+            );
+        }
+
+        let _cache = self.cache.lock().await;
+        let store = open_store()?;
+        // Removed while the browser was open: then it stays removed.
+        let account = store
+            .accounts()?
+            .into_iter()
+            .find(|a| a.email == email)
+            .context("the account is no longer signed in")?;
+        vault.save(email, &refresh_token).await?;
+        self.suggesting.replace(None);
+        if let Some(scopes) = &tokens.scopes {
+            store.set_account_scopes(account.id, scopes)?;
+            if !permission.is_in(scopes) {
+                bail!(
+                    "{email} did not give the permission: its line on Google's page was \
+                     left unticked."
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Signs in in the browser. Until Google has answered, a newer attempt replaces
+    /// this one, wherever it is: unlocking the keyring, or waiting on a browser tab
+    /// that may have been closed.
+    async fn newest_sign_in(
+        &self,
+        permissions: &[Permission],
+        account: Option<&str>,
+    ) -> Result<(ClientConfig, Vault, TokenSet)> {
+        let mut attempt = 0;
+        self.sign_in_attempt.send_modify(|newest| {
+            *newest += 1;
+            attempt = *newest;
+        });
+        let mut newest = self.sign_in_attempt.subscribe();
+        tokio::select! {
+            signed_in = self.sign_in(permissions, account) => signed_in,
+            _ = newest.wait_for(|newest| *newest != attempt) => Err(Superseded.into()),
+        }
+    }
+
     /// Opens the browser and waits for the user to finish signing in there.
-    async fn sign_in(&self) -> Result<(ClientConfig, Vault, TokenSet)> {
+    async fn sign_in(
+        &self,
+        permissions: &[Permission],
+        account: Option<&str>,
+    ) -> Result<(ClientConfig, Vault, TokenSet)> {
         let config = load_config()?;
         let endpoints = Endpoints::default();
         let vault = Vault::open().await?;
 
-        let pending = gcal_google::begin_login(
-            &config,
-            &endpoints,
-            &gcal_google::scopes(crate::try_people()),
-        )
-        .await?;
+        let scopes: Vec<&str> = permissions.iter().map(|one| one.scope()).collect();
+        let pending = gcal_google::begin_login(&config, &endpoints, &scopes, account).await?;
         let _waiting = self.start(|activity| &mut activity.waiting_for_browser);
         open::that_detached(&pending.auth_url).context("cannot open your browser")?;
         let finish = pending.finish(&self.http, &config, &endpoints);
@@ -602,6 +719,18 @@ impl Worker {
             }
             reached |= result.is_ok();
             problems.extend(sync_problem(&account.email, &result));
+            // Google says with every access token what the account allows: that is how
+            // it is learnt for an account signed in before the app kept it, and how a
+            // change made at Google is noticed.
+            let news = match client.granted_scopes().await {
+                Some(scopes) => store
+                    .set_account_scopes(account.id, &scopes)
+                    .unwrap_or(false),
+                None => false,
+            };
+            if news {
+                self.suggesting.replace(None);
+            }
             // Redrawing closes an open details card and costs time, so the window is only
             // told when there is something new to show. A failed run may have saved part
             // of what it fetched.
@@ -609,7 +738,7 @@ impl Worker {
                 &result,
                 Ok(report) if !report.changed
             );
-            if !unchanged {
+            if !unchanged || news {
                 self.data_changed();
             }
         }
@@ -922,6 +1051,7 @@ impl Worker {
         };
         Vault::open().await?.delete(email).await?;
         store.remove_account(account.id)?;
+        self.suggesting.replace(None);
         // The account is gone either way; a file left larger than needed is no failure.
         let _ = store.compact();
         Ok(())
@@ -939,13 +1069,26 @@ fn no_connection(error: &SyncError) -> bool {
     network.is_connect() || network.is_timeout() || network.is_request()
 }
 
+/// Said under the guests field for an account that allows none of the look-ups.
+const NO_PEOPLE_PERMISSION: &str = "No suggestions: this account does not let the app \
+    read its contacts. You can allow it in the settings, under Permissions.";
+
+/// Where people may be looked up for an account that allows `scopes`. For an account
+/// of which that is not known yet, everywhere: Google refuses what is not allowed.
+fn people_sources(scopes: Option<&[String]>) -> Vec<Permission> {
+    PEOPLE
+        .into_iter()
+        .filter(|source| scopes.is_none_or(|scopes| source.is_in(scopes)))
+        .collect()
+}
+
 /// What to say under the guests field when people could not be looked up. Nothing
 /// when Google cannot be reached: the banner says that already.
 fn suggestion_problem(error: &anyhow::Error) -> String {
     match error.downcast_ref::<ApiError>() {
         Some(ApiError::Status { status: 403, .. }) => {
-            "No suggestions: this account has not allowed the app to read its contacts. \
-             Remove the account and add it again; if that does not help, the People API \
+            "No suggestions: Google refused to look up people for this account. Look at \
+             its permissions in the settings; if they are allowed there, the People API \
              is not enabled for the sign-in key (see README)."
                 .into()
         }
@@ -1113,6 +1256,27 @@ mod tests {
                 "end": {"dateTime": "2026-11-17T13:00:00+01:00", "timeZone": "Europe/Prague"},
                 "reminders": {"useDefault": true}
             })
+        );
+    }
+
+    #[test]
+    fn people_are_looked_up_only_where_the_account_allows() {
+        let scopes = |all: &[Permission]| -> Vec<String> {
+            all.iter().map(|one| one.scope().to_owned()).collect()
+        };
+        // Not known yet: everywhere, and Google refuses what it must.
+        assert_eq!(people_sources(None), PEOPLE);
+        assert_eq!(
+            people_sources(Some(&scopes(&[Permission::Calendar]))),
+            vec![]
+        );
+        assert_eq!(
+            people_sources(Some(&scopes(&[
+                Permission::Calendar,
+                Permission::Directory,
+                Permission::Contacts
+            ]))),
+            vec![Permission::Contacts, Permission::Directory]
         );
     }
 

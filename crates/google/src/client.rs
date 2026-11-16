@@ -8,6 +8,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use url::Url;
 
+use crate::Permission;
 use crate::auth::{self, AuthError};
 use crate::config::{ClientConfig, Endpoints};
 
@@ -85,6 +86,8 @@ struct Page {
 struct Access {
     token: String,
     expires_at: DateTime<Utc>,
+    /// What the account lets the app do, if Google said so with the token.
+    scopes: Option<Vec<String>>,
 }
 
 pub struct GoogleClient {
@@ -112,11 +115,26 @@ impl GoogleClient {
     }
 
     /// Reuses the access token from a sign-in that has just completed, saving one refresh.
-    pub fn with_access_token(self, token: String, expires_at: DateTime<Utc>) -> Self {
+    pub fn with_access_token(
+        self,
+        token: String,
+        expires_at: DateTime<Utc>,
+        scopes: Option<Vec<String>>,
+    ) -> Self {
         Self {
-            access: Mutex::new(Some(Access { token, expires_at })),
+            access: Mutex::new(Some(Access {
+                token,
+                expires_at,
+                scopes,
+            })),
             ..self
         }
+    }
+
+    /// What the account lets the app do, as Google said when it last handed out an
+    /// access token. `None` before the first request, or if Google did not say.
+    pub async fn granted_scopes(&self) -> Option<Vec<String>> {
+        self.access.lock().await.as_ref()?.scopes.clone()
     }
 
     /// The account's address, which is also the ID of its primary calendar.
@@ -293,10 +311,15 @@ impl GoogleClient {
     /// only tells Google to get its search ready, which Google asks for before the
     /// first search.
     ///
-    /// A source that cannot be asked (an ordinary account has no directory) is left
-    /// out. Only if none can be asked is that an error: the account was signed in
-    /// without this permission, or the People API is not enabled for the sign-in key.
-    pub async fn search_people(&self, query: &str) -> Result<Vec<Person>, ApiError> {
+    /// Only the `sources` the account has given are asked. One that then cannot be
+    /// asked after all (an ordinary account has no directory) is left out. Only if none
+    /// answers is that an error: the permission was taken back, or the People API is
+    /// not enabled for the sign-in key.
+    pub async fn search_people(
+        &self,
+        query: &str,
+        sources: &[Permission],
+    ) -> Result<Vec<Person>, ApiError> {
         let common = [
             ("query", query),
             ("readMask", "names,emailAddresses"),
@@ -308,16 +331,22 @@ impl GoogleClient {
             ("pageSize", "10"),
             ("sources", "DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE"),
         ];
-        let searches: [(&str, &[(&str, &str)]); 3] = [
-            ("people:searchContacts", &common),
-            ("otherContacts:search", &common),
-            ("people:searchDirectoryPeople", &directory),
+        type Parameters<'a> = &'a [(&'a str, &'a str)];
+        let searches: [(Permission, &str, Parameters); 3] = [
+            (Permission::Contacts, "people:searchContacts", &common),
+            (Permission::OtherContacts, "otherContacts:search", &common),
+            (
+                Permission::Directory,
+                "people:searchDirectoryPeople",
+                &directory,
+            ),
         ];
         let mut people: Vec<Person> = Vec::new();
         let (mut failure, mut answered) = (None, false);
-        for (path, parameters) in searches {
+        for (source, path, parameters) in searches {
             // The directory has no "get ready" request.
-            if query.is_empty() && path.ends_with("DirectoryPeople") {
+            let nothing_to_ask = query.is_empty() && source == Permission::Directory;
+            if nothing_to_ask || !sources.contains(&source) {
                 continue;
             }
             let api = &self.endpoints.people_api;
@@ -443,6 +472,7 @@ impl GoogleClient {
         *access = Some(Access {
             token: fresh.access_token,
             expires_at: fresh.expires_at,
+            scopes: fresh.scopes,
         });
         Ok(token)
     }
@@ -581,7 +611,16 @@ mod tests {
             .mount(&server)
             .await;
 
-        let found = client(&server).await.search_people("an").await.unwrap();
+        let all = [
+            Permission::Contacts,
+            Permission::OtherContacts,
+            Permission::Directory,
+        ];
+        let found = client(&server)
+            .await
+            .search_people("an", &all)
+            .await
+            .unwrap();
         let listed: Vec<(&str, &str)> = found
             .iter()
             .map(|p| (p.name.as_str(), p.email.as_str()))
@@ -603,8 +642,14 @@ mod tests {
             .respond_with(ResponseTemplate::new(403).set_body_string("insufficient scopes"))
             .mount(&server)
             .await;
-        let result = client(&server).await.search_people("an").await;
+        let client = client(&server).await;
+        let result = client.search_people("an", &[Permission::Contacts]).await;
         assert!(matches!(result, Err(ApiError::Status { status: 403, .. })));
+        // A source the account has not given is not asked at all.
+        assert_eq!(client.search_people("an", &[]).await.unwrap(), vec![]);
+        let asked = server.received_requests().await.unwrap();
+        let searches = asked.iter().filter(|r| r.url.path().contains("people-api"));
+        assert_eq!(searches.count(), 1);
     }
 
     #[tokio::test]
@@ -768,9 +813,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = client(&server)
-            .await
-            .with_access_token("revoked".into(), Utc::now() + chrono::Duration::hours(1));
+        let client = client(&server).await.with_access_token(
+            "revoked".into(),
+            Utc::now() + chrono::Duration::hours(1),
+            None,
+        );
         assert_eq!(client.account_email().await.unwrap(), "me@example.com");
     }
 }

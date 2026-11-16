@@ -17,6 +17,7 @@ use gcal_core::schedule::{DayPart, schedule};
 use gcal_core::text::plain_text;
 use gcal_core::week::{WeekLayout, layout_days, local_day_start};
 use gcal_core::{CalendarListEntry, Event, EventTime, ResponseStatus};
+use gcal_google::Permission;
 use gcal_store::{Account, AccountId, Store, StoredCalendar};
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
@@ -160,6 +161,29 @@ fn shown_dates(day: NaiveDate) -> NaiveDate {
     let first = NaiveDate::from_ymd_opt(1900, 1, 1).unwrap_or_default();
     let last = NaiveDate::from_ymd_opt(2200, 12, 31).unwrap_or_default();
     day.clamp(first, last)
+}
+
+/// For the settings: what each account lets the app do. One number for each of
+/// `Permission::ALL`, in that order: 0 not known yet (the account was signed in before
+/// the app kept this; the next sync tells), 1 allowed, 2 not allowed.
+fn account_permissions(accounts: &[Account]) -> Vec<AccountPermissions> {
+    accounts
+        .iter()
+        .map(|account| {
+            let states: Vec<i32> = Permission::ALL
+                .iter()
+                .map(|permission| match &account.scopes {
+                    None => 0,
+                    Some(scopes) if permission.is_in(scopes) => 1,
+                    Some(_) => 2,
+                })
+                .collect();
+            AccountPermissions {
+                email: account.email.as_str().into(),
+                states: ModelRc::from(Rc::new(VecModel::from(states))),
+            }
+        })
+        .collect()
 }
 
 /// How dates and times are shown, as chosen in the settings.
@@ -1354,6 +1378,10 @@ impl View {
         })();
         match loaded {
             Ok(loaded) => {
+                if let Some(ui) = self.ui.upgrade() {
+                    let rows = account_permissions(&loaded.accounts);
+                    ui.set_account_permissions(ModelRc::from(Rc::new(VecModel::from(rows))));
+                }
                 self.loaded.replace(loaded);
                 self.refresh();
             }
@@ -2381,9 +2409,6 @@ impl View {
     fn suggest_guests(&self, text: &str, calendar: usize) {
         let Some(ui) = self.ui.upgrade() else { return };
         self.clear_suggestions(&ui);
-        if !crate::try_people() {
-            return;
-        }
         let word = text
             .rsplit([',', ';', ' ', '\n', '\t'])
             .next()
@@ -3315,6 +3340,17 @@ pub fn run() -> Result<()> {
             let _ = commands.send(Command::RemoveAccount(email.into()));
         }
     });
+    ui.on_grant_permission({
+        let commands = commands.clone();
+        move |email, permission| {
+            if let Some(permission) = Permission::ALL.get(permission.max(0) as usize) {
+                let _ = commands.send(Command::Grant {
+                    email: email.into(),
+                    permission: *permission,
+                });
+            }
+        }
+    });
 
     // Keeps the current-time line and the "today" highlight moving.
     let clock_timer = Timer::default();
@@ -3365,6 +3401,29 @@ mod tests {
 
     fn date(text: &str) -> NaiveDate {
         text.parse().unwrap()
+    }
+
+    #[test]
+    fn the_settings_say_what_each_account_allows() {
+        let account = |email: &str, scopes: Option<&[Permission]>| Account {
+            id: 1,
+            email: email.into(),
+            scopes: scopes.map(|all| all.iter().map(|one| one.scope().to_owned()).collect()),
+        };
+        let rows = account_permissions(&[
+            account("old@example.com", None),
+            account(
+                "new@example.com",
+                Some(&[Permission::Calendar, Permission::OtherContacts]),
+            ),
+        ]);
+        let states = |row: &AccountPermissions| row.states.iter().collect::<Vec<i32>>();
+        assert_eq!(rows[0].email, "old@example.com");
+        // Signed in before the app kept this: not known until the next sync.
+        assert_eq!(states(&rows[0]), [0, 0, 0, 0]);
+        // In the order of the settings' list: calendars, contacts, other contacts,
+        // the directory.
+        assert_eq!(states(&rows[1]), [1, 2, 1, 2]);
     }
 
     #[test]

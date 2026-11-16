@@ -27,6 +27,9 @@ pub type AccountId = i64;
 pub struct Account {
     pub id: AccountId,
     pub email: String,
+    /// What the account lets the app do, in Google's names (scopes), as Google last
+    /// said. `None` until Google has said: an account signed in by an older version.
+    pub scopes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -90,6 +93,11 @@ const MIGRATIONS: &[&str] = &[
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
+",
+    "
+    -- What the account lets the app do: Google's scopes, separated by spaces. NULL
+    -- until Google has said.
+    ALTER TABLE accounts ADD COLUMN scopes TEXT;
 ",
 ];
 
@@ -160,14 +168,25 @@ impl Store {
     pub fn accounts(&self) -> Result<Vec<Account>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, email FROM accounts ORDER BY id")?;
+            .prepare("SELECT id, email, scopes FROM accounts ORDER BY id")?;
         let rows = stmt.query_map([], |row| {
+            let scopes: Option<String> = row.get(2)?;
             Ok(Account {
                 id: row.get(0)?,
                 email: row.get(1)?,
+                scopes: scopes.map(|all| all.split_whitespace().map(str::to_owned).collect()),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Remembers what the account lets the app do. Returns whether that is news.
+    pub fn set_account_scopes(&self, account: AccountId, scopes: &[String]) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE accounts SET scopes = ?2 WHERE id = ?1 AND scopes IS NOT ?2",
+            rusqlite::params![account, scopes.join(" ")],
+        )?;
+        Ok(changed > 0)
     }
 
     pub fn calendar_list_sync_token(&self, account: AccountId) -> Result<Option<String>> {
@@ -845,5 +864,23 @@ mod tests {
         assert_eq!(reopened.accounts().unwrap()[0].email, "me@example.com");
         drop(reopened);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn what_an_account_allows_is_unknown_until_it_is_said() {
+        let store = Store::open_in_memory().unwrap();
+        let account = store.add_account("me@example.com").unwrap();
+        assert_eq!(store.accounts().unwrap()[0].scopes, None);
+
+        let scopes = ["calendar".to_owned(), "contacts".to_owned()];
+        assert!(store.set_account_scopes(account, &scopes).unwrap());
+        assert_eq!(store.accounts().unwrap()[0].scopes, Some(scopes.to_vec()));
+        // Said again, it is no news; signing in again keeps it.
+        assert!(!store.set_account_scopes(account, &scopes).unwrap());
+        store.add_account("me@example.com").unwrap();
+        assert_eq!(store.accounts().unwrap()[0].scopes, Some(scopes.to_vec()));
+        // Nothing at all is something known too.
+        assert!(store.set_account_scopes(account, &[]).unwrap());
+        assert_eq!(store.accounts().unwrap()[0].scopes, Some(vec![]));
     }
 }

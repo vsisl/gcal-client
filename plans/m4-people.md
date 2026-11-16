@@ -36,17 +36,20 @@ addresses, and every question about e-mails is answered "no".
    time from a list. Those by e-mail or at another time are kept and shown, but the
    editor cannot make them. (`tools/e2e/ed.py`)
 
-## To try, behind a switch
-
-- **Suggestions for the guests field** from the account's contacts, the people it has
-  written to, and its organisation's directory (Google's People API). They need three
-  further read-only permissions at sign-in, so they exist only when the app is started
-  with `GCAL_CLIENT_TRY_PEOPLE=1`, and only for accounts signed in that way. Tried by
-  the owner by hand (2026-11-16); the test accounts have no contacts, so no script
-  covers the answers from Google, only the mock-server tests do. The owner's decisions,
-  still open: whether every sign-in asks for these permissions, and whether the
-  directory ("See and download your organization's directory") is among them. Not done:
-  choosing a suggestion with the arrow keys (Enter takes the first).
+9. **Suggestions for the guests field** from the account's contacts, the people it has
+   written to and, if allowed, its organisation's directory (Google's People API).
+   Every sign-in asks for the first two (read-only; each can be left unticked on
+   Google's page). The directory is asked for only from the settings: it covers every
+   profile in the organisation. Tried by the owner by hand (2026-11-16); the test
+   accounts have no contacts, so no script covers Google's answers, only the
+   mock-server tests do. Not done: choosing a suggestion with the arrow keys (Enter
+   takes the first).
+10. **Permissions in the settings**: for each account what it allows (Google says so
+    with every access token; the cache keeps it), what each permission is for and what
+    it exposes, and "Allow" for a missing one: a sign-in for that account which keeps
+    what it gave before. A sign-in that comes back as another account changes nothing.
+    (`tools/e2e/perms.py` reads the list; pressing "Allow" needs the owner in the
+    browser and was not tried by a script.)
 
 ## Left
 

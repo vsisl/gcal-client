@@ -51,12 +51,8 @@ async fn login() -> Result<()> {
     let http = HttpClient::new();
     let vault = Vault::open().await?;
 
-    let pending = gcal_google::begin_login(
-        &config,
-        &endpoints,
-        &gcal_google::scopes(crate::try_people()),
-    )
-    .await?;
+    let scopes = gcal_google::Permission::AT_SIGN_IN.map(gcal_google::Permission::scope);
+    let pending = gcal_google::begin_login(&config, &endpoints, &scopes, None).await?;
     println!(
         "Opening your browser to sign in. If nothing opens, visit:\n\n{}\n",
         pending.auth_url
@@ -69,12 +65,19 @@ async fn login() -> Result<()> {
         .context("Google sent no refresh token")?;
 
     let client = GoogleClient::new(http, config, endpoints, refresh_token.clone())
-        .with_access_token(tokens.access_token, tokens.expires_at);
+        .with_access_token(
+            tokens.access_token,
+            tokens.expires_at,
+            tokens.scopes.clone(),
+        );
     let email = client.account_email().await?;
     vault.save(&email, &refresh_token).await?;
 
     let mut store = open_store()?;
     let account = store.add_account(&email)?;
+    if let Some(scopes) = &tokens.scopes {
+        store.set_account_scopes(account, scopes)?;
+    }
     println!("Signed in as {email}. Syncing…");
     let report = gcal_sync::sync_account(&client, &mut store, account).await?;
     print_report(&email, &report);
@@ -237,13 +240,6 @@ async fn patch(
         .await?;
     println!("{}", serde_json::to_string_pretty(&now)?);
     Ok(())
-}
-
-/// Whether this run asks, at sign-in, for permission to read contacts, and suggests
-/// guests from them. Off unless the app is started with GCAL_CLIENT_TRY_PEOPLE=1:
-/// asking every user for that permission is the owner's decision, still open.
-pub fn try_people() -> bool {
-    std::env::var("GCAL_CLIENT_TRY_PEOPLE").is_ok_and(|value| value == "1")
 }
 
 fn main() -> Result<()> {
