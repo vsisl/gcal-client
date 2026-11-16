@@ -187,6 +187,12 @@ python3 tools/e2e/e2e.py <screenshot folder> <data folder>/gcal-client/cache.db
 As a second guard, `insert` refuses to run on a cache that holds more than one account,
 which the real one usually does.
 
+The test build also has `patch <test account> <calendar> <event id> <file>`: it sends
+the changes in the file as that account and prints Google's answer, for finding out
+what Google does with a change before the window is taught to make it. It runs on a
+one-account folder only, and sends no e-mail unless `--email` is added (between the
+owner's two test accounts only).
+
 | Script | Covers | Needs first |
 |---|---|---|
 | `e2e.py` | create, delete, undo; a series: this / following / all | the `series` fixture |

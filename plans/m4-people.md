@@ -41,8 +41,12 @@ addresses, and every question about e-mails is answered "no".
 
 ## Known rough edges
 
-- A guest's own copy of an event the organiser lets guests change stays read-only
-  here (`can_move` asks who organises it, not `guestsCanModify`).
+- A guest's own copy of an event stays read-only here, also when the organiser lets
+  guests change it. Tried with the two test accounts (2026-11-16): a guest's change
+  through the guest's own calendar is saved in that copy alone and never reaches the
+  organiser (not after minutes, not with `sendUpdates=all`); sent to the organiser's
+  calendar it is refused as "not found". The web can do it; the public API, as far as
+  these tries show, cannot. The details card's link opens the event on the web.
 
 - After a change to a video meeting the app fetches the event again three seconds
   later, which closes an open details card; within those seconds another change to the
