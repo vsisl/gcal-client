@@ -916,6 +916,9 @@ fn to_window(form: &Form) -> EditorForm {
         busy: form.busy,
         guests: form.guests.as_str().into(),
         meet: form.meet,
+        may_modify: form.may_modify,
+        may_invite: form.may_invite,
+        may_see: form.may_see,
     }
 }
 
@@ -936,6 +939,9 @@ fn from_window(form: &EditorForm) -> Form {
         busy: form.busy,
         guests: form.guests.to_string(),
         meet: form.meet,
+        may_modify: form.may_modify,
+        may_invite: form.may_invite,
+        may_see: form.may_see,
     }
 }
 

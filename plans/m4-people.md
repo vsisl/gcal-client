@@ -19,6 +19,10 @@ attachment links.
    adding and removing on an existing one; the organiser joins the first guests.
    (`tools/e2e/guests.py`)
 5. **Google Meet** from the editor: create, keep, remove. (`tools/e2e/meet.py`)
+6. **What guests may do**, in the editor: change the event, invite others, see the
+   guest list. Who may change the event may do the other two, as on the web. A new
+   event says nothing about them unless they differ from Google's defaults.
+   (`tools/e2e/guests.py`)
 
 Sending e-mails has not been tried by the scripts on purpose: their guests are made-up
 addresses, and every question about e-mails is answered "no".
@@ -28,8 +32,6 @@ addresses, and every question about e-mails is answered "no".
 - **Contact autocomplete** for the guests field: needs Google's People API and a further
   permission at sign-in (every signed-in account has to agree again). Decide with the
   owner before adding a scope.
-- **Guest permissions**: guests may modify the event / invite others / see the guest
-  list (`guestsCanModify`, `guestsCanInviteOthers`, `guestsCanSeeOtherGuests`).
 - **Optional guests**, and a note with an answer.
 - **Find a time**: other people's free/busy (`freebusy.query`) beside the event in the
   editor.
@@ -38,6 +40,9 @@ addresses, and every question about e-mails is answered "no".
 - A guest's copy of an event: "propose a new time" has no API and goes to the browser.
 
 ## Known rough edges
+
+- A guest's own copy of an event the organiser lets guests change stays read-only
+  here (`can_move` asks who organises it, not `guestsCanModify`).
 
 - After a change to a video meeting the app fetches the event again three seconds
   later, which closes an open details card; within those seconds another change to the

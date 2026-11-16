@@ -55,6 +55,11 @@ pub struct Form {
     pub guests: String,
     /// Whether the event has a Google Meet video meeting.
     pub meet: bool,
+    /// What the guests may do: change the event, invite others, see who else is
+    /// invited. Google's own defaults are no, yes, yes.
+    pub may_modify: bool,
+    pub may_invite: bool,
+    pub may_see: bool,
 }
 
 /// What the form cannot show but must not lose.
@@ -89,6 +94,8 @@ fn date(instant: DateTime<Utc>, zone: Tz) -> NaiveDate {
 pub fn new_form(start: EventTime, end: EventTime, zone: Tz) -> Form {
     let mut form = Form {
         busy: true,
+        may_invite: true,
+        may_see: true,
         ..Form::default()
     };
     set_times(&mut form, start, end, zone);
@@ -179,6 +186,12 @@ pub fn form_of(resource: &Value, start: EventTime, end: EventTime, zone: Tz) -> 
             _ => 0,
         },
         busy: resource["transparency"].as_str() != Some("transparent"),
+        // Google leaves out what is as it is by default.
+        may_modify: resource["guestsCanModify"].as_bool().unwrap_or(false),
+        may_invite: resource["guestsCanInviteOthers"].as_bool().unwrap_or(true),
+        may_see: resource["guestsCanSeeOtherGuests"]
+            .as_bool()
+            .unwrap_or(true),
         ..Form::default()
     };
     set_times(&mut form, start, end, zone);
@@ -296,6 +309,10 @@ pub fn fields(form: &Form, kept: &Kept, zone: Tz) -> Result<Value, String> {
     Ok(json!({
         "conferenceData": conference,
         "attendees": guest_list(form, kept)?,
+        // Who may change the event may do the rest as well, as on the web.
+        "guestsCanModify": form.may_modify,
+        "guestsCanInviteOthers": form.may_modify || form.may_invite,
+        "guestsCanSeeOtherGuests": form.may_modify || form.may_see,
         "summary": form.title.trim(),
         "start": start,
         "end": end,
@@ -441,6 +458,8 @@ pub fn creation(fields: Value) -> Value {
         "reminders" => value == &json!({ "useDefault": true }),
         "visibility" => value == "default",
         "transparency" => value == "opaque",
+        "guestsCanModify" => value == false,
+        "guestsCanInviteOthers" | "guestsCanSeeOtherGuests" => value == true,
         _ => false,
     };
     fields.retain(|name, value| !says_nothing(name, value));
@@ -782,6 +801,9 @@ mod tests {
                 busy: false,
                 guests: String::new(),
                 meet: false,
+                may_modify: false,
+                may_invite: true,
+                may_see: true,
             }
         );
         let opened = fields(&form, &kept, zone()).unwrap();
@@ -1006,6 +1028,68 @@ mod tests {
         assert_eq!(
             fields(&form, &Kept::default(), zone()).unwrap()["attendees"],
             json!([{"email": "ann@x.org"}])
+        );
+    }
+
+    #[test]
+    fn what_guests_may_do_is_sent_only_when_it_differs() {
+        let start = timed("2026-11-17T09:00:00Z");
+        let end = timed("2026-11-17T10:00:00Z");
+        let may = |form: &Form| {
+            let fields = fields(form, &Kept::default(), zone()).unwrap();
+            [
+                "guestsCanModify",
+                "guestsCanInviteOthers",
+                "guestsCanSeeOtherGuests",
+            ]
+            .map(|name| fields[name].as_bool().unwrap())
+        };
+
+        // A new event has Google's defaults, and says nothing about them.
+        let mut form = new_form(start, end, zone());
+        assert_eq!(may(&form), [false, true, true]);
+        let new = creation(fields(&form, &Kept::default(), zone()).unwrap());
+        assert!(new.get("guestsCanModify").is_none());
+        assert!(new.get("guestsCanInviteOthers").is_none());
+        assert!(new.get("guestsCanSeeOtherGuests").is_none());
+
+        // What differs is said.
+        form.may_see = false;
+        let new = creation(fields(&form, &Kept::default(), zone()).unwrap());
+        assert_eq!(new["guestsCanSeeOtherGuests"], json!(false));
+        assert!(new.get("guestsCanInviteOthers").is_none());
+
+        // Who may change the event may do the rest, whatever the other boxes say.
+        form.may_modify = true;
+        form.may_invite = false;
+        assert_eq!(may(&form), [true, true, true]);
+
+        // An existing event: what it does not say is the default; one box changed
+        // sends that field alone, and taking it back removes it again.
+        let resource = json!({
+            "summary": "Review",
+            "start": {"dateTime": "2026-11-17T09:00:00Z"},
+            "end": {"dateTime": "2026-11-17T10:00:00Z"},
+            "guestsCanInviteOthers": false
+        });
+        let (opened, kept) = form_of(&resource, start, end, zone());
+        assert_eq!(
+            (opened.may_modify, opened.may_invite, opened.may_see),
+            (false, false, true)
+        );
+        let mut edited = opened.clone();
+        edited.may_modify = true;
+        let changes = diff(
+            &fields(&opened, &kept, zone()).unwrap(),
+            &fields(&edited, &kept, zone()).unwrap(),
+        );
+        assert_eq!(
+            changes,
+            json!({"guestsCanModify": true, "guestsCanInviteOthers": true})
+        );
+        assert_eq!(
+            inverse(&changes, &resource),
+            json!({"guestsCanModify": null, "guestsCanInviteOthers": false})
         );
     }
 
