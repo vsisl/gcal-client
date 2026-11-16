@@ -10,8 +10,10 @@ e-mails is unticked, and seen to be unticked, before it is confirmed. Needs no f
 
 With --email the three questions are left ticked instead, so that Google e-mails the
 guest an invitation, an update and a cancellation. The owner allowed this between the
-two test accounts only, which is why the script refuses it unless the guest is a guest
-of this very run. The app cannot read mail: that the e-mails arrived is for the owner
+two test accounts only: before each e-mailed change the script stops unless the
+guests it sees (in the editor, and in the cache) are those two and no other. It
+cannot rule out a guest added at Google in the seconds between that look and the
+change. The app cannot read mail: that the e-mails arrived is for the owner
 to see in the guest's inbox. They carry the name the script prints.
 
 Before anything is written the script makes sure that each app really is the one
@@ -78,6 +80,23 @@ def confirm(question, email=False):
     if bool(properties(one("Checkbox", question)).get("accessibleChecked")) != email:
         raise Failed(f"'{question}' could not be set; nothing was confirmed")
     key(ENTER)
+
+
+def typed_guests():
+    """The addresses in the editor's guests field, as the app will send them."""
+    text = properties(one("TextInput", HINT)).get("accessibleValue", "")
+    return {part.strip().lower() for part in text.replace(";", ",").split(",") if part.strip()}
+
+
+def only_the_two(shown):
+    """With --email, stops unless the e-mails can only go to the two test accounts:
+    the guests in the editor and the guests the cache has for the event."""
+    if not EMAIL:
+        return
+    if not shown or not shown <= {organiser, guest}:
+        raise Failed(f"the editor lists {sorted(shown)} as guests; no e-mail is sent")
+    if created and set(answers(mine())) != {organiser, guest}:
+        raise Failed("the event has other guests; no e-mail is sent")
 
 
 def must(passed):
@@ -184,6 +203,8 @@ def run():
     click("Button", "More options")
     click("TextInput", HINT)
     for ch in guest: key(ch)
+    if typed_guests() != {guest}:
+        raise Failed(f"the guests field holds {sorted(typed_guests())}, not the guest; nothing was saved")
     click("Button", "Save"); time.sleep(0.5)
     confirm(ASK, EMAIL)
     must(wait("organiser: created", lambda: len(named(NAME)) == 1))
@@ -211,6 +232,7 @@ def run():
     # 4. The organiser renames it; the guest's copy follows and keeps the answer.
     key("e"); time.sleep(0.5)
     key(" "); key("2")
+    only_the_two(typed_guests())
     click("Button", "Save"); time.sleep(0.5)
     confirm(ASK, EMAIL)
     must(wait("organiser: renamed at Google", lambda: mine()["summary"] == RENAMED))
@@ -247,7 +269,8 @@ def delete(email=False):
     must(wait("organiser: the event to delete is on screen", lambda: len(items(name)) >= 1))
     open_event(name)
     key(DEL); time.sleep(0.5)
-    # E-mails only to this run's own guest list: the organiser and the guest.
+    # E-mails only to this run's own guest list: the organiser and the guest. The
+    # event may have been given other guests at Google since it was created.
     if email and set(answers(mine())) != {organiser, guest}:
         raise Failed("the event has other guests; no e-mail is sent")
     confirm(ASK_CANCEL, email)
