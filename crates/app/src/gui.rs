@@ -181,6 +181,13 @@ fn typed_before_suggestion(text: &str) -> Result<Vec<&str>, String> {
     }
 }
 
+/// Whether a calendar can be taken off its account's list from the sidebar: one the
+/// account subscribed to. Its own calendars stay (Google does not let the main one
+/// go at all, and an owned one taken off the list is hard to find again).
+fn can_leave_list(entry: &CalendarListEntry) -> bool {
+    !entry.primary && entry.access_role.as_deref() != Some("owner")
+}
+
 /// For the settings: what each account lets the app do. One number for each of
 /// `Permission::ALL`, in that order: 0 not known yet (the account was signed in before
 /// the app kept this; the next sync tells), 1 allowed, 2 not allowed.
@@ -1467,6 +1474,7 @@ impl View {
                 email: account.email.as_str().into(),
                 color: FALLBACK_COLOR,
                 shown: true,
+                removable: false,
             });
             for calendar in calendars.iter().filter(|c| c.account_id == account.id) {
                 let entry = &calendar.entry;
@@ -1482,6 +1490,7 @@ impl View {
                         .and_then(parse_color)
                         .unwrap_or(FALLBACK_COLOR),
                     shown: calendar.shown,
+                    removable: can_leave_list(entry),
                 });
             }
         }
@@ -2469,6 +2478,37 @@ impl View {
         }
     }
 
+    /// The field of "Add a calendar" was typed into: asks for people of `account`
+    /// matching the text, once it has two letters. An empty text only takes the
+    /// suggestions away.
+    fn suggest_owners(&self, text: &str, account: AccountId) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        self.clear_suggestions(&ui);
+        let query = text.trim();
+        if query.chars().count() >= 2 {
+            let _ = self.commands.send(Command::SuggestGuests {
+                account,
+                query: query.to_owned(),
+                serial: ui.get_guest_suggest_serial(),
+            });
+        }
+    }
+
+    /// The calendar to add for what was typed in "Add a calendar": the text itself if
+    /// it can be an address or an identifier, else (a name, or the start of one) the
+    /// first person suggested for it.
+    fn calendar_typed(&self, text: &str) -> String {
+        let text = text.trim();
+        let first = self
+            .ui
+            .upgrade()
+            .and_then(|ui| ui.get_guest_suggestions().row_data(0));
+        match first {
+            Some(person) if !text.contains('@') => person.email.into(),
+            _ => text.to_owned(),
+        }
+    }
+
     /// A suggested person was chosen: joins the guests, by name, after the addresses
     /// typed before. Says whether the field's text was used up.
     fn pick_suggestion(&self, row: usize) -> bool {
@@ -3378,6 +3418,32 @@ pub fn run() -> Result<()> {
             let _ = commands.send(Command::RemoveAccount(email.into()));
         }
     });
+    ui.on_subscribe_typed({
+        let view = view.clone();
+        move |text, account| view.suggest_owners(&text, AccountId::from(account))
+    });
+    ui.on_subscribe_calendar({
+        let commands = commands.clone();
+        let view = view.clone();
+        move |account, calendar| {
+            let calendar_id = view.calendar_typed(&calendar);
+            if !calendar_id.is_empty() {
+                let _ = commands.send(Command::Subscribe {
+                    account: AccountId::from(account),
+                    calendar_id,
+                });
+            }
+        }
+    });
+    ui.on_unsubscribe_calendar({
+        let commands = commands.clone();
+        move |account, calendar| {
+            let _ = commands.send(Command::Unsubscribe {
+                account: AccountId::from(account),
+                calendar_id: calendar.into(),
+            });
+        }
+    });
     ui.on_grant_permission({
         let commands = commands.clone();
         move |email, permission| {
@@ -3460,6 +3526,21 @@ mod tests {
             typed_before_suggestion("žo@example.com, šá"),
             Ok(vec!["žo@example.com"])
         );
+    }
+
+    #[test]
+    fn only_a_subscribed_calendar_can_be_taken_off_the_list() {
+        let entry = |primary: bool, role: &str| -> CalendarListEntry {
+            serde_json::from_value(serde_json::json!({
+                "id": "c", "primary": primary, "accessRole": role
+            }))
+            .unwrap()
+        };
+        assert!(can_leave_list(&entry(false, "reader")));
+        assert!(can_leave_list(&entry(false, "freeBusyReader")));
+        assert!(can_leave_list(&entry(false, "writer")));
+        assert!(!can_leave_list(&entry(true, "owner")));
+        assert!(!can_leave_list(&entry(false, "owner")));
     }
 
     #[test]

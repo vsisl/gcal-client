@@ -12,7 +12,7 @@ Not affiliated with or endorsed by Google. Google Calendar is a trademark of Goo
 
 | Works | Not yet |
 |---|---|
-| Several accounts merged in one view, calendars ticked on and off | "Find a time", rooms, subscribing to further calendars |
+| Several accounts merged in one view, calendars ticked on and off; a colleague's calendar added by their address | "Find a time", rooms, creating and sharing calendars |
 | Day, week, a few days, month, year and schedule views; go to date | Search |
 | Create, edit, move, resize and delete events, with undo (two exceptions, see below) | Date and time pickers (dates and times are typed), custom repeat rules |
 | Repeating events: "this / this and following / all"; guests (also optional ones, suggested from your contacts), answering invitations, Google Meet links, several notifications per event | Notifications shown on the desktop, tray icon, running in the background |
