@@ -3,7 +3,7 @@ name: Release
 # A tag "v<version>" publishes that version: the AppImage and its .zsync file are
 # attached to a GitHub release. Started by hand instead (Actions → Release → Run
 # workflow) it builds the same AppImage and keeps it with the run, for trying it out
-# without publishing anything.
+# without publishing anything; so does a pull request that touches the packaging.
 on:
   push:
     tags: ["v*"]
@@ -13,14 +13,20 @@ on:
   pull_request:
     paths: ["packaging/**", ".github/workflows/release.yml"]
 
+# Building may only read the repository. Publishing is a job of its own, the only one
+# that may write, and it runs nothing from the repository.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   # Where published versions are found, written into each AppImage: the newest GitHub
   # release of this repository. Gear Lever and other AppImage updaters read it.
   UPDATE_INFORMATION: gh-releases-zsync|vsisl|gcal-client|latest|gcal-client-*-x86_64.AppImage.zsync
+  # The tool that packs the AppImage: a fixed version, checked against its checksum
+  # before it is run. To move to a newer one, change both.
+  APPIMAGETOOL_VERSION: 1.9.0
+  APPIMAGETOOL_SHA256: 46fdd785094c7f6e545b61afcfb0f3d98d8eab243f644b4b17698c01d06083d1
 
 jobs:
   appimage:
@@ -29,6 +35,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Version
         id: version
         run: |
@@ -43,7 +51,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libfontconfig-dev libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev libdbus-1-dev zsync desktop-file-utils
-          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          curl -fsSL -o appimagetool "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage"
+          echo "$APPIMAGETOOL_SHA256  appimagetool" | sha256sum --check
           chmod +x appimagetool
           # The runner has no FUSE to mount an AppImage with: the tool unpacks itself.
           printf '#!/bin/sh\nexec "%s/appimagetool" --appimage-extract-and-run "$@"\n' "$PWD" | sudo tee /usr/local/bin/appimagetool > /dev/null
@@ -58,6 +67,7 @@ jobs:
           # a pull request can change.
           VERSION: ${{ steps.version.outputs.version }}
         run: |
+          desktop-file-validate packaging/*.desktop
           packaging/build-appimage.sh target/release/gcal-client "$VERSION" dist "$UPDATE_INFORMATION"
           ls -l dist
           # It must start, and be the version it is named after.
@@ -65,13 +75,24 @@ jobs:
           dist/*.AppImage --appimage-extract-and-run --version | grep -F "gcal-client $VERSION"
           test -f "dist/gcal-client-$VERSION-x86_64.AppImage.zsync"
       - name: Keep the AppImage with this run
-        if: github.ref_type != 'tag'
         uses: actions/upload-artifact@v4
         with:
           name: gcal-client-appimage
           path: dist/*
+          if-no-files-found: error
+
+  publish:
+    if: github.ref_type == 'tag'
+    needs: appimage
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: gcal-client-appimage
+          path: dist
       - name: Publish the release
-        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

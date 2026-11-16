@@ -39,8 +39,10 @@ Decided by the user:
 - **Features without a public API** keep their menu entries/buttons, marked "opens in browser", and
   open the matching Google Calendar page for the right account.
 - **Repo:** private on GitHub from M0 (for CI); made public at the end of M3. Pushes only after asking.
-- **Packaging: Flatpak only** (Flathub). Token storage and background mode are designed for the
-  sandbox from the start (`oo7` / Secret portal, Background portal).
+- **Packaging: an AppImage first** (changed 2026-11-16; it was "Flatpak only"): published
+  as GitHub releases, with update information so that Gear Lever keeps it up to date. It
+  needs no sandbox work and no store review. A Flatpak (Flathub) later; token storage
+  already goes through `oo7`, which works in the sandbox too.
 - **Languages:** English, with every interface string marked for translation from day one (`@tr`);
   dates, times and week start follow settings/locale.
 - **Privacy:** the app talks only to Google. No statistics, crash reporting or update checks;
@@ -139,6 +141,10 @@ clock, print.
 
 **M8 — Public release**: final name, homepage + privacy policy on a domain, Google review, Flatpak
 packaging and Flathub submission, release CI injecting the official key, accessibility pass.
+*Brought forward in part (2026-11-16): the AppImage and its release workflow, the README for
+the public, the privacy policy and homepage, and the checklist for Google's review
+(`docs/google-review.md`). Left: the name, the review itself, the official key in releases,
+the Flatpak, the accessibility pass.*
 
 **M9 — Windows and macOS** builds, keychains, installers.
 

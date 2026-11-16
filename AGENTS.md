@@ -26,7 +26,9 @@ Made by the owner; do not reopen them without being asked.
 - The Google sign-in key is never in the repository (Google's terms forbid it); each
   developer has one in `~/.config/gcal-client/client.toml`. Google's review of the app
   is part of M8.
-- Packaging will be Flatpak only. English, with every string in `.slint` marked `@tr`.
+- Packaging: an AppImage first, published as GitHub releases and updated through
+  Gear Lever (`packaging/`, `.github/workflows/release.yml`); a Flatpak later.
+  English, with every string in `.slint` marked `@tr`.
 
 ## Working rules
 
@@ -66,6 +68,15 @@ Do not pipe these into `tail` or `grep` when deciding whether they passed: the p
 the exit status (this once let a failing commit through). CI runs the same three on pull
 requests.
 
+**Releases**
+- A release is a tag `v<version>` on `main`, with the same version in `Cargo.toml`
+  (`[workspace.package]`). The release workflow builds the AppImage, checks that it
+  starts, and attaches it and its `.zsync` file to a GitHub release. Only the owner
+  tags.
+- The file name `gcal-client-<version>-x86_64.AppImage` and the update information in
+  the workflow belong together: Gear Lever finds new versions by them. Change neither
+  without the other.
+
 **Reporting**
 - Say plainly what was tested and how, and what was not. "Compiles" is not "works".
 - New logic gets a test. A bug gets a test that fails without the fix.
@@ -84,6 +95,8 @@ requests.
 | `crates/app/src/worker.rs` | Background thread: sign-in, sync, and every write to Google |
 | `crates/app/ui/app.slint` | The whole window |
 | `tools/e2e` | End-to-end scripts that drive the window against a test account |
+| `packaging` | The icon, the launcher's entry, the AppStream metadata, and the script that packs the AppImage |
+| `docs` | The homepage and the privacy policy (served by GitHub Pages), and the checklist for Google's review |
 | `plans` | Design and per-milestone plans |
 | `spikes` | Throwaway experiments from M0; not part of the workspace's product |
 
