@@ -217,16 +217,20 @@ def run():
     common.use(*GUEST)
     synced("guest: sees the new name, still yes", lambda: theirs()["summary"] == RENAMED and answers(theirs())[guest] == "accepted")
 
-    # 5. The guest changes the answer; the organiser sees it.
-    must(wait("guest: the new name is on screen", lambda: len(items(RENAMED)) == 1))
-    open_event(RENAMED)
-    click("Button", "No")
-    must(wait("guest: no saved at Google", lambda: answers(theirs())[guest] == "declined"))
-    common.use(*ORGANISER)
-    synced("organiser: sees the guest's no", lambda: answers(mine())[guest] == "declined")
+    # 5. The guest changes the answer; the organiser sees it. Not with --email: the
+    #    cancellation is to be seen arriving, and after a run in which the guest had
+    #    declined none arrived.
+    if not EMAIL:
+        must(wait("guest: the new name is on screen", lambda: len(items(RENAMED)) == 1))
+        open_event(RENAMED)
+        click("Button", "No")
+        must(wait("guest: no saved at Google", lambda: answers(theirs())[guest] == "declined"))
+        common.use(*ORGANISER)
+        synced("organiser: sees the guest's no", lambda: answers(mine())[guest] == "declined")
 
     # 6. The organiser deletes it, without cancellation e-mails; it leaves the guest's
     #    calendar too.
+    common.use(*ORGANISER)
     time.sleep(11)
     delete(EMAIL)
     must(wait("organiser: deleted", lambda: mine() is None))
