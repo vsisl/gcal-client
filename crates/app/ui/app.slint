@@ -35,6 +35,43 @@ export struct AllDayItem {
     text-color: color,
 }
 
+// A notification in the editor's list.
+export struct EditorNotice {
+    // Which of the offered times; the one after the last is `custom`.
+    choice: int,
+    // A time that is none of the offered ones, in words; empty if there is none.
+    custom: string,
+    custom-minutes: int,
+    email: bool,
+}
+
+// A guest in the editor's list.
+export struct EditorGuest {
+    email: string,
+    // The guest's name, if one is known.
+    name: string,
+    optional: bool,
+}
+
+// What one account lets the app do at Google: for each permission, in the order of
+// permission-names, 0 not known yet, 1 allowed, 2 not allowed.
+export struct AccountPermissions {
+    email: string,
+    states: [int],
+}
+
+// Someone suggested as a guest while a name is typed.
+export struct Suggestion {
+    name: string,
+    email: string,
+}
+
+// A file attached to an event, opened in the browser.
+export struct Attachment {
+    title: string,
+    link: string,
+}
+
 // One guest of an event.
 export struct Guest {
     name: string,
@@ -67,6 +104,7 @@ export struct EventDetail {
     // Who is invited, and the address of the video meeting, if any.
     guests: [Guest],
     meet: string,
+    attachments: [Attachment],
     // This account's own answer to the invitation: 0 none yet, 1 yes, 2 no, 3 maybe;
     // -1 when it is not invited (or cannot answer here).
     rsvp: int,
@@ -143,7 +181,6 @@ export struct EditorForm {
     description: string,
     // 0 is the calendar's colour.
     color: int,
-    reminder: int,
     visibility: int,
     busy: bool,
     // The guests' e-mail addresses, separated by commas.
@@ -251,6 +288,10 @@ component Field inherits Rectangle {
     callback edited(string);
     // Enter in a one-line box.
     callback accepted(string);
+    // Empties the box; its text no longer follows `value` once it was typed into.
+    public function clear() {
+        input.text = "";
+    }
 
     height: multiline ? 96px : 36px;
     border-radius: 4px;
@@ -582,16 +623,42 @@ export component AppWindow inherits Window {
     in-out property <EditorForm> editor;
     in-out property <bool> editor-visible;
     in property <bool> editor-new;
-    // The event repeats, or reminds, in a way the lists do not offer: one more choice
-    // keeps that as it is.
+    // The event repeats in a way the list does not offer: one more choice keeps that
+    // as it is.
     in property <bool> editor-custom-repeat;
-    in property <bool> editor-custom-reminder;
+    // The event's notifications: those usual in its calendar, or its own ones, one
+    // line each (up to five). Rust keeps the list.
+    in property <bool> editor-usual-notices;
+    in property <[EditorNotice]> editor-notices;
+    // Adds one (to the usual ones of the calendar, given for a new event, if those
+    // were in force), removes one, sets one's time, goes back to the usual ones.
+    callback editor-notice-add(int);
+    callback editor-notice-remove(int);
+    callback editor-notice-set(int, int);
+    callback editor-notice-usual();
     in property <string> editor-calendar-name;
     in property <[string]> editor-calendars;
     // The calendar's colour, then Google's event colours.
     in property <[color]> editor-colors;
     // Why the form cannot be saved as it is.
     in property <string> editor-error;
+    // The guests of the event in the editor, one line each. The field above them
+    // holds what is being typed; Enter (or Save) adds it. Rust keeps the list.
+    in property <[EditorGuest]> editor-guests;
+    // Adds the addresses in the text; false (with editor-error set) if one is none.
+    callback editor-guest-add(string) -> bool;
+    callback editor-guest-remove(int);
+    // People matching what is being typed in the guests field, offered under it. The
+    // worker fills them in for the request numbered guest-suggest-serial and no other.
+    in-out property <[Suggestion]> guest-suggestions;
+    in-out property <int> guest-suggest-serial;
+    // Why there are none, when that is worth saying.
+    in-out property <string> guest-suggest-problem;
+    // The field's text changed (with the calendar chosen for a new event).
+    callback editor-guest-typed(string, int);
+    // Returns whether the field's text was used up (and is to be emptied).
+    callback editor-guest-pick(int) -> bool;
+    callback editor-guest-optional(int);
     callback editor-requested(int);
     callback editor-from-draft(string, int);
     callback editor-save(EditorForm, int);
@@ -612,6 +679,8 @@ export component AppWindow inherits Window {
     }
     // The settings card, opened with "s" or its button.
     property <bool> settings-visible;
+    // Whether the settings card shows its page of permissions.
+    property <bool> settings-permissions;
     // The hours' labels beside the day columns, in the clock that was chosen.
     in property <[string]> hour-labels;
     // Choices of the settings card: the week's first day (Monday, Sunday, Saturday)
@@ -789,6 +858,23 @@ export component AppWindow inherits Window {
     callback toggle-calendar(int, string, bool);
     callback add-account();
     callback remove-account(string);
+    // The settings' list of permissions: what there is to allow and what for (here,
+    // so that it can be translated), and what each account allows (from Rust).
+    in property <[AccountPermissions]> account-permissions;
+    property <[string]> permission-names: [
+        @tr("Calendars and events"),
+        @tr("Contacts"),
+        @tr("Other contacts"),
+        @tr("Your organisation's directory"),
+    ];
+    property <[string]> permission-purposes: [
+        @tr("Needed. The app shows the account's calendars and events and saves your changes to them. With this it can see, change and delete every calendar and event the account can."),
+        @tr("Suggests guests from the account's address book while you type a name. Google's permission covers everything saved about your contacts. The app asks only for the names and e-mail addresses that match what you type, and keeps none of them."),
+        @tr("Suggests people the account has exchanged e-mails with but never saved as contacts. Google's permission covers their names, e-mail addresses and phone numbers. The app asks only for the names and e-mail addresses that match what you type, and keeps none of them."),
+        @tr("Optional, and only of use for an account at a company or a school: suggests colleagues as guests. Google's permission lets the app read the profile of everyone in the organisation's directory: names, e-mail addresses, photos, phone numbers, job titles and whatever else the organisation shows there. The app asks only for the names and e-mail addresses that match what you type, and keeps none of them. The organisation's administrator can turn this off."),
+    ];
+    // An account's address, and the permission's place in permission-names.
+    callback grant-permission(string, int);
     callback sync-now();
     // Raised from the background worker when the cache changed.
     callback data-changed();
@@ -910,6 +996,7 @@ export component AppWindow inherits Window {
                 return accept;
             }
             if (event.text == "s") {
+                root.settings-permissions = false;
                 root.settings-visible = true;
                 return accept;
             }
@@ -1101,6 +1188,7 @@ export component AppWindow inherits Window {
                     TextButton {
                         text: @tr("Settings");
                         clicked => {
+                            root.settings-permissions = false;
                             root.settings-visible = true;
                         }
                     }
@@ -2386,6 +2474,28 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+                if root.detail.attachments.length > 0: VerticalLayout {
+                    spacing: 2px;
+
+                    Text {
+                        text: root.detail.attachments.length == 1 ? @tr("1 attachment") : @tr("{} attachments", root.detail.attachments.length);
+                        font-size: 12px;
+                        font-weight: 500;
+                        color: Theme.text-dim;
+                    }
+
+                    for file[i] in root.detail.attachments: HorizontalLayout {
+                        alignment: start;
+                        TextButton {
+                            text: file.title;
+                            height: 28px;
+                            text-color: Theme.accent;
+                            clicked => {
+                                root.open-link(file.link);
+                            }
+                        }
+                    }
+                }
                 if root.detail.guests.length > 0: VerticalLayout {
                     spacing: 2px;
 
@@ -2840,11 +2950,147 @@ export component AppWindow inherits Window {
 
                     EditorRow {
                         label: @tr("Guests");
-                        Field {
-                            hint: @tr("ann@example.com, bob@example.com");
-                            value: root.editor.guests;
-                            edited(text) => {
-                                root.editor.guests = text;
+                        VerticalLayout {
+                            spacing: 2px;
+
+                            guest-field := Field {
+                                hint: @tr("ann@example.com, bob@example.com");
+                                value: root.editor.guests;
+                                edited(text) => {
+                                    root.editor.guests = text;
+                                    root.editor-guest-typed(text, root.draft-calendar);
+                                }
+                                accepted(text) => {
+                                    if (root.editor-guest-add(text)) {
+                                        guest-field.clear();
+                                        root.editor.guests = "";
+                                    }
+                                }
+                            }
+
+                            for person[i] in root.guest-suggestions: Rectangle {
+                                height: 30px;
+                                border-radius: 4px;
+                                background: person-touch.has-hover ? Theme.selected : Theme.hover;
+                                accessible-role: list-item;
+                                accessible-label: "Suggestion: \{person.email}";
+                                accessible-action-default => {
+                                    if (root.editor-guest-pick(i)) {
+                                        guest-field.clear();
+                                        root.editor.guests = "";
+                                    }
+                                }
+
+                                person-touch := TouchArea {
+                                    clicked => {
+                                        if (root.editor-guest-pick(i)) {
+                                            guest-field.clear();
+                                            root.editor.guests = "";
+                                        }
+                                    }
+                                }
+
+                                Text {
+                                    x: 10px;
+                                    width: parent.width - 20px;
+                                    height: parent.height;
+                                    text: person.name != "" ? "\{person.name} · \{person.email}" : person.email;
+                                    font-size: 13px;
+                                    color: Theme.text;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                            if root.guest-suggest-problem != "": Text {
+                                text: root.guest-suggest-problem;
+                                font-size: 12px;
+                                color: Theme.text-dim;
+                                wrap: word-wrap;
+                            }
+
+                            for guest[i] in root.editor-guests: Rectangle {
+                                height: 30px;
+                                border-radius: 4px;
+                                accessible-role: list-item;
+                                accessible-label: guest.optional ? "Guest: \{guest.email}, optional" : "Guest: \{guest.email}";
+
+                                Text {
+                                    x: 10px;
+                                    width: parent.width - 150px;
+                                    height: parent.height;
+                                    text: guest.name != "" && guest.name != guest.email ? "\{guest.name} · \{guest.email}" : guest.email;
+                                    font-size: 13px;
+                                    color: Theme.text;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+
+                                Rectangle {
+                                    x: parent.width - 136px;
+                                    width: 100px;
+                                    height: parent.height;
+                                    border-radius: 4px;
+                                    background: optional-touch.has-hover ? Theme.hover : transparent;
+                                    accessible-role: checkbox;
+                                    accessible-label: "Optional: \{guest.email}";
+                                    accessible-checked: guest.optional;
+                                    accessible-action-default => {
+                                        root.editor-guest-optional(i);
+                                    }
+
+                                    optional-touch := TouchArea {
+                                        clicked => {
+                                            root.editor-guest-optional(i);
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        x: 6px;
+                                        y: (parent.height - self.height) / 2;
+                                        width: 14px;
+                                        height: 14px;
+                                        border-radius: 3px;
+                                        border-width: 2px;
+                                        border-color: guest.optional ? Theme.accent : Theme.text-dim;
+                                        background: guest.optional ? Theme.accent : transparent;
+                                    }
+
+                                    Text {
+                                        x: 28px;
+                                        height: parent.height;
+                                        text: @tr("Optional");
+                                        font-size: 12px;
+                                        color: Theme.text-dim;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                Rectangle {
+                                    x: parent.width - 30px;
+                                    width: 28px;
+                                    height: parent.height;
+                                    border-radius: 14px;
+                                    background: remove-touch.has-hover ? Theme.hover : transparent;
+                                    accessible-role: button;
+                                    accessible-label: "Remove \{guest.email}";
+                                    accessible-action-default => {
+                                        root.editor-guest-remove(i);
+                                    }
+
+                                    remove-touch := TouchArea {
+                                        clicked => {
+                                            root.editor-guest-remove(i);
+                                        }
+                                    }
+
+                                    Text {
+                                        text: "×";
+                                        font-size: 16px;
+                                        color: Theme.text-dim;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
                             }
                         }
                     }
@@ -2936,6 +3182,9 @@ export component AppWindow inherits Window {
                             current: root.draft-calendar;
                             chosen(i) => {
                                 root.draft-calendar = i;
+                                // Suggested guests are another account's now: they
+                                // go, and are asked for again from this one.
+                                root.editor-guest-typed(root.editor.guests, i);
                             }
                         }
                         if !root.editor-new: Text {
@@ -2982,18 +3231,99 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    reminder-row := EditorRow {
-                        label: @tr("Reminder");
-                        Choice {
-                            // Scrolled so that the open list is in sight, and back
-                            // within the form when it closes.
-                            toggled => {
-                                editor-scroll.content-y = Math.max(Math.min(0px, editor-scroll.height - editor-form.preferred-height), Math.min(editor-scroll.content-y, editor-scroll.height - reminder-row.y - reminder-row.height - 8px));
+                    notice-row := EditorRow {
+                        label: @tr("Notifications");
+                        VerticalLayout {
+                            spacing: 2px;
+
+                            if root.editor-usual-notices: Text {
+                                height: 36px;
+                                text: @tr("The calendar's usual notifications");
+                                font-size: 14px;
+                                color: Theme.text;
+                                vertical-alignment: center;
                             }
-                            options: root.editor-custom-reminder ? [@tr("The calendar's usual reminders"), @tr("None"), @tr("When it starts"), @tr("5 minutes before"), @tr("10 minutes before"), @tr("15 minutes before"), @tr("30 minutes before"), @tr("1 hour before"), @tr("1 day before"), @tr("As it reminds now")] : [@tr("The calendar's usual reminders"), @tr("None"), @tr("When it starts"), @tr("5 minutes before"), @tr("10 minutes before"), @tr("15 minutes before"), @tr("30 minutes before"), @tr("1 hour before"), @tr("1 day before")];
-                            current: root.editor.reminder;
-                            chosen(i) => {
-                                root.editor.reminder = i;
+                            if !root.editor-usual-notices && root.editor-notices.length == 0: Text {
+                                height: 36px;
+                                text: @tr("None");
+                                font-size: 14px;
+                                color: Theme.text-dim;
+                                vertical-alignment: center;
+                            }
+                            for notice[i] in root.editor-notices: HorizontalLayout {
+                                spacing: 6px;
+
+                                Choice {
+                                    // Scrolled so that the open list is in sight, and
+                                    // back within the form when it closes.
+                                    toggled => {
+                                        editor-scroll.content-y = Math.max(Math.min(0px, editor-scroll.height - editor-form.preferred-height), Math.min(editor-scroll.content-y, editor-scroll.height - notice-row.y - notice-row.height - 8px));
+                                    }
+                                    options: notice.custom != "" ? [@tr("When it starts"), @tr("5 minutes before"), @tr("10 minutes before"), @tr("15 minutes before"), @tr("30 minutes before"), @tr("1 hour before"), @tr("2 hours before"), @tr("1 day before"), @tr("2 days before"), @tr("1 week before"), notice.custom] : [@tr("When it starts"), @tr("5 minutes before"), @tr("10 minutes before"), @tr("15 minutes before"), @tr("30 minutes before"), @tr("1 hour before"), @tr("2 hours before"), @tr("1 day before"), @tr("2 days before"), @tr("1 week before")];
+                                    current: notice.choice;
+                                    chosen(c) => {
+                                        root.editor-notice-set(i, c);
+                                    }
+                                }
+
+                                if notice.email: Text {
+                                    horizontal-stretch: 0;
+                                    height: 36px;
+                                    text: @tr("by e-mail");
+                                    font-size: 12px;
+                                    color: Theme.text-dim;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle {
+                                    horizontal-stretch: 0;
+                                    width: 28px;
+                                    height: 36px;
+                                    border-radius: 14px;
+                                    background: notice-remove.has-hover ? Theme.hover : transparent;
+                                    accessible-role: button;
+                                    accessible-label: "Remove notification \{i + 1}";
+                                    accessible-action-default => {
+                                        root.editor-notice-remove(i);
+                                    }
+
+                                    notice-remove := TouchArea {
+                                        clicked => {
+                                            root.editor-notice-remove(i);
+                                        }
+                                    }
+
+                                    Text {
+                                        text: "×";
+                                        font-size: 16px;
+                                        color: Theme.text-dim;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                alignment: start;
+                                spacing: 4px;
+
+                                if root.editor-notices.length < 5: TextButton {
+                                    text: @tr("Add notification");
+                                    height: 30px;
+                                    text-color: Theme.accent;
+                                    clicked => {
+                                        root.editor-notice-add(root.draft-calendar);
+                                        // The new line pushes this button down: keep it
+                                        // in sight.
+                                        editor-scroll.content-y = Math.max(Math.min(0px, editor-scroll.height - editor-form.preferred-height), Math.min(editor-scroll.content-y, editor-scroll.height - notice-row.y - notice-row.height - 8px));
+                                    }
+                                }
+                                if !root.editor-usual-notices: TextButton {
+                                    text: @tr("Use the calendar's usual");
+                                    height: 30px;
+                                    clicked => {
+                                        root.editor-notice-usual();
+                                    }
+                                }
                             }
                         }
                     }
@@ -3245,7 +3575,7 @@ export component AppWindow inherits Window {
             }
         }
         if root.settings-visible: Rectangle {
-            width: Math.min(380px, root.width - 24px);
+            width: Math.min(440px, root.width - 24px);
             height: Math.min(settings-box.preferred-height, root.height - 24px);
             background: Theme.card;
             border-radius: 12px;
@@ -3271,7 +3601,7 @@ export component AppWindow inherits Window {
                 spacing: 4px;
 
                 Text {
-                    text: @tr("Settings");
+                    text: root.settings-permissions ? @tr("Permissions") : @tr("Settings");
                     font-size: 18px;
                     color: Theme.text;
                 }
@@ -3280,130 +3610,259 @@ export component AppWindow inherits Window {
                     height: 12px;
                 }
 
-                Text {
-                    text: @tr("Theme");
-                    font-size: 12px;
-                    font-weight: 500;
-                    color: Theme.text-dim;
-                }
+                // The settings themselves.
+                if !root.settings-permissions: VerticalLayout {
+                    spacing: 4px;
 
-                for label[i] in [@tr("Same as the desktop"), @tr("Light"), @tr("Dark")]: RadioRow {
-                    text: label;
-                    selected: root.theme-mode == i;
-                    clicked => {
-                        root.theme-mode = i;
-                        root.theme-chosen(i);
+                    Text {
+                        text: @tr("Theme");
+                        font-size: 12px;
+                        font-weight: 500;
+                        color: Theme.text-dim;
                     }
-                }
 
-                Rectangle {
-                    height: 8px;
-                }
-
-                Text {
-                    text: @tr("Week starts on");
-                    font-size: 12px;
-                    font-weight: 500;
-                    color: Theme.text-dim;
-                }
-
-                Choice {
-                    options: [@tr("Monday"), @tr("Sunday"), @tr("Saturday")];
-                    current: root.week-start-choice;
-                    chosen(i) => {
-                        root.week-start-choice = i;
-                        root.week-start-chosen(i);
-                    }
-                }
-
-                Rectangle {
-                    height: 8px;
-                }
-
-                Text {
-                    text: @tr("Days in the custom view (X)");
-                    font-size: 12px;
-                    font-weight: 500;
-                    color: Theme.text-dim;
-                }
-
-                Choice {
-                    options: [@tr("2 days"), @tr("3 days"), @tr("4 days"), @tr("5 days"), @tr("6 days"), @tr("7 days")];
-                    current: root.custom-days-choice;
-                    chosen(i) => {
-                        root.custom-days-choice = i;
-                        root.custom-days-chosen(i);
-                    }
-                }
-
-                Rectangle {
-                    height: 8px;
-                }
-
-                Text {
-                    text: @tr("Time format");
-                    font-size: 12px;
-                    font-weight: 500;
-                    color: Theme.text-dim;
-                }
-
-                Choice {
-                    options: [@tr("13:00"), @tr("1:00pm")];
-                    current: root.clock-choice;
-                    chosen(i) => {
-                        root.clock-choice = i;
-                        root.clock-chosen(i);
-                    }
-                }
-
-                Rectangle {
-                    height: 8px;
-                }
-
-                Text {
-                    text: @tr("Zoom of the day columns");
-                    font-size: 12px;
-                    font-weight: 500;
-                    color: Theme.text-dim;
-                }
-
-                HorizontalLayout {
-                    alignment: start;
-                    spacing: 8px;
-                    TextButton {
-                        text: "−";
-                        width: 36px;
-                        outlined: true;
-                        accessible-label: @tr("Zoom out");
+                    for label[i] in [@tr("Same as the desktop"), @tr("Light"), @tr("Dark")]: RadioRow {
+                        text: label;
+                        selected: root.theme-mode == i;
                         clicked => {
-                            root.zoom-by(-1);
+                            root.theme-mode = i;
+                            root.theme-chosen(i);
+                        }
+                    }
+
+                    Rectangle {
+                        height: 8px;
+                    }
+
+                    Text {
+                        text: @tr("Week starts on");
+                        font-size: 12px;
+                        font-weight: 500;
+                        color: Theme.text-dim;
+                    }
+
+                    Choice {
+                        options: [@tr("Monday"), @tr("Sunday"), @tr("Saturday")];
+                        current: root.week-start-choice;
+                        chosen(i) => {
+                            root.week-start-choice = i;
+                            root.week-start-chosen(i);
+                        }
+                    }
+
+                    Rectangle {
+                        height: 8px;
+                    }
+
+                    Text {
+                        text: @tr("Days in the custom view (X)");
+                        font-size: 12px;
+                        font-weight: 500;
+                        color: Theme.text-dim;
+                    }
+
+                    Choice {
+                        options: [@tr("2 days"), @tr("3 days"), @tr("4 days"), @tr("5 days"), @tr("6 days"), @tr("7 days")];
+                        current: root.custom-days-choice;
+                        chosen(i) => {
+                            root.custom-days-choice = i;
+                            root.custom-days-chosen(i);
+                        }
+                    }
+
+                    Rectangle {
+                        height: 8px;
+                    }
+
+                    Text {
+                        text: @tr("Time format");
+                        font-size: 12px;
+                        font-weight: 500;
+                        color: Theme.text-dim;
+                    }
+
+                    Choice {
+                        options: [@tr("13:00"), @tr("1:00pm")];
+                        current: root.clock-choice;
+                        chosen(i) => {
+                            root.clock-choice = i;
+                            root.clock-chosen(i);
+                        }
+                    }
+
+                    Rectangle {
+                        height: 8px;
+                    }
+
+                    Text {
+                        text: @tr("Zoom of the day columns");
+                        font-size: 12px;
+                        font-weight: 500;
+                        color: Theme.text-dim;
+                    }
+
+                    HorizontalLayout {
+                        alignment: start;
+                        spacing: 8px;
+                        TextButton {
+                            text: "−";
+                            width: 36px;
+                            outlined: true;
+                            accessible-label: @tr("Zoom out");
+                            clicked => {
+                                root.zoom-by(-1);
+                            }
+                        }
+
+                        Text {
+                            width: 64px;
+                            text: "\{Math.round(root.hour-h / 48px * 100)} %";
+                            font-size: 14px;
+                            color: Theme.text;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        TextButton {
+                            text: "+";
+                            width: 36px;
+                            outlined: true;
+                            accessible-label: @tr("Zoom in");
+                            clicked => {
+                                root.zoom-by(1);
+                            }
+                        }
+
+                        TextButton {
+                            text: @tr("Reset");
+                            clicked => {
+                                root.set-hour-height(48px);
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 8px;
+                    }
+
+                    Text {
+                        text: @tr("Accounts");
+                        font-size: 12px;
+                        font-weight: 500;
+                        color: Theme.text-dim;
+                    }
+
+                    HorizontalLayout {
+                        alignment: start;
+                        TextButton {
+                            text: @tr("Permissions…");
+                            outlined: true;
+                            clicked => {
+                                root.settings-permissions = true;
+                            }
+                        }
+                    }
+                }
+
+                // What each account lets the app do: a page of its own, being long.
+                if root.settings-permissions: VerticalLayout {
+                    spacing: 4px;
+
+                    HorizontalLayout {
+                        alignment: start;
+                        padding-bottom: 4px;
+                        TextButton {
+                            text: @tr("‹ Settings");
+                            height: 28px;
+                            accessible-label: @tr("Back to the settings");
+                            clicked => {
+                                root.settings-permissions = false;
+                            }
                         }
                     }
 
                     Text {
-                        width: 64px;
-                        text: "\{Math.round(root.hour-h / 48px * 100)} %";
-                        font-size: 14px;
+                        text: @tr("What each account lets this app do at Google. \"Allow\" opens Google's page in your browser; an account keeps what it allowed before.");
+                        font-size: 12px;
+                        color: Theme.text-dim;
+                        wrap: word-wrap;
+                        // A layout reckons a wrapped text as one line when it works out how tall
+                        // the card must be; said outright, the height is the wrapped one.
+                        height: self.preferred-height;
+                    }
+
+                    if root.account-permissions.length == 0: Text {
+                        text: @tr("No account is signed in.");
+                        font-size: 13px;
                         color: Theme.text;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
                     }
 
-                    TextButton {
-                        text: "+";
-                        width: 36px;
-                        outlined: true;
-                        accessible-label: @tr("Zoom in");
-                        clicked => {
-                            root.zoom-by(1);
+                    for name[i] in root.permission-names: VerticalLayout {
+                        padding-top: 10px;
+                        spacing: 2px;
+
+                        Text {
+                            text: name;
+                            font-size: 14px;
+                            font-weight: 500;
+                            color: Theme.text;
+                        }
+
+                        Text {
+                            text: root.permission-purposes[i];
+                            font-size: 12px;
+                            color: Theme.text-dim;
+                            wrap: word-wrap;
+                            // A layout reckons a wrapped text as one line when it works out how tall
+                            // the card must be; said outright, the height is the wrapped one.
+                            height: self.preferred-height;
+                        }
+
+                        for account in root.account-permissions: HorizontalLayout {
+                            height: 32px;
+                            spacing: 8px;
+
+                            Text {
+                                horizontal-stretch: 1;
+                                text: account.email;
+                                font-size: 13px;
+                                color: Theme.text;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+
+                            Text {
+                                horizontal-stretch: 0;
+                                text: account.states[i] == 1 ? @tr("Allowed") : account.states[i] == 2 ? @tr("Not allowed") : @tr("Not known yet");
+                                font-size: 13px;
+                                color: account.states[i] == 1 ? Theme.text : Theme.text-dim;
+                                vertical-alignment: center;
+                                accessible-role: text;
+                                accessible-label: "\{name}, \{account.email}: \{self.text}";
+                            }
+
+                            if account.states[i] == 2: TextButton {
+                                horizontal-stretch: 0;
+                                text: @tr("Allow");
+                                height: 28px;
+                                y: 2px;
+                                outlined: true;
+                                accessible-label: "Allow \{name} for \{account.email}";
+                                clicked => {
+                                    root.grant-permission(account.email, i);
+                                }
+                            }
                         }
                     }
 
-                    TextButton {
-                        text: @tr("Reset");
-                        clicked => {
-                            root.set-hour-height(48px);
-                        }
+                    Text {
+                        text: @tr("\"Not known yet\" is settled by the next sync. To take a permission back, remove this app's access in your Google Account (under \"Third-party apps & services\"), then add the account here again.");
+                        font-size: 12px;
+                        color: Theme.text-dim;
+                        wrap: word-wrap;
+                        // A layout reckons a wrapped text as one line when it works out how tall
+                        // the card must be; said outright, the height is the wrapped one.
+                        height: self.preferred-height;
                     }
                 }
 

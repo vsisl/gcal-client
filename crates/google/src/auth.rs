@@ -38,6 +38,9 @@ pub struct TokenSet {
     pub expires_at: DateTime<Utc>,
     /// Present after a sign-in; a refresh usually returns none and the old one stays valid.
     pub refresh_token: Option<String>,
+    /// What the account lets the app do, as Google names it, if Google said. After a
+    /// sign-in this can be less than was asked for: the user may untick single lines.
+    pub scopes: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -45,6 +48,7 @@ struct TokenResponse {
     access_token: String,
     expires_in: i64,
     refresh_token: Option<String>,
+    scope: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -66,10 +70,15 @@ pub struct PendingLogin {
 }
 
 /// Starts a sign-in: opens the local listener and builds the address for the browser.
+///
+/// With `account`, the sign-in is for an account that is signed in already and is to
+/// give the app more: Google then offers that account and keeps what it gave before.
+/// The user can still pick another account there, so the caller must check who came back.
 pub async fn begin_login(
     config: &ClientConfig,
     endpoints: &Endpoints,
     scopes: &[&str],
+    account: Option<&str>,
 ) -> Result<PendingLogin, AuthError> {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -93,6 +102,12 @@ pub async fn begin_login(
         // Always show the account chooser: adding a second account is the point of the app.
         .append_pair("prompt", "consent select_account")
         .append_pair("access_type", "offline");
+    if let Some(email) = account {
+        auth_url
+            .query_pairs_mut()
+            .append_pair("login_hint", email)
+            .append_pair("include_granted_scopes", "true");
+    }
 
     Ok(PendingLogin {
         listener,
@@ -245,6 +260,9 @@ async fn request_tokens(
         // token that lapses in flight.
         expires_at: Utc::now() + Duration::seconds(tokens.expires_in - 60),
         refresh_token: tokens.refresh_token,
+        scopes: tokens
+            .scope
+            .map(|scopes| scopes.split_whitespace().map(str::to_owned).collect()),
     })
 }
 
@@ -266,6 +284,7 @@ mod tests {
             auth: format!("{}/auth", server.uri()),
             token: format!("{}/token", server.uri()),
             calendar_api: server.uri(),
+            people_api: server.uri(),
         }
     }
 
@@ -289,18 +308,20 @@ mod tests {
             .and(body_string_contains("code_verifier="))
             .and(body_string_contains("client_secret=test-secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "access-1", "expires_in": 3600, "refresh_token": "refresh-1"
+                "access_token": "access-1", "expires_in": 3600, "refresh_token": "refresh-1",
+                "scope": "scope-a scope-b"
             })))
             .expect(1)
             .mount(&server)
             .await;
 
         let endpoints = endpoints(&server);
-        let pending = begin_login(&config(), &endpoints, &["scope-a", "scope-b"])
+        let pending = begin_login(&config(), &endpoints, &["scope-a", "scope-b"], None)
             .await
             .unwrap();
         assert_eq!(query(&pending.auth_url, "scope"), "scope-a scope-b");
         assert_eq!(query(&pending.auth_url, "code_challenge_method"), "S256");
+        assert!(!pending.auth_url.contains("login_hint"));
         let redirect = query(&pending.auth_url, "redirect_uri");
         let state = query(&pending.auth_url, "state");
 
@@ -318,6 +339,10 @@ mod tests {
         let tokens = pending.finish(&http, &config(), &endpoints).await.unwrap();
         assert_eq!(tokens.access_token, "access-1");
         assert_eq!(tokens.refresh_token.as_deref(), Some("refresh-1"));
+        assert_eq!(
+            tokens.scopes,
+            Some(vec!["scope-a".to_owned(), "scope-b".to_owned()])
+        );
         assert!(tokens.expires_at > Utc::now() + Duration::minutes(50));
     }
 
@@ -328,8 +353,11 @@ mod tests {
             auth: "http://unused/auth".into(),
             token: "http://unused/token".into(),
             calendar_api: "http://unused".into(),
+            people_api: "http://unused".into(),
         };
-        let pending = begin_login(&config, &endpoints, &["s"]).await.unwrap();
+        let pending = begin_login(&config, &endpoints, &["s"], None)
+            .await
+            .unwrap();
         let port = pending.listener.local_addr().unwrap().port();
         let state = pending.state.clone();
 
@@ -355,7 +383,12 @@ mod tests {
     async fn redirect_with_wrong_state_is_ignored_and_denial_is_reported() {
         let server = MockServer::start().await;
         let endpoints = endpoints(&server);
-        let pending = begin_login(&config(), &endpoints, &["s"]).await.unwrap();
+        // A sign-in for more permissions names the account and keeps what it gave.
+        let pending = begin_login(&config(), &endpoints, &["s"], Some("me@example.com"))
+            .await
+            .unwrap();
+        assert_eq!(query(&pending.auth_url, "login_hint"), "me@example.com");
+        assert_eq!(query(&pending.auth_url, "include_granted_scopes"), "true");
         let redirect = query(&pending.auth_url, "redirect_uri");
         let state = query(&pending.auth_url, "state");
 

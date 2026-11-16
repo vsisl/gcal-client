@@ -12,10 +12,10 @@ Not affiliated with or endorsed by Google. Google Calendar is a trademark of Goo
 
 | Works | Not yet |
 |---|---|
-| Several accounts merged in one view, calendars ticked on and off | Guests' address book, "find a time", rooms |
+| Several accounts merged in one view, calendars ticked on and off | "Find a time", rooms, subscribing to further calendars |
 | Day, week, a few days, month, year and schedule views; go to date | Search |
 | Create, edit, move, resize and delete events, with undo (two exceptions, see below) | Date and time pickers (dates and times are typed), custom repeat rules |
-| Repeating events: "this / this and following / all"; guests, answering invitations, Google Meet links | Reminders on the desktop, tray icon, running in the background |
+| Repeating events: "this / this and following / all"; guests (also optional ones, suggested from your contacts), answering invitations, Google Meet links, several notifications per event | Notifications shown on the desktop, tray icon, running in the background |
 | Settings: theme, first day of the week, 12/24-hour clock, zoom | Tasks, birthdays, out of office and other special entries |
 | Works offline for viewing; syncs every five minutes | Packaging (Flatpak), Windows and macOS |
 
@@ -44,7 +44,8 @@ not been through Google's review yet. Until it has, everyone who runs it creates
 their own, once. It is free.
 
 1. Open the [Google Cloud Console](https://console.cloud.google.com/) and create a project.
-2. Under **APIs & Services → Library**, enable the **Google Calendar API**.
+2. Under **APIs & Services → Library**, enable the **Google Calendar API** and, for
+   suggestions of guests, the **People API**.
 3. Under **APIs & Services → OAuth consent screen** (also called "Google Auth Platform"),
    set the app up as **External**, and add every Google account you want to use as a
    **test user**.
@@ -62,7 +63,11 @@ Google ends each sign-in after seven days; the app then asks you to add the acco
 ## Using it
 
 Start the app and choose **Add account**: your browser opens Google's sign-in page, and the
-account's calendars appear once you have agreed. Repeat for further accounts. The first sync
+account's calendars appear once you have agreed. Repeat for further accounts. Google's
+page also asks whether the app may read your contacts: that is for suggesting guests
+while you type a name, and can be left unticked. **Settings → Permissions…** shows what
+each account allows and what each permission is for, and lets you allow what is missing
+(also the optional one for a company's directory). The first sync
 of a large account can take a few minutes; a bar under the top bar and a count show that it
 is alive.
 

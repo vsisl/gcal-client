@@ -168,6 +168,7 @@ mod tests {
                 auth: format!("{}/auth", server.uri()),
                 token: format!("{}/token", server.uri()),
                 calendar_api: server.uri(),
+                people_api: server.uri(),
             },
             "refresh".into(),
         )

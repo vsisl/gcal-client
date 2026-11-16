@@ -30,6 +30,11 @@ def type_into(hint, text):
     for ch in text: key(ch)
 
 
+def listed():
+    """The lines of the editor's list of guests."""
+    return [label(h) for h in find("ListItem") if label(h).startswith("Guest: ")]
+
+
 def guests(name):
     """Each guest's answer by address; Google lists them in an order of its own."""
     return {g["email"]: g.get("responseStatus") for g in named(name)[0].get("attendees", [])}
@@ -45,7 +50,7 @@ type_into(HINT, "nobody@example.com")
 click("Button", "Save"); time.sleep(0.5)
 wait("a new event with guests asks about e-mails", lambda: bool(by_label("Checkbox", ASK)))
 key(ESC); time.sleep(0.5)
-wait("cancelled: the editor is back with what was typed", lambda: value("TextInput", "Add title") == "AT guests" and value("TextInput", HINT) == "nobody@example.com")
+wait("cancelled: the editor is back with what was typed, the guest in the list", lambda: value("TextInput", "Add title") == "AT guests" and listed() == ["Guest: nobody@example.com"])
 click("Button", "Save"); time.sleep(0.5)
 click("Checkbox", ASK)
 key(ENTER)
@@ -56,11 +61,16 @@ time.sleep(2)
 call("click_element", elementHandle=items("AT guests")[0]); time.sleep(0.5)
 shot("guests-details")
 key("e"); time.sleep(0.5)
-type_into(HINT, ", second@example.com")
+wait("the editor lists the organiser and the guest", lambda: len(listed()) == 2 and "Guest: nobody@example.com" in listed())
+type_into(HINT, "second@example.com")
+key(ENTER); time.sleep(0.4)
+wait("Enter puts the address into the list", lambda: listed()[-1] == "Guest: second@example.com" and value("TextInput", HINT) == "")
+click("Checkbox", "Optional: second@example.com")
+wait("ticked as optional", lambda: listed()[-1] == "Guest: second@example.com, optional")
 click("Button", "Save"); time.sleep(0.5)
 click("Checkbox", ASK)
 key(ENTER)
-wait("a third guest at Google", lambda: len(guests("AT guests")) == 3 and "second@example.com" in guests("AT guests"))
+wait("a third guest at Google, optional", lambda: len(guests("AT guests")) == 3 and [g.get("optional") for g in named("AT guests")[0]["attendees"] if g["email"] == "second@example.com"] == [True])
 time.sleep(3); key("z")
 wait("undo: two guests again", lambda: len(guests("AT guests")) == 2)
 time.sleep(11)

@@ -39,11 +39,17 @@ key("c")
 for ch in "AT edit": key(ch)
 click("Button", "More options")
 type_into("Add location", "Room 1")
-choose("The calendar's usual reminders", "10 minutes before")
+# The first one added keeps the calendar's usual notifications (whatever they are in
+# the test account) and adds one; then one of them is set to a week.
+click("Button", "Add notification")
+click("Button", "Add notification")
+shown = [label(h) for h in find("Combobox") if label(h).endswith("before") or label(h) == "When it starts"]
+print("   notifications in the editor:", shown)
+choose(shown[-1], "1 week before")
 click("ListItem", "Colour 5")
 shot("ed-filled")
 click("Button", "Save")
-wait("new: created with location, colour and reminder", lambda: ev("AT edit")["location"] == "Room 1" and ev("AT edit")["colorId"] == "5" and ev("AT edit")["reminders"]["overrides"][0]["minutes"] == 10)
+wait("new: created with location, colour and its notifications", lambda: ev("AT edit")["location"] == "Room 1" and ev("AT edit")["colorId"] == "5" and len(shown) >= 2 and len(ev("AT edit")["reminders"]["overrides"]) == len(shown) and 10080 in [r["minutes"] for r in ev("AT edit")["reminders"]["overrides"]])
 start = ev("AT edit")["start"]["dateTime"]
 time.sleep(2)
 

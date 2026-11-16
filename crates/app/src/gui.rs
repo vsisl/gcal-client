@@ -17,6 +17,7 @@ use gcal_core::schedule::{DayPart, schedule};
 use gcal_core::text::plain_text;
 use gcal_core::week::{WeekLayout, layout_days, local_day_start};
 use gcal_core::{CalendarListEntry, Event, EventTime, ResponseStatus};
+use gcal_google::Permission;
 use gcal_store::{Account, AccountId, Store, StoredCalendar};
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
@@ -160,6 +161,47 @@ fn shown_dates(day: NaiveDate) -> NaiveDate {
     let first = NaiveDate::from_ymd_opt(1900, 1, 1).unwrap_or_default();
     let last = NaiveDate::from_ymd_opt(2200, 12, 31).unwrap_or_default();
     day.clamp(first, last)
+}
+
+/// The addresses typed in the guests field before the word a suggestion stands for
+/// ("ann@example.com, bo" with a suggestion for "bo"). Earlier words of a name being
+/// typed ("bob sm") are no addresses and are dropped with it; but something that was
+/// meant as an address and is none fails with a sentence, as it does without a
+/// suggestion.
+fn typed_before_suggestion(text: &str) -> Result<Vec<&str>, String> {
+    let word = text
+        .rsplit([',', ';', ' ', '\n', '\t'])
+        .next()
+        .unwrap_or("");
+    let before = &text[..text.len() - word.len()];
+    if before.contains('@') {
+        editor::addresses(before)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+/// For the settings: what each account lets the app do. One number for each of
+/// `Permission::ALL`, in that order: 0 not known yet (the account was signed in before
+/// the app kept this; the next sync tells), 1 allowed, 2 not allowed.
+fn account_permissions(accounts: &[Account]) -> Vec<AccountPermissions> {
+    accounts
+        .iter()
+        .map(|account| {
+            let states: Vec<i32> = Permission::ALL
+                .iter()
+                .map(|permission| match &account.scopes {
+                    None => 0,
+                    Some(scopes) if permission.is_in(scopes) => 1,
+                    Some(_) => 2,
+                })
+                .collect();
+            AccountPermissions {
+                email: account.email.as_str().into(),
+                states: ModelRc::from(Rc::new(VecModel::from(states))),
+            }
+        })
+        .collect()
 }
 
 /// How dates and times are shown, as chosen in the settings.
@@ -474,6 +516,78 @@ fn plan_rsvp(
             changes: before,
         },
     ))
+}
+
+/// Whether a link from an event may be handed to the desktop to open. Events come
+/// from anyone who can invite the account, and "open this" is also how the desktop
+/// starts programs and opens files: only web addresses pass.
+fn is_web_address(link: &str) -> bool {
+    (link.starts_with("https://") || link.starts_with("http://"))
+        && !link.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
+/// The files attached to an event that can be opened: those with a web address.
+fn attachment_links(event: &Event) -> Vec<(String, String)> {
+    event
+        .attachments
+        .iter()
+        .filter_map(|file| {
+            let link = file
+                .file_url
+                .as_deref()
+                .filter(|link| is_web_address(link))?;
+            let title = file.title.as_deref().map(str::trim).unwrap_or("");
+            let title = if title.is_empty() { link } else { title };
+            // A name is one line of text, whatever was put into it.
+            let title: String = title.chars().filter(|c| !c.is_control()).collect();
+            Some((title, link.to_owned()))
+        })
+        .collect()
+}
+
+/// The times before an event the editor offers for a notification, in minutes, in the
+/// order of its list.
+const NOTICE_MINUTES: [i64; 10] = [0, 5, 10, 15, 30, 60, 120, 1440, 2880, 10080];
+
+/// A time before an event in words, for one that is not among the offered ones.
+fn before_text(minutes: i64) -> String {
+    let (count, unit) = match minutes {
+        m if m > 0 && m % 10080 == 0 => (m / 10080, "week"),
+        m if m > 0 && m % 1440 == 0 => (m / 1440, "day"),
+        m if m > 0 && m % 60 == 0 => (m / 60, "hour"),
+        m => (m, "minute"),
+    };
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} {unit}{plural} before")
+}
+
+/// A notification as a line of the editor's list.
+fn notice_row(notice: &editor::Notification) -> EditorNotice {
+    match NOTICE_MINUTES.iter().position(|m| *m == notice.minutes) {
+        Some(choice) => EditorNotice {
+            choice: choice as i32,
+            custom: SharedString::new(),
+            custom_minutes: 0,
+            email: notice.email,
+        },
+        None => EditorNotice {
+            choice: NOTICE_MINUTES.len() as i32,
+            custom: before_text(notice.minutes).into(),
+            custom_minutes: notice.minutes.clamp(0, i32::MAX as i64) as i32,
+            email: notice.email,
+        },
+    }
+}
+
+/// The notification a line of the editor's list stands for.
+fn notice_of(row: &EditorNotice) -> editor::Notification {
+    editor::Notification {
+        minutes: NOTICE_MINUTES
+            .get(row.choice.max(0) as usize)
+            .copied()
+            .unwrap_or(row.custom_minutes as i64),
+        email: row.email,
+    }
 }
 
 fn web_link(event: &Event, account_email: &str) -> String {
@@ -918,7 +1032,6 @@ fn to_window(form: &Form) -> EditorForm {
         location: form.location.as_str().into(),
         description: form.description.as_str().into(),
         color: form.color as i32,
-        reminder: form.reminder as i32,
         visibility: form.visibility as i32,
         busy: form.busy,
         guests: form.guests.as_str().into(),
@@ -941,10 +1054,12 @@ fn from_window(form: &EditorForm) -> Form {
         location: form.location.to_string(),
         description: form.description.to_string(),
         color: form.color.max(0) as usize,
-        reminder: form.reminder.max(0) as usize,
+        usual_notifications: true,
+        notifications: Vec::new(),
         visibility: form.visibility.max(0) as usize,
         busy: form.busy,
         guests: form.guests.to_string(),
+        optional: Vec::new(),
         meet: form.meet,
         may_modify: form.may_modify,
         may_invite: form.may_invite,
@@ -1192,6 +1307,10 @@ struct View {
     generation: Cell<i32>,
     /// The event the editor is open for.
     editing: RefCell<Option<Editing>>,
+    /// The guests of the event in the editor, as the window lists them.
+    editor_guests: Rc<VecModel<EditorGuest>>,
+    /// Its own notifications, likewise.
+    editor_notices: Rc<VecModel<EditorNotice>>,
     /// Hides the message about the last change after a while.
     toast_timer: Timer,
     commands: UnboundedSender<Command>,
@@ -1277,6 +1396,10 @@ impl View {
         })();
         match loaded {
             Ok(loaded) => {
+                if let Some(ui) = self.ui.upgrade() {
+                    let rows = account_permissions(&loaded.accounts);
+                    ui.set_account_permissions(ModelRc::from(Rc::new(VecModel::from(rows))));
+                }
                 self.loaded.replace(loaded);
                 self.refresh();
             }
@@ -1632,6 +1755,15 @@ impl View {
                             .collect::<Vec<_>>(),
                     ))),
                     meet: event.hangout_link.as_deref().unwrap_or("").into(),
+                    attachments: ModelRc::from(Rc::new(VecModel::from(
+                        attachment_links(event)
+                            .into_iter()
+                            .map(|(title, link)| Attachment {
+                                title: title.into(),
+                                link: link.into(),
+                            })
+                            .collect::<Vec<_>>(),
+                    ))),
                     // An answer is given in the account's own calendar.
                     rsvp: match event.own_invitation() {
                         Some(own) if can_answer(event, &calendar.entry) => {
@@ -2114,9 +2246,48 @@ impl View {
             .collect();
         ui.set_editor_colors(ModelRc::from(Rc::new(VecModel::from(colors))));
         ui.set_editor_custom_repeat(form.repeat == editor::REPEAT_CUSTOM);
-        ui.set_editor_custom_reminder(form.reminder == editor::REMINDER_CUSTOM);
+        ui.set_editor_usual_notices(form.usual_notifications);
+        self.editor_notices.set_vec(
+            form.notifications
+                .iter()
+                .map(notice_row)
+                .collect::<Vec<_>>(),
+        );
         ui.set_editor_error(SharedString::new());
-        ui.set_editor(to_window(&form));
+        // The guests go into the list, each on its line, with the name the event has
+        // for them; the field is for adding. A text that cannot be read as addresses
+        // (it never got past "Save") stays in the field as it is.
+        let mut window = to_window(&form);
+        let rows = match editor::addresses(&form.guests) {
+            Ok(addresses) => {
+                window.guests = SharedString::new();
+                addresses
+                    .into_iter()
+                    .map(|address| EditorGuest {
+                        email: address.into(),
+                        name: kept
+                            .attendees
+                            .iter()
+                            .find(|guest| {
+                                guest["email"]
+                                    .as_str()
+                                    .is_some_and(|known| known.eq_ignore_ascii_case(address))
+                            })
+                            .and_then(|guest| guest["displayName"].as_str())
+                            .unwrap_or("")
+                            .into(),
+                        optional: form
+                            .optional
+                            .iter()
+                            .any(|known| known.eq_ignore_ascii_case(address)),
+                    })
+                    .collect()
+            }
+            Err(_) => Vec::new(),
+        };
+        self.editor_guests.set_vec(rows);
+        self.clear_suggestions(ui);
+        ui.set_editor(window);
         self.editing.replace(Some(Editing {
             target,
             opened: form,
@@ -2126,6 +2297,204 @@ impl View {
         }));
         ui.set_detail_visible(false);
         ui.set_editor_visible(true);
+    }
+
+    /// The editor's form as the window has it: its fields, and the guests of the list
+    /// followed by whatever is still in the field for adding them.
+    fn form_from(&self, window: &EditorForm) -> Form {
+        let mut form = from_window(window);
+        let rows: Vec<EditorGuest> = self.editor_guests.iter().collect();
+        form.optional = rows
+            .iter()
+            .filter(|guest| guest.optional)
+            .map(|guest| guest.email.to_string())
+            .collect();
+        let mut guests: Vec<String> = rows.iter().map(|guest| guest.email.to_string()).collect();
+        if !form.guests.trim().is_empty() {
+            guests.push(form.guests.clone());
+        }
+        form.guests = guests.join(", ");
+        form.usual_notifications = self
+            .ui
+            .upgrade()
+            .is_none_or(|ui| ui.get_editor_usual_notices());
+        form.notifications = self
+            .editor_notices
+            .iter()
+            .map(|row| notice_of(&row))
+            .collect();
+        form
+    }
+
+    /// "Add notification". If the event had its calendar's usual ones, it gets its
+    /// own from here on: those usual ones, and the new one.
+    fn add_notice(&self, calendar: usize) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        if ui.get_editor_usual_notices() {
+            let of = match self.editing.borrow().as_ref().map(|e| e.target.clone()) {
+                Some(Some(target)) => Some((target.account, target.calendar_id)),
+                Some(None) => self
+                    .draft
+                    .borrow()
+                    .as_ref()
+                    .and_then(|draft| draft.calendars.get(calendar).cloned())
+                    .map(|(account, calendar_id, _)| (account, calendar_id)),
+                None => None,
+            };
+            let usual: Vec<EditorNotice> = of
+                .and_then(|(account, calendar_id)| {
+                    let loaded = self.loaded.borrow();
+                    let calendar = loaded
+                        .calendars
+                        .iter()
+                        .find(|c| c.account_id == account && c.entry.id == calendar_id)?;
+                    Some(
+                        calendar
+                            .entry
+                            .default_reminders
+                            .iter()
+                            .filter_map(|usual| {
+                                Some(notice_row(&editor::Notification {
+                                    minutes: usual.minutes?,
+                                    email: usual.method.as_deref() == Some("email"),
+                                }))
+                            })
+                            .collect(),
+                    )
+                })
+                .unwrap_or_default();
+            self.editor_notices.set_vec(usual);
+            ui.set_editor_usual_notices(false);
+        }
+        if self.editor_notices.row_count() < editor::MOST_NOTIFICATIONS {
+            // A time the event does not have yet, from the nearest on.
+            let taken: Vec<i64> = self
+                .editor_notices
+                .iter()
+                .map(|row| notice_of(&row).minutes)
+                .collect();
+            let minutes = [10, 30, 60, 1440, 5, 15, 120, 2880, 10080, 0]
+                .into_iter()
+                .find(|minutes| !taken.contains(minutes))
+                .unwrap_or(10);
+            self.editor_notices.push(notice_row(&editor::Notification {
+                minutes,
+                email: false,
+            }));
+        }
+    }
+
+    /// Adds the addresses in `text` to the editor's list of guests (Enter in the
+    /// field). A text that is no address stands for the first person suggested for
+    /// it; without one, nothing is added and the editor says so.
+    fn add_guests(&self, text: &str) -> bool {
+        let Some(ui) = self.ui.upgrade() else {
+            return false;
+        };
+        match editor::addresses(text) {
+            Ok(addresses) => {
+                for address in addresses {
+                    self.add_guest(address, "");
+                }
+                ui.set_editor_error(SharedString::new());
+                self.clear_suggestions(&ui);
+                true
+            }
+            Err(problem) => match ui.get_guest_suggestions().row_data(0) {
+                Some(first) => self.add_suggested(&ui, text, &first),
+                None => {
+                    ui.set_editor_error(problem.into());
+                    false
+                }
+            },
+        }
+    }
+
+    /// Adds a suggested person, and with them the addresses typed before the word
+    /// they were suggested for. If something there is wrong, nothing is added and
+    /// the editor says so; the field then keeps its text.
+    fn add_suggested(&self, ui: &AppWindow, text: &str, person: &Suggestion) -> bool {
+        match typed_before_suggestion(text) {
+            Ok(addresses) => {
+                for address in addresses {
+                    self.add_guest(address, "");
+                }
+                self.add_guest(&person.email, &person.name);
+                ui.set_editor_error(SharedString::new());
+                self.clear_suggestions(ui);
+                true
+            }
+            Err(problem) => {
+                ui.set_editor_error(problem.into());
+                false
+            }
+        }
+    }
+
+    /// Takes the suggestions away, and makes any answer still on its way too late.
+    fn clear_suggestions(&self, ui: &AppWindow) {
+        ui.set_guest_suggest_serial(ui.get_guest_suggest_serial().wrapping_add(1));
+        ui.set_guest_suggestions(ModelRc::default());
+        ui.set_guest_suggest_problem(SharedString::new());
+    }
+
+    /// The guests field was typed into: asks for people matching the word being
+    /// typed, once it has two letters. `calendar` is the one chosen for a new event.
+    fn suggest_guests(&self, text: &str, calendar: usize) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        self.clear_suggestions(&ui);
+        let word = text
+            .rsplit([',', ';', ' ', '\n', '\t'])
+            .next()
+            .unwrap_or("");
+        if word.chars().count() < 2 {
+            return;
+        }
+        let account = match self.editing.borrow().as_ref().map(|e| e.target.clone()) {
+            Some(Some(target)) => Some(target.account),
+            Some(None) => self
+                .draft
+                .borrow()
+                .as_ref()
+                .and_then(|draft| draft.calendars.get(calendar))
+                .map(|(account, _, _)| *account),
+            None => None,
+        };
+        if let Some(account) = account {
+            let _ = self.commands.send(Command::SuggestGuests {
+                account,
+                query: word.to_owned(),
+                serial: ui.get_guest_suggest_serial(),
+            });
+        }
+    }
+
+    /// A suggested person was chosen: joins the guests, by name, after the addresses
+    /// typed before. Says whether the field's text was used up.
+    fn pick_suggestion(&self, row: usize) -> bool {
+        let Some(ui) = self.ui.upgrade() else {
+            return false;
+        };
+        let Some(person) = ui.get_guest_suggestions().row_data(row) else {
+            self.clear_suggestions(&ui);
+            return false;
+        };
+        let text = ui.get_editor().guests;
+        self.add_suggested(&ui, &text, &person)
+    }
+
+    fn add_guest(&self, address: &str, name: &str) {
+        let known = self
+            .editor_guests
+            .iter()
+            .any(|guest| guest.email.eq_ignore_ascii_case(address));
+        if !known {
+            self.editor_guests.push(EditorGuest {
+                email: address.into(),
+                name: name.into(),
+                optional: false,
+            });
+        }
     }
 
     /// "Save" in the editor: checks the form and sends what changed. For a repeating
@@ -2612,6 +2981,8 @@ pub fn run() -> Result<()> {
         undo: RefCell::default(),
         asked: RefCell::default(),
         editing: RefCell::default(),
+        editor_guests: Rc::new(VecModel::default()),
+        editor_notices: Rc::new(VecModel::default()),
         pending: RefCell::default(),
         generation: Cell::new(0),
         toast_timer: Timer::default(),
@@ -2800,7 +3171,68 @@ pub fn run() -> Result<()> {
     });
     ui.on_editor_save({
         let view = view.clone();
-        move |form, calendar| view.save_editor(from_window(&form), calendar as usize)
+        move |form, calendar| view.save_editor(view.form_from(&form), calendar as usize)
+    });
+    ui.set_editor_guests(ModelRc::from(view.editor_guests.clone()));
+    ui.on_editor_guest_add({
+        let view = view.clone();
+        move |text| view.add_guests(&text)
+    });
+    ui.set_editor_notices(ModelRc::from(view.editor_notices.clone()));
+    ui.on_editor_notice_add({
+        let view = view.clone();
+        move |calendar| view.add_notice(calendar.max(0) as usize)
+    });
+    ui.on_editor_notice_remove({
+        let view = view.clone();
+        move |row| {
+            if (row.max(0) as usize) < view.editor_notices.row_count() {
+                view.editor_notices.remove(row as usize);
+            }
+        }
+    });
+    ui.on_editor_notice_set({
+        let view = view.clone();
+        move |row, choice| {
+            if let Some(mut notice) = view.editor_notices.row_data(row.max(0) as usize) {
+                notice.choice = choice;
+                view.editor_notices.set_row_data(row as usize, notice);
+            }
+        }
+    });
+    ui.on_editor_notice_usual({
+        let view = view.clone();
+        move || {
+            view.editor_notices.set_vec(Vec::new());
+            if let Some(ui) = view.ui.upgrade() {
+                ui.set_editor_usual_notices(true);
+            }
+        }
+    });
+    ui.on_editor_guest_typed({
+        let view = view.clone();
+        move |text, calendar| view.suggest_guests(&text, calendar.max(0) as usize)
+    });
+    ui.on_editor_guest_pick({
+        let view = view.clone();
+        move |row| view.pick_suggestion(row.max(0) as usize)
+    });
+    ui.on_editor_guest_remove({
+        let view = view.clone();
+        move |row| {
+            if (row as usize) < view.editor_guests.row_count() {
+                view.editor_guests.remove(row as usize);
+            }
+        }
+    });
+    ui.on_editor_guest_optional({
+        let view = view.clone();
+        move |row| {
+            if let Some(mut guest) = view.editor_guests.row_data(row as usize) {
+                guest.optional = !guest.optional;
+                view.editor_guests.set_row_data(row as usize, guest);
+            }
+        }
     });
     ui.on_edit_scope_cancelled({
         let view = view.clone();
@@ -2920,7 +3352,9 @@ pub fn run() -> Result<()> {
     });
     ui.on_open_link(|link| {
         // Nothing useful to do if no browser can be started.
-        let _ = open::that_detached(link.as_str());
+        if is_web_address(&link) {
+            let _ = open::that_detached(link.as_str());
+        }
     });
     ui.on_data_changed({
         let view = view.clone();
@@ -2942,6 +3376,17 @@ pub fn run() -> Result<()> {
         let commands = commands.clone();
         move |email| {
             let _ = commands.send(Command::RemoveAccount(email.into()));
+        }
+    });
+    ui.on_grant_permission({
+        let commands = commands.clone();
+        move |email, permission| {
+            if let Some(permission) = Permission::ALL.get(permission.max(0) as usize) {
+                let _ = commands.send(Command::Grant {
+                    email: email.into(),
+                    permission: *permission,
+                });
+            }
         }
     });
 
@@ -2994,6 +3439,50 @@ mod tests {
 
     fn date(text: &str) -> NaiveDate {
         text.parse().unwrap()
+    }
+
+    #[test]
+    fn a_suggestion_keeps_the_addresses_typed_before_it() {
+        assert_eq!(typed_before_suggestion("bo"), Ok(vec![]));
+        assert_eq!(
+            typed_before_suggestion("ann@example.com, cy@example.com;bo"),
+            Ok(vec!["ann@example.com", "cy@example.com"])
+        );
+        // A name of two words is one person, not an address gone wrong.
+        assert_eq!(typed_before_suggestion("bob sm"), Ok(vec![]));
+        // What was meant as an address and is none is said, not dropped.
+        assert_eq!(
+            typed_before_suggestion("ann@example, bo"),
+            Err("“ann@example” is not an e-mail address.".into())
+        );
+        // Text that is not ASCII is cut at the word, not inside a letter.
+        assert_eq!(
+            typed_before_suggestion("žo@example.com, šá"),
+            Ok(vec!["žo@example.com"])
+        );
+    }
+
+    #[test]
+    fn the_settings_say_what_each_account_allows() {
+        let account = |email: &str, scopes: Option<&[Permission]>| Account {
+            id: 1,
+            email: email.into(),
+            scopes: scopes.map(|all| all.iter().map(|one| one.scope().to_owned()).collect()),
+        };
+        let rows = account_permissions(&[
+            account("old@example.com", None),
+            account(
+                "new@example.com",
+                Some(&[Permission::Calendar, Permission::OtherContacts]),
+            ),
+        ]);
+        let states = |row: &AccountPermissions| row.states.iter().collect::<Vec<i32>>();
+        assert_eq!(rows[0].email, "old@example.com");
+        // Signed in before the app kept this: not known until the next sync.
+        assert_eq!(states(&rows[0]), [0, 0, 0, 0]);
+        // In the order of the settings' list: calendars, contacts, other contacts,
+        // the directory.
+        assert_eq!(states(&rows[1]), [1, 2, 1, 2]);
     }
 
     #[test]
@@ -3352,6 +3841,77 @@ mod tests {
                 Some(foreign)
             ),
             None
+        );
+    }
+
+    #[test]
+    fn a_notification_is_one_of_the_offered_times_or_keeps_its_own() {
+        let notice = |minutes, email| editor::Notification { minutes, email };
+        // An offered time is that choice, and comes back as it was.
+        let row = notice_row(&notice(30, false));
+        assert_eq!((row.choice, row.custom.as_str()), (4, ""));
+        assert_eq!(notice_of(&row), notice(30, false));
+        // Another time is one more choice, in words; e-mail stays e-mail.
+        let row = notice_row(&notice(45, true));
+        assert_eq!((row.choice, row.custom.as_str()), (10, "45 minutes before"));
+        assert_eq!(notice_of(&row), notice(45, true));
+        // Changed to an offered time and back to its own.
+        let mut changed = row.clone();
+        changed.choice = 2;
+        assert_eq!(notice_of(&changed), notice(10, true));
+        changed.choice = 10;
+        assert_eq!(notice_of(&changed), notice(45, true));
+
+        assert_eq!(before_text(1), "1 minute before");
+        assert_eq!(before_text(180), "3 hours before");
+        assert_eq!(before_text(4320), "3 days before");
+        assert_eq!(before_text(20160), "2 weeks before");
+        assert_eq!(before_text(90), "90 minutes before");
+    }
+
+    #[test]
+    fn only_web_addresses_are_opened_and_offered_as_attachments() {
+        for good in [
+            "https://drive.google.com/file/d/abc/view",
+            "http://example.com/a?b=c",
+        ] {
+            assert!(is_web_address(good), "{good}");
+        }
+        for bad in [
+            "",
+            "file:///etc/passwd",
+            "/usr/bin/xterm",
+            "javascript:alert(1)",
+            "smb://server/share",
+            "https://example.com/a b",
+            "https://example.com/\n--flag",
+            " https://example.com",
+            "HTTPS-like.desktop",
+        ] {
+            assert!(!is_web_address(bad), "{bad}");
+        }
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "id": "e",
+            "attachments": [
+                {"fileUrl": "https://drive.google.com/file/d/abc/view", "title": "Agenda\u{1b}[2J.pdf"},
+                {"fileUrl": "https://docs.google.com/document/d/x", "title": "  "},
+                {"fileUrl": "file:///home/me/.ssh/id_rsa", "title": "Notes"},
+                {"title": "No link at all"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            attachment_links(&event),
+            vec![
+                (
+                    "Agenda[2J.pdf".to_owned(),
+                    "https://drive.google.com/file/d/abc/view".to_owned()
+                ),
+                (
+                    "https://docs.google.com/document/d/x".to_owned(),
+                    "https://docs.google.com/document/d/x".to_owned()
+                ),
+            ]
         );
     }
 

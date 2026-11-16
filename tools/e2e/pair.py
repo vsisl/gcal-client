@@ -83,9 +83,12 @@ def confirm(question, email=False):
 
 
 def typed_guests():
-    """The addresses in the editor's guests field, as the app will send them."""
+    """The guests the editor will send: those in its list, and what is still in the
+    field for adding them."""
     text = properties(one("TextInput", HINT)).get("accessibleValue", "")
-    return {part.strip().lower() for part in text.replace(";", ",").split(",") if part.strip()}
+    typed = {part.strip().lower() for part in text.replace(";", ",").split(",") if part.strip()}
+    rows = {label(h)[len("Guest: "):].split(",")[0].lower() for h in find("ListItem") if label(h).startswith("Guest: ")}
+    return typed | rows
 
 
 def only_the_two(shown):

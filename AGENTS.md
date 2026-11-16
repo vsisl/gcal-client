@@ -75,7 +75,7 @@ requests.
 | Path | What is there |
 |---|---|
 | `crates/core` | No I/O. `model` (events, calendars), `recurrence` (expanding series, cutting and splitting them), `week` / `month` / `schedule` (layout of the views), `text` |
-| `crates/google` | `auth` (browser sign-in with PKCE, token refresh), `client` (Calendar API: list, insert, patch, delete, instances), `config` |
+| `crates/google` | `auth` (browser sign-in with PKCE, token refresh), `client` (Calendar API: list, insert, patch, delete, instances; People API: search), `config`, `Permission` (the scopes) |
 | `crates/store` | SQLite cache: accounts, calendars, events (each with its complete JSON), sync tokens, settings. Migrations by `user_version` |
 | `crates/sync` | Full and incremental sync of one account, with progress |
 | `crates/app/src/main.rs` | Entry point and the small command line |
@@ -205,6 +205,7 @@ owner's two test accounts only).
 | `guests.py` | guests in the editor, the question about e-mails | — |
 | `meet.py` | a Google Meet link: create, remove, undo | — |
 | `zoom.py` | zoom through the settings | — |
+| `perms.py` | the settings' list of what the account allows (reads only; "Allow" is not pressed) | — |
 | `pair.py` | an invitation between two test accounts, from both sides: invite, answer, rename, delete | a second test account and a second test app (below) |
 
 `pair.py` drives two test apps at once, each on a one-account folder of its own: the

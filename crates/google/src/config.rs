@@ -60,6 +60,8 @@ pub struct Endpoints {
     pub auth: String,
     pub token: String,
     pub calendar_api: String,
+    /// The People API: contacts, for suggesting guests.
+    pub people_api: String,
 }
 
 impl Default for Endpoints {
@@ -68,6 +70,7 @@ impl Default for Endpoints {
             auth: "https://accounts.google.com/o/oauth2/v2/auth".into(),
             token: "https://oauth2.googleapis.com/token".into(),
             calendar_api: "https://www.googleapis.com/calendar/v3".into(),
+            people_api: "https://people.googleapis.com/v1".into(),
         }
     }
 }

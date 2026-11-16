@@ -11,7 +11,7 @@ mod worker;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use gcal_google::{ClientConfig, Endpoints, GoogleClient, HttpClient, SCOPE_CALENDAR};
+use gcal_google::{ClientConfig, Endpoints, GoogleClient, HttpClient};
 use gcal_store::Store;
 use vault::Vault;
 
@@ -51,7 +51,8 @@ async fn login() -> Result<()> {
     let http = HttpClient::new();
     let vault = Vault::open().await?;
 
-    let pending = gcal_google::begin_login(&config, &endpoints, &[SCOPE_CALENDAR]).await?;
+    let scopes = gcal_google::Permission::AT_SIGN_IN.map(gcal_google::Permission::scope);
+    let pending = gcal_google::begin_login(&config, &endpoints, &scopes, None).await?;
     println!(
         "Opening your browser to sign in. If nothing opens, visit:\n\n{}\n",
         pending.auth_url
@@ -64,12 +65,19 @@ async fn login() -> Result<()> {
         .context("Google sent no refresh token")?;
 
     let client = GoogleClient::new(http, config, endpoints, refresh_token.clone())
-        .with_access_token(tokens.access_token, tokens.expires_at);
+        .with_access_token(
+            tokens.access_token,
+            tokens.expires_at,
+            tokens.scopes.clone(),
+        );
     let email = client.account_email().await?;
     vault.save(&email, &refresh_token).await?;
 
     let mut store = open_store()?;
     let account = store.add_account(&email)?;
+    if let Some(scopes) = &tokens.scopes {
+        store.set_account_scopes(account, scopes)?;
+    }
     println!("Signed in as {email}. Syncing…");
     let report = gcal_sync::sync_account(&client, &mut store, account).await?;
     print_report(&email, &report);
