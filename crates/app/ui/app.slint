@@ -684,10 +684,15 @@ export component AppWindow inherits Window {
     property <string> subscribe-email;
     property <int> subscribe-account;
     changed subscribe-email => {
+        // Opened or closed: suggestions from before are not for this.
+        root.subscribe-typed("", root.subscribe-account);
         if (root.subscribe-email == "") {
             keys.focus();
         }
     }
+    // The card's field changed: people of that account are suggested under it, in
+    // guest-suggestions, as for an event's guests.
+    callback subscribe-typed(string, int);
     // Account, and what was typed: a colleague's address or a calendar's identifier.
     callback subscribe-calendar(int, string);
     // Account and calendar: off the account's list.
@@ -3691,12 +3696,54 @@ export component AppWindow inherits Window {
                     property <string> typed;
                     edited(text) => {
                         self.typed = text;
+                        root.subscribe-typed(text, root.subscribe-account);
                     }
                     accepted(text) => {
                         if (text != "") {
                             root.subscribe-calendar(root.subscribe-account, text);
                             root.subscribe-email = "";
                         }
+                    }
+                }
+
+                if root.guest-suggestions.length > 0 || root.guest-suggest-problem != "": VerticalLayout {
+                    spacing: 2px;
+
+                    for person in root.guest-suggestions: Rectangle {
+                        height: 30px;
+                        border-radius: 4px;
+                        background: whose-touch.has-hover ? Theme.selected : Theme.hover;
+                        accessible-role: list-item;
+                        accessible-label: "Suggestion: \{person.email}";
+                        accessible-action-default => {
+                            whose-touch.clicked();
+                        }
+
+                        whose-touch := TouchArea {
+                            clicked => {
+                                root.subscribe-calendar(root.subscribe-account, person.email);
+                                root.subscribe-email = "";
+                            }
+                        }
+
+                        Text {
+                            x: 10px;
+                            width: parent.width - 20px;
+                            height: parent.height;
+                            text: person.name != "" ? "\{person.name} · \{person.email}" : person.email;
+                            font-size: 13px;
+                            color: Theme.text;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+
+                    if root.guest-suggest-problem != "": Text {
+                        text: root.guest-suggest-problem;
+                        font-size: 12px;
+                        color: Theme.text-dim;
+                        wrap: word-wrap;
+                        height: self.preferred-height;
                     }
                 }
 

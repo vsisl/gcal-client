@@ -2478,6 +2478,37 @@ impl View {
         }
     }
 
+    /// The field of "Add a calendar" was typed into: asks for people of `account`
+    /// matching the text, once it has two letters. An empty text only takes the
+    /// suggestions away.
+    fn suggest_owners(&self, text: &str, account: AccountId) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        self.clear_suggestions(&ui);
+        let query = text.trim();
+        if query.chars().count() >= 2 {
+            let _ = self.commands.send(Command::SuggestGuests {
+                account,
+                query: query.to_owned(),
+                serial: ui.get_guest_suggest_serial(),
+            });
+        }
+    }
+
+    /// The calendar to add for what was typed in "Add a calendar": the text itself if
+    /// it can be an address or an identifier, else (a name, or the start of one) the
+    /// first person suggested for it.
+    fn calendar_typed(&self, text: &str) -> String {
+        let text = text.trim();
+        let first = self
+            .ui
+            .upgrade()
+            .and_then(|ui| ui.get_guest_suggestions().row_data(0));
+        match first {
+            Some(person) if !text.contains('@') => person.email.into(),
+            _ => text.to_owned(),
+        }
+    }
+
     /// A suggested person was chosen: joins the guests, by name, after the addresses
     /// typed before. Says whether the field's text was used up.
     fn pick_suggestion(&self, row: usize) -> bool {
@@ -3387,10 +3418,15 @@ pub fn run() -> Result<()> {
             let _ = commands.send(Command::RemoveAccount(email.into()));
         }
     });
+    ui.on_subscribe_typed({
+        let view = view.clone();
+        move |text, account| view.suggest_owners(&text, AccountId::from(account))
+    });
     ui.on_subscribe_calendar({
         let commands = commands.clone();
+        let view = view.clone();
         move |account, calendar| {
-            let calendar_id = calendar.trim().to_owned();
+            let calendar_id = view.calendar_typed(&calendar);
             if !calendar_id.is_empty() {
                 let _ = commands.send(Command::Subscribe {
                     account: AccountId::from(account),
