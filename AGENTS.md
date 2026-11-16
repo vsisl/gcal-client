@@ -232,8 +232,11 @@ Rules for these runs:
 - The Undo offer lasts ten seconds, so a script must not wait longer before pressing `z`.
 - Add a step to these scripts for every new kind of write.
 - No e-mail may leave a test: every question about sending e-mails is unticked before
-  it is confirmed, in clean-up too. Guests are made-up addresses (`@example.com`); the
-  one exception is `pair.py`, whose guest is the owner's second test account.
+  it is confirmed, in clean-up too. Guests are made-up addresses (`@example.com`).
+  The one exception, allowed by the owner: `pair.py`, whose guest is the owner's second
+  test account, and which with `--email` lets Google e-mail that guest (an invitation,
+  an update, a cancellation). The app cannot read mail, so whether they arrived is for
+  the owner to look up in the guest's inbox.
 - The app opens on the view it was closed with; a script that needs a view picks it.
 
 Not covered by any test yet: Google failing or being slow, and the gestures the test

@@ -1,12 +1,20 @@
 """An invitation between two test accounts, seen from both sides and checked against
 Google: the organiser invites, the guest answers, the organiser changes and deletes.
 
-usage: pair.py <screenshot folder> <organiser's cache.db> <guest's cache.db>
+usage: pair.py <screenshot folder> <organiser's cache.db> <guest's cache.db> [--email]
 
 Two test apps must be running, each on a one-account data folder of its own: the
 organiser's with SLINT_MCP_PORT=8766, the guest's with SLINT_MCP_PORT=8767. Both
 accounts must be ones set aside for testing. No e-mail is sent: every question about
 e-mails is unticked, and seen to be unticked, before it is confirmed. Needs no fixture.
+
+With --email the three questions are left ticked instead, so that Google e-mails the
+guest an invitation, an update and a cancellation. The owner allowed this between the
+two test accounts only: before each e-mailed change the script stops unless the
+guests it sees (in the editor, and in the cache) are those two and no other. It
+cannot rule out a guest added at Google in the seconds between that look and the
+change. The app cannot read mail: that the e-mails arrived is for the owner
+to see in the guest's inbox. They carry the name the script prints.
 
 Before anything is written the script makes sure that each app really is the one
 working on the cache it was given. Whatever goes wrong after the event was created, the
@@ -24,6 +32,7 @@ ASK_CANCEL = "Send cancellation e-mails to guests"
 # A name of this run's own: an event left by an earlier run must never be taken for it.
 NAME = "AT pair " + time.strftime("%H%M%S")
 RENAMED = NAME + " 2"
+EMAIL = "--email" in sys.argv[4:]
 
 
 class Failed(Exception):
@@ -63,14 +72,31 @@ def open_event(name):
     do("click_element", elementHandle=found[0]); time.sleep(0.5)
 
 
-def confirm_without_email(question):
-    """Unticks the question about e-mails, makes sure it is unticked, and only then
-    confirms."""
-    if properties(one("Checkbox", question)).get("accessibleChecked"):
+def confirm(question, email=False):
+    """Sets the question about e-mails (unticked unless e-mails are wanted), makes sure
+    it is set that way, and only then confirms."""
+    if bool(properties(one("Checkbox", question)).get("accessibleChecked")) != email:
         click("Checkbox", question)
-    if properties(one("Checkbox", question)).get("accessibleChecked"):
-        raise Failed(f"'{question}' could not be unticked; nothing was confirmed")
+    if bool(properties(one("Checkbox", question)).get("accessibleChecked")) != email:
+        raise Failed(f"'{question}' could not be set; nothing was confirmed")
     key(ENTER)
+
+
+def typed_guests():
+    """The addresses in the editor's guests field, as the app will send them."""
+    text = properties(one("TextInput", HINT)).get("accessibleValue", "")
+    return {part.strip().lower() for part in text.replace(";", ",").split(",") if part.strip()}
+
+
+def only_the_two(shown):
+    """With --email, stops unless the e-mails can only go to the two test accounts:
+    the guests in the editor and the guests the cache has for the event."""
+    if not EMAIL:
+        return
+    if not shown or not shown <= {organiser, guest}:
+        raise Failed(f"the editor lists {sorted(shown)} as guests; no e-mail is sent")
+    if created and set(answers(mine())) != {organiser, guest}:
+        raise Failed("the event has other guests; no e-mail is sent")
 
 
 def must(passed):
@@ -82,6 +108,9 @@ def synced(what, cond):
     """Waits for a change made in the other account to reach this app's cache,
     refreshing every ten seconds: a refresh right after the change brings nothing."""
     key(ESC)
+    # Back to the month with today in it: the windows are on the owner's screen, and a
+    # turn of the mouse wheel over one shows another month.
+    key("t")
     start = time.time()
     while time.time() - start < 120:
         key("r")
@@ -174,8 +203,10 @@ def run():
     click("Button", "More options")
     click("TextInput", HINT)
     for ch in guest: key(ch)
+    if typed_guests() != {guest}:
+        raise Failed(f"the guests field holds {sorted(typed_guests())}, not the guest; nothing was saved")
     click("Button", "Save"); time.sleep(0.5)
-    confirm_without_email(ASK)
+    confirm(ASK, EMAIL)
     must(wait("organiser: created", lambda: len(named(NAME)) == 1))
     created, uid = named(NAME)[0]["id"], named(NAME)[0]["iCalUID"]
     must(wait("organiser: with the guest unanswered, in the organiser's own calendar",
@@ -201,40 +232,52 @@ def run():
     # 4. The organiser renames it; the guest's copy follows and keeps the answer.
     key("e"); time.sleep(0.5)
     key(" "); key("2")
+    only_the_two(typed_guests())
     click("Button", "Save"); time.sleep(0.5)
-    confirm_without_email(ASK)
+    confirm(ASK, EMAIL)
     must(wait("organiser: renamed at Google", lambda: mine()["summary"] == RENAMED))
     common.use(*GUEST)
     synced("guest: sees the new name, still yes", lambda: theirs()["summary"] == RENAMED and answers(theirs())[guest] == "accepted")
 
-    # 5. The guest changes the answer; the organiser sees it.
-    must(wait("guest: the new name is on screen", lambda: len(items(RENAMED)) == 1))
-    open_event(RENAMED)
-    click("Button", "No")
-    must(wait("guest: no saved at Google", lambda: answers(theirs())[guest] == "declined"))
-    common.use(*ORGANISER)
-    synced("organiser: sees the guest's no", lambda: answers(mine())[guest] == "declined")
+    # 5. The guest changes the answer; the organiser sees it. Not with --email: the
+    #    cancellation is to be seen arriving, and after a run in which the guest had
+    #    declined none arrived.
+    if not EMAIL:
+        must(wait("guest: the new name is on screen", lambda: len(items(RENAMED)) == 1))
+        open_event(RENAMED)
+        click("Button", "No")
+        must(wait("guest: no saved at Google", lambda: answers(theirs())[guest] == "declined"))
+        common.use(*ORGANISER)
+        synced("organiser: sees the guest's no", lambda: answers(mine())[guest] == "declined")
 
     # 6. The organiser deletes it, without cancellation e-mails; it leaves the guest's
     #    calendar too.
+    common.use(*ORGANISER)
     time.sleep(11)
-    delete()
+    delete(EMAIL)
     must(wait("organiser: deleted", lambda: mine() is None))
     common.use(*GUEST)
     synced("guest: gone from the guest's calendar", lambda: theirs() is None)
 
 
-def delete():
-    """Deletes this run's event in the organiser's app, without e-mails."""
+def delete(email=False):
+    """Deletes this run's event in the organiser's app; without e-mails in clean-up."""
     common.use(*ORGANISER)
     name = mine()["summary"]
     for _ in range(4): key(ESC)
+    key("t")
     must(wait("organiser: the event to delete is on screen", lambda: len(items(name)) >= 1))
     open_event(name)
     key(DEL); time.sleep(0.5)
-    confirm_without_email(ASK_CANCEL)
+    # E-mails only to this run's own guest list: the organiser and the guest. The
+    # event may have been given other guests at Google since it was created.
+    if email and set(answers(mine())) != {organiser, guest}:
+        raise Failed("the event has other guests; no e-mail is sent")
+    confirm(ASK_CANCEL, email)
 
 
+if EMAIL:
+    print(f"e-mails to {guest} will carry the names '{NAME}' and '{RENAMED}'")
 try:
     run()
 except Exception as error:
