@@ -179,6 +179,9 @@ pub struct Event {
     #[serde(default)]
     pub attendees: Vec<Attendee>,
     pub organizer: Option<Organizer>,
+    /// Whether the organiser lets the guests change the event.
+    #[serde(default)]
+    pub guests_can_modify: bool,
     /// The address of the event's video meeting, if it has one.
     pub hangout_link: Option<String>,
     /// RRULE/EXDATE/RDATE lines; present only on the master event of a series.
@@ -216,6 +219,23 @@ impl Event {
     /// change or a cancellation.
     pub fn has_guests_to_notify(&self) -> bool {
         !self.attendees.is_empty() && self.organizer.as_ref().is_some_and(|o| o.is_self)
+    }
+
+    /// Whether this account, a guest of the event, may change it: the organiser lets
+    /// the guests, and Google passes a guest's change on to everyone's copy. Single
+    /// events only: cutting a series in two ("this and following") would leave the
+    /// guest organising the second half.
+    pub fn may_change_as_guest(&self) -> bool {
+        self.guests_can_modify
+            && self.own_invitation().is_some()
+            && !self.organizer.as_ref().is_some_and(|o| o.is_self)
+            && !self.is_recurring_master()
+            && self.recurring_event_id.is_none()
+    }
+
+    /// Whether a change made here reaches other people, who can be told of it.
+    pub fn others_see_changes(&self) -> bool {
+        self.has_guests_to_notify() || self.may_change_as_guest()
     }
 }
 

@@ -680,12 +680,13 @@ fn plan_drag(
 }
 
 /// Whether the event can be changed in the app: dragged, resized, opened in the
-/// editor. An event with guests only by the account that invited them (a guest's copy
-/// would drift from the organiser's); never the special kinds of entry (birthdays, ...).
+/// editor. An event with guests only by the account that invited them, or by a guest
+/// the organiser lets change it (any other guest's copy would drift from the
+/// organiser's); never the special kinds of entry (birthdays, ...).
 fn can_move(event: &Event, calendar: &CalendarListEntry) -> bool {
     calendar.is_writable()
         && matches!(event.event_type.as_deref(), None | Some("default"))
-        && (event.attendees.is_empty() || event.has_guests_to_notify())
+        && (event.attendees.is_empty() || event.others_see_changes())
 }
 
 /// An instant moved by whole days and minutes on the local clock, so that a move across
@@ -1646,7 +1647,7 @@ impl View {
                     etag: instance.event.etag.clone(),
                     occurrence: occurrence_of(instance.event, instance.start),
                     movable: can_move(instance.event, &calendar.entry),
-                    guests: instance.event.has_guests_to_notify(),
+                    guests: instance.event.others_see_changes(),
                     can_answer: can_answer(instance.event, &calendar.entry),
                     start: instance.start,
                     end: instance.end,
@@ -3445,6 +3446,22 @@ mod tests {
         for other in [
             serde_json::json!({"attendees": [{"email": "a@example.com"}]}),
             serde_json::json!({"eventType": "birthday"}),
+        ] {
+            assert!(!can_move(&event(other), &owner));
+        }
+        // A guest whom the organiser lets change the event may; not a series (yet),
+        // and not someone who is no guest of it.
+        let invited = serde_json::json!([{"email": "me@example.com", "self": true}]);
+        let allowed = event(serde_json::json!({"guestsCanModify": true, "attendees": invited}));
+        assert!(can_move(&allowed, &owner));
+        assert!(allowed.others_see_changes() && !allowed.has_guests_to_notify());
+        for other in [
+            serde_json::json!({"guestsCanModify": false, "attendees": invited}),
+            serde_json::json!({"guestsCanModify": true, "attendees": [{"email": "a@example.com"}]}),
+            serde_json::json!({"guestsCanModify": true, "attendees": invited,
+                "recurrence": ["RRULE:FREQ=DAILY"]}),
+            serde_json::json!({"guestsCanModify": true, "attendees": invited,
+                "recurringEventId": "m"}),
         ] {
             assert!(!can_move(&event(other), &owner));
         }

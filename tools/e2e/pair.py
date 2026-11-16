@@ -229,15 +229,32 @@ def run():
     open_event(NAME)
     shot("pair-organiser-answered")
 
-    # 4. The organiser renames it; the guest's copy follows and keeps the answer.
+    # 4. The organiser renames it and lets guests change it; the guest's copy follows
+    #    and keeps the answer.
     key("e"); time.sleep(0.5)
     key(" "); key("2")
+    click("Checkbox", "Change it")
     only_the_two(typed_guests())
     click("Button", "Save"); time.sleep(0.5)
     confirm(ASK, EMAIL)
     must(wait("organiser: renamed at Google", lambda: mine()["summary"] == RENAMED))
     common.use(*GUEST)
     synced("guest: sees the new name, still yes", lambda: theirs()["summary"] == RENAMED and answers(theirs())[guest] == "accepted")
+
+    # 4b. The guest, now allowed to, adds a place. Never with e-mails: the question is
+    #     the organiser's to test.
+    must(wait("guest: may change it", lambda: theirs().get("guestsCanModify") is True and len(items(RENAMED)) == 1))
+    open_event(RENAMED)
+    key("e"); time.sleep(0.5)
+    click("TextInput", "Add location")
+    for ch in "Room 7": key(ch)
+    click("Button", "Save"); time.sleep(0.5)
+    confirm(ASK, False)
+    must(wait("guest: the place is saved at Google", lambda: theirs().get("location") == "Room 7"))
+    common.use(*ORGANISER)
+    synced("organiser: sees the guest's change", lambda: mine().get("location") == "Room 7" and mine()["organizer"]["email"] == organiser)
+    common.use(*GUEST)
+    time.sleep(11)   # the Undo offer of the change would take the next keys
 
     # 5. The guest changes the answer; the organiser sees it. Not with --email: the
     #    cancellation is to be seen arriving, and after a run in which the guest had
@@ -282,6 +299,10 @@ try:
     run()
 except Exception as error:
     print("FAIL", f"{type(error).__name__}: {error}")
+    # Both copies as the caches have them, to see which side is behind.
+    for who, copy in (("organiser", created and mine()), ("guest", uid and theirs())):
+        if copy:
+            print(f"   {who}:", {name: copy.get(name) for name in ("summary", "location", "updated", "sequence", "guestsCanModify", "etag")})
     try:
         shot("fail-last")
         if created and mine():
