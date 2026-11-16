@@ -503,6 +503,51 @@ fn attachment_links(event: &Event) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The times before an event the editor offers for a notification, in minutes, in the
+/// order of its list.
+const NOTICE_MINUTES: [i64; 10] = [0, 5, 10, 15, 30, 60, 120, 1440, 2880, 10080];
+
+/// A time before an event in words, for one that is not among the offered ones.
+fn before_text(minutes: i64) -> String {
+    let (count, unit) = match minutes {
+        m if m > 0 && m % 10080 == 0 => (m / 10080, "week"),
+        m if m > 0 && m % 1440 == 0 => (m / 1440, "day"),
+        m if m > 0 && m % 60 == 0 => (m / 60, "hour"),
+        m => (m, "minute"),
+    };
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} {unit}{plural} before")
+}
+
+/// A notification as a line of the editor's list.
+fn notice_row(notice: &editor::Notification) -> EditorNotice {
+    match NOTICE_MINUTES.iter().position(|m| *m == notice.minutes) {
+        Some(choice) => EditorNotice {
+            choice: choice as i32,
+            custom: SharedString::new(),
+            custom_minutes: 0,
+            email: notice.email,
+        },
+        None => EditorNotice {
+            choice: NOTICE_MINUTES.len() as i32,
+            custom: before_text(notice.minutes).into(),
+            custom_minutes: notice.minutes.clamp(0, i32::MAX as i64) as i32,
+            email: notice.email,
+        },
+    }
+}
+
+/// The notification a line of the editor's list stands for.
+fn notice_of(row: &EditorNotice) -> editor::Notification {
+    editor::Notification {
+        minutes: NOTICE_MINUTES
+            .get(row.choice.max(0) as usize)
+            .copied()
+            .unwrap_or(row.custom_minutes as i64),
+        email: row.email,
+    }
+}
+
 fn web_link(event: &Event, account_email: &str) -> String {
     match &event.html_link {
         Some(link) => {
@@ -945,7 +990,6 @@ fn to_window(form: &Form) -> EditorForm {
         location: form.location.as_str().into(),
         description: form.description.as_str().into(),
         color: form.color as i32,
-        reminder: form.reminder as i32,
         visibility: form.visibility as i32,
         busy: form.busy,
         guests: form.guests.as_str().into(),
@@ -968,7 +1012,8 @@ fn from_window(form: &EditorForm) -> Form {
         location: form.location.to_string(),
         description: form.description.to_string(),
         color: form.color.max(0) as usize,
-        reminder: form.reminder.max(0) as usize,
+        usual_notifications: true,
+        notifications: Vec::new(),
         visibility: form.visibility.max(0) as usize,
         busy: form.busy,
         guests: form.guests.to_string(),
@@ -1222,6 +1267,8 @@ struct View {
     editing: RefCell<Option<Editing>>,
     /// The guests of the event in the editor, as the window lists them.
     editor_guests: Rc<VecModel<EditorGuest>>,
+    /// Its own notifications, likewise.
+    editor_notices: Rc<VecModel<EditorNotice>>,
     /// Hides the message about the last change after a while.
     toast_timer: Timer,
     commands: UnboundedSender<Command>,
@@ -2153,7 +2200,13 @@ impl View {
             .collect();
         ui.set_editor_colors(ModelRc::from(Rc::new(VecModel::from(colors))));
         ui.set_editor_custom_repeat(form.repeat == editor::REPEAT_CUSTOM);
-        ui.set_editor_custom_reminder(form.reminder == editor::REMINDER_CUSTOM);
+        ui.set_editor_usual_notices(form.usual_notifications);
+        self.editor_notices.set_vec(
+            form.notifications
+                .iter()
+                .map(notice_row)
+                .collect::<Vec<_>>(),
+        );
         ui.set_editor_error(SharedString::new());
         // The guests go into the list, each on its line, with the name the event has
         // for them; the field is for adding. A text that cannot be read as addresses
@@ -2215,7 +2268,74 @@ impl View {
             guests.push(form.guests.clone());
         }
         form.guests = guests.join(", ");
+        form.usual_notifications = self
+            .ui
+            .upgrade()
+            .is_none_or(|ui| ui.get_editor_usual_notices());
+        form.notifications = self
+            .editor_notices
+            .iter()
+            .map(|row| notice_of(&row))
+            .collect();
         form
+    }
+
+    /// "Add notification". If the event had its calendar's usual ones, it gets its
+    /// own from here on: those usual ones, and the new one.
+    fn add_notice(&self, calendar: usize) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        if ui.get_editor_usual_notices() {
+            let of = match self.editing.borrow().as_ref().map(|e| e.target.clone()) {
+                Some(Some(target)) => Some((target.account, target.calendar_id)),
+                Some(None) => self
+                    .draft
+                    .borrow()
+                    .as_ref()
+                    .and_then(|draft| draft.calendars.get(calendar).cloned())
+                    .map(|(account, calendar_id, _)| (account, calendar_id)),
+                None => None,
+            };
+            let usual: Vec<EditorNotice> = of
+                .and_then(|(account, calendar_id)| {
+                    let loaded = self.loaded.borrow();
+                    let calendar = loaded
+                        .calendars
+                        .iter()
+                        .find(|c| c.account_id == account && c.entry.id == calendar_id)?;
+                    Some(
+                        calendar
+                            .entry
+                            .default_reminders
+                            .iter()
+                            .filter_map(|usual| {
+                                Some(notice_row(&editor::Notification {
+                                    minutes: usual.minutes?,
+                                    email: usual.method.as_deref() == Some("email"),
+                                }))
+                            })
+                            .collect(),
+                    )
+                })
+                .unwrap_or_default();
+            self.editor_notices.set_vec(usual);
+            ui.set_editor_usual_notices(false);
+        }
+        if self.editor_notices.row_count() < editor::MOST_NOTIFICATIONS {
+            // A time the event does not have yet, from the nearest on.
+            let taken: Vec<i64> = self
+                .editor_notices
+                .iter()
+                .map(|row| notice_of(&row).minutes)
+                .collect();
+            let minutes = [10, 30, 60, 1440, 5, 15, 120, 2880, 10080, 0]
+                .into_iter()
+                .find(|minutes| !taken.contains(minutes))
+                .unwrap_or(10);
+            self.editor_notices.push(notice_row(&editor::Notification {
+                minutes,
+                email: false,
+            }));
+        }
     }
 
     /// Adds the addresses in `text` to the editor's list of guests (Enter in the
@@ -2799,6 +2919,7 @@ pub fn run() -> Result<()> {
         asked: RefCell::default(),
         editing: RefCell::default(),
         editor_guests: Rc::new(VecModel::default()),
+        editor_notices: Rc::new(VecModel::default()),
         pending: RefCell::default(),
         generation: Cell::new(0),
         toast_timer: Timer::default(),
@@ -2993,6 +3114,37 @@ pub fn run() -> Result<()> {
     ui.on_editor_guest_add({
         let view = view.clone();
         move |text| view.add_guests(&text)
+    });
+    ui.set_editor_notices(ModelRc::from(view.editor_notices.clone()));
+    ui.on_editor_notice_add({
+        let view = view.clone();
+        move |calendar| view.add_notice(calendar.max(0) as usize)
+    });
+    ui.on_editor_notice_remove({
+        let view = view.clone();
+        move |row| {
+            if (row.max(0) as usize) < view.editor_notices.row_count() {
+                view.editor_notices.remove(row as usize);
+            }
+        }
+    });
+    ui.on_editor_notice_set({
+        let view = view.clone();
+        move |row, choice| {
+            if let Some(mut notice) = view.editor_notices.row_data(row.max(0) as usize) {
+                notice.choice = choice;
+                view.editor_notices.set_row_data(row as usize, notice);
+            }
+        }
+    });
+    ui.on_editor_notice_usual({
+        let view = view.clone();
+        move || {
+            view.editor_notices.set_vec(Vec::new());
+            if let Some(ui) = view.ui.upgrade() {
+                ui.set_editor_usual_notices(true);
+            }
+        }
     });
     ui.on_editor_guest_typed({
         let view = view.clone();
@@ -3572,6 +3724,31 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn a_notification_is_one_of_the_offered_times_or_keeps_its_own() {
+        let notice = |minutes, email| editor::Notification { minutes, email };
+        // An offered time is that choice, and comes back as it was.
+        let row = notice_row(&notice(30, false));
+        assert_eq!((row.choice, row.custom.as_str()), (4, ""));
+        assert_eq!(notice_of(&row), notice(30, false));
+        // Another time is one more choice, in words; e-mail stays e-mail.
+        let row = notice_row(&notice(45, true));
+        assert_eq!((row.choice, row.custom.as_str()), (10, "45 minutes before"));
+        assert_eq!(notice_of(&row), notice(45, true));
+        // Changed to an offered time and back to its own.
+        let mut changed = row.clone();
+        changed.choice = 2;
+        assert_eq!(notice_of(&changed), notice(10, true));
+        changed.choice = 10;
+        assert_eq!(notice_of(&changed), notice(45, true));
+
+        assert_eq!(before_text(1), "1 minute before");
+        assert_eq!(before_text(180), "3 hours before");
+        assert_eq!(before_text(4320), "3 days before");
+        assert_eq!(before_text(20160), "2 weeks before");
+        assert_eq!(before_text(90), "90 minutes before");
     }
 
     #[test]

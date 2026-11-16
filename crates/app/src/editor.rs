@@ -23,12 +23,16 @@ const REPEAT_WEEKDAYS: usize = 5;
 /// The event's own rule, which is none of the above; kept as it is.
 pub const REPEAT_CUSTOM: usize = 6;
 
-/// Choices of the "reminder" list: the calendar's default, none, then these minutes
-/// before the event; the last choice keeps reminders that are none of these.
-const REMINDER_DEFAULT: usize = 0;
-const REMINDER_NONE: usize = 1;
-const REMINDER_MINUTES: [i64; 7] = [0, 5, 10, 15, 30, 60, 24 * 60];
-pub const REMINDER_CUSTOM: usize = 2 + REMINDER_MINUTES.len();
+/// How many notifications Google lets an event have.
+pub const MOST_NOTIFICATIONS: usize = 5;
+
+/// One notification before an event.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Notification {
+    pub minutes: i64,
+    /// By e-mail rather than on the screen.
+    pub email: bool,
+}
 
 const VISIBILITY: [&str; 3] = ["default", "public", "private"];
 
@@ -48,7 +52,10 @@ pub struct Form {
     pub description: String,
     /// 0 for the calendar's colour, else the number of one of Google's event colours.
     pub color: usize,
-    pub reminder: usize,
+    /// Whether the event has the notifications usual in its calendar; if not, its own
+    /// ones follow (none at all is possible).
+    pub usual_notifications: bool,
+    pub notifications: Vec<Notification>,
     pub visibility: usize,
     pub busy: bool,
     /// The guests' addresses, separated by commas, spaces or new lines.
@@ -68,7 +75,6 @@ pub struct Form {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Kept {
     pub recurrence: Vec<String>,
-    pub reminders: Value,
     pub start_zone: Option<String>,
     pub end_zone: Option<String>,
     /// The guests as the event has them, with their answers and whatever else Google
@@ -96,6 +102,7 @@ fn date(instant: DateTime<Utc>, zone: Tz) -> NaiveDate {
 pub fn new_form(start: EventTime, end: EventTime, zone: Tz) -> Form {
     let mut form = Form {
         busy: true,
+        usual_notifications: true,
         may_invite: true,
         may_see: true,
         ..Form::default()
@@ -156,7 +163,6 @@ pub fn form_of(resource: &Value, start: EventTime, end: EventTime, zone: Tz) -> 
         .unwrap_or_default();
     let kept = Kept {
         recurrence,
-        reminders: resource["reminders"].clone(),
         start_zone: resource["start"]["timeZone"].as_str().map(str::to_owned),
         end_zone: resource["end"]["timeZone"].as_str().map(str::to_owned),
         attendees: resource["attendees"]
@@ -194,6 +200,18 @@ pub fn form_of(resource: &Value, start: EventTime, end: EventTime, zone: Tz) -> 
             _ => 0,
         },
         busy: resource["transparency"].as_str() != Some("transparent"),
+        usual_notifications: resource["reminders"]["useDefault"].as_bool() != Some(false),
+        notifications: resource["reminders"]["overrides"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|one| {
+                Some(Notification {
+                    minutes: one["minutes"].as_i64()?,
+                    email: one["method"] == "email",
+                })
+            })
+            .collect(),
         // Google leaves out what is as it is by default.
         may_modify: resource["guestsCanModify"].as_bool().unwrap_or(false),
         may_invite: resource["guestsCanInviteOthers"].as_bool().unwrap_or(true),
@@ -218,19 +236,6 @@ pub fn form_of(resource: &Value, start: EventTime, end: EventTime, zone: Tz) -> 
             .find(|choice| repeat_rules(*choice, day, &kept) == kept.recurrence)
             .unwrap_or(REPEAT_CUSTOM),
         None => REPEAT_CUSTOM,
-    };
-    let overrides = kept.reminders["overrides"].as_array();
-    form.reminder = if kept.reminders["useDefault"].as_bool() != Some(false) {
-        REMINDER_DEFAULT
-    } else {
-        match overrides.map(Vec::as_slice) {
-            None | Some([]) => REMINDER_NONE,
-            Some([one]) if one["method"] == "popup" => REMINDER_MINUTES
-                .iter()
-                .position(|minutes| one["minutes"].as_i64() == Some(*minutes))
-                .map_or(REMINDER_CUSTOM, |position| position + 2),
-            _ => REMINDER_CUSTOM,
-        }
     };
     (form, kept)
 }
@@ -290,17 +295,25 @@ pub fn fields(form: &Form, kept: &Kept, zone: Tz) -> Result<Value, String> {
         };
         (field(from, &kept.start_zone), field(to, &kept.end_zone))
     };
-    let reminders = match form.reminder {
-        REMINDER_DEFAULT => json!({ "useDefault": true }),
-        REMINDER_NONE => json!({ "useDefault": false, "overrides": [] }),
-        REMINDER_CUSTOM => kept.reminders.clone(),
-        choice => json!({
-            "useDefault": false,
-            "overrides": [{
-                "method": "popup",
-                "minutes": REMINDER_MINUTES.get(choice - 2).copied().unwrap_or(10),
-            }],
-        }),
+    if form.notifications.len() > MOST_NOTIFICATIONS {
+        return Err(format!(
+            "An event can have {MOST_NOTIFICATIONS} notifications at most."
+        ));
+    }
+    let reminders = if form.usual_notifications {
+        json!({ "useDefault": true })
+    } else {
+        let overrides: Vec<Value> = form
+            .notifications
+            .iter()
+            .map(|one| {
+                json!({
+                    "method": if one.email { "email" } else { "popup" },
+                    "minutes": one.minutes,
+                })
+            })
+            .collect();
+        json!({ "useDefault": false, "overrides": overrides })
     };
     // A meeting the event has stays as it is; a new one is asked of Google, which
     // needs a text of our choosing to tell a repeated request from a second one.
@@ -746,7 +759,17 @@ mod tests {
         form.repeat = REPEAT_WEEKLY;
         form.location = "Main street 1".into();
         form.color = 5;
-        form.reminder = 4;
+        form.usual_notifications = false;
+        form.notifications = vec![
+            Notification {
+                minutes: 10,
+                email: false,
+            },
+            Notification {
+                minutes: 1440,
+                email: true,
+            },
+        ];
         form.visibility = 2;
         form.busy = false;
         assert_eq!(
@@ -758,7 +781,9 @@ mod tests {
                 "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=TU"],
                 "location": "Main street 1",
                 "colorId": "5",
-                "reminders": {"useDefault": false, "overrides": [{"method": "popup", "minutes": 10}]},
+                "reminders": {"useDefault": false, "overrides": [
+                    {"method": "popup", "minutes": 10}, {"method": "email", "minutes": 1440}
+                ]},
                 "visibility": "private",
                 "transparency": "transparent",
             })
@@ -829,7 +854,17 @@ mod tests {
                 location: "Canteen".into(),
                 description: "Bring cake".into(),
                 color: 7,
-                reminder: REMINDER_CUSTOM,
+                usual_notifications: false,
+                notifications: vec![
+                    Notification {
+                        minutes: 30,
+                        email: true
+                    },
+                    Notification {
+                        minutes: 7,
+                        email: false
+                    },
+                ],
                 visibility: 2,
                 busy: false,
                 guests: String::new(),
@@ -895,7 +930,7 @@ mod tests {
             .0
         };
         assert_eq!(event(json!({})).repeat, REPEAT_NONE);
-        assert_eq!(event(json!({})).reminder, REMINDER_DEFAULT);
+        assert!(event(json!({})).usual_notifications);
         assert_eq!(event(json!({})).visibility, 0);
         assert!(event(json!({})).busy);
         let repeat = |rule: &str| event(json!({"recurrence": [rule]})).repeat;
@@ -908,19 +943,62 @@ mod tests {
             repeat("RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"),
             REPEAT_WEEKDAYS
         );
-        let reminder = |reminders: Value| event(json!({"reminders": reminders})).reminder;
-        assert_eq!(reminder(json!({"useDefault": false})), REMINDER_NONE);
+        // Its own notifications: none, or several, each on the screen or by e-mail.
+        let own = |reminders: Value| {
+            let form = event(json!({ "reminders": reminders }));
+            assert!(!form.usual_notifications);
+            form.notifications
+        };
+        assert_eq!(own(json!({"useDefault": false})), vec![]);
         assert_eq!(
-            reminder(
-                json!({"useDefault": false, "overrides": [{"method": "popup", "minutes": 30}]})
-            ),
-            6
+            own(json!({"useDefault": false, "overrides": [
+                {"method": "popup", "minutes": 30}, {"method": "email", "minutes": 45}
+            ]})),
+            vec![
+                Notification {
+                    minutes: 30,
+                    email: false
+                },
+                Notification {
+                    minutes: 45,
+                    email: true
+                }
+            ]
         );
+    }
+
+    #[test]
+    fn an_event_can_have_several_notifications_but_not_more_than_google_takes() {
+        let (start, end) = (timed("2026-11-17T11:00:00Z"), timed("2026-11-17T12:00:00Z"));
+        let mut form = new_form(start, end, zone());
+        // A new event has its calendar's usual ones, and says nothing about them.
+        assert!(form.usual_notifications);
+        let new = creation(fields(&form, &Kept::default(), zone()).unwrap());
+        assert!(new.get("reminders").is_none());
+
+        // None at all is said.
+        form.usual_notifications = false;
         assert_eq!(
-            reminder(
-                json!({"useDefault": false, "overrides": [{"method": "email", "minutes": 30}]})
-            ),
-            REMINDER_CUSTOM
+            fields(&form, &Kept::default(), zone()).unwrap()["reminders"],
+            json!({"useDefault": false, "overrides": []})
+        );
+
+        let one = |minutes| Notification {
+            minutes,
+            email: false,
+        };
+        form.notifications = vec![one(10), one(60), one(1440), one(2880), one(10080)];
+        assert_eq!(
+            fields(&form, &Kept::default(), zone()).unwrap()["reminders"]["overrides"]
+                .as_array()
+                .unwrap()
+                .len(),
+            5
+        );
+        form.notifications.push(one(5));
+        assert_eq!(
+            fields(&form, &Kept::default(), zone()),
+            Err("An event can have 5 notifications at most.".into())
         );
     }
 

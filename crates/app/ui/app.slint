@@ -35,6 +35,16 @@ export struct AllDayItem {
     text-color: color,
 }
 
+// A notification in the editor's list.
+export struct EditorNotice {
+    // Which of the offered times; the one after the last is `custom`.
+    choice: int,
+    // A time that is none of the offered ones, in words; empty if there is none.
+    custom: string,
+    custom-minutes: int,
+    email: bool,
+}
+
 // A guest in the editor's list.
 export struct EditorGuest {
     email: string,
@@ -164,7 +174,6 @@ export struct EditorForm {
     description: string,
     // 0 is the calendar's colour.
     color: int,
-    reminder: int,
     visibility: int,
     busy: bool,
     // The guests' e-mail addresses, separated by commas.
@@ -607,10 +616,19 @@ export component AppWindow inherits Window {
     in-out property <EditorForm> editor;
     in-out property <bool> editor-visible;
     in property <bool> editor-new;
-    // The event repeats, or reminds, in a way the lists do not offer: one more choice
-    // keeps that as it is.
+    // The event repeats in a way the list does not offer: one more choice keeps that
+    // as it is.
     in property <bool> editor-custom-repeat;
-    in property <bool> editor-custom-reminder;
+    // The event's notifications: those usual in its calendar, or its own ones, one
+    // line each (up to five). Rust keeps the list.
+    in property <bool> editor-usual-notices;
+    in property <[EditorNotice]> editor-notices;
+    // Adds one (to the usual ones of the calendar, given for a new event, if those
+    // were in force), removes one, sets one's time, goes back to the usual ones.
+    callback editor-notice-add(int);
+    callback editor-notice-remove(int);
+    callback editor-notice-set(int, int);
+    callback editor-notice-usual();
     in property <string> editor-calendar-name;
     in property <[string]> editor-calendars;
     // The calendar's colour, then Google's event colours.
@@ -3179,18 +3197,99 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    reminder-row := EditorRow {
-                        label: @tr("Reminder");
-                        Choice {
-                            // Scrolled so that the open list is in sight, and back
-                            // within the form when it closes.
-                            toggled => {
-                                editor-scroll.content-y = Math.max(Math.min(0px, editor-scroll.height - editor-form.preferred-height), Math.min(editor-scroll.content-y, editor-scroll.height - reminder-row.y - reminder-row.height - 8px));
+                    notice-row := EditorRow {
+                        label: @tr("Notifications");
+                        VerticalLayout {
+                            spacing: 2px;
+
+                            if root.editor-usual-notices: Text {
+                                height: 36px;
+                                text: @tr("The calendar's usual notifications");
+                                font-size: 14px;
+                                color: Theme.text;
+                                vertical-alignment: center;
                             }
-                            options: root.editor-custom-reminder ? [@tr("The calendar's usual reminders"), @tr("None"), @tr("When it starts"), @tr("5 minutes before"), @tr("10 minutes before"), @tr("15 minutes before"), @tr("30 minutes before"), @tr("1 hour before"), @tr("1 day before"), @tr("As it reminds now")] : [@tr("The calendar's usual reminders"), @tr("None"), @tr("When it starts"), @tr("5 minutes before"), @tr("10 minutes before"), @tr("15 minutes before"), @tr("30 minutes before"), @tr("1 hour before"), @tr("1 day before")];
-                            current: root.editor.reminder;
-                            chosen(i) => {
-                                root.editor.reminder = i;
+                            if !root.editor-usual-notices && root.editor-notices.length == 0: Text {
+                                height: 36px;
+                                text: @tr("None");
+                                font-size: 14px;
+                                color: Theme.text-dim;
+                                vertical-alignment: center;
+                            }
+                            for notice[i] in root.editor-notices: HorizontalLayout {
+                                spacing: 6px;
+
+                                Choice {
+                                    // Scrolled so that the open list is in sight, and
+                                    // back within the form when it closes.
+                                    toggled => {
+                                        editor-scroll.content-y = Math.max(Math.min(0px, editor-scroll.height - editor-form.preferred-height), Math.min(editor-scroll.content-y, editor-scroll.height - notice-row.y - notice-row.height - 8px));
+                                    }
+                                    options: notice.custom != "" ? [@tr("When it starts"), @tr("5 minutes before"), @tr("10 minutes before"), @tr("15 minutes before"), @tr("30 minutes before"), @tr("1 hour before"), @tr("2 hours before"), @tr("1 day before"), @tr("2 days before"), @tr("1 week before"), notice.custom] : [@tr("When it starts"), @tr("5 minutes before"), @tr("10 minutes before"), @tr("15 minutes before"), @tr("30 minutes before"), @tr("1 hour before"), @tr("2 hours before"), @tr("1 day before"), @tr("2 days before"), @tr("1 week before")];
+                                    current: notice.choice;
+                                    chosen(c) => {
+                                        root.editor-notice-set(i, c);
+                                    }
+                                }
+
+                                if notice.email: Text {
+                                    horizontal-stretch: 0;
+                                    height: 36px;
+                                    text: @tr("by e-mail");
+                                    font-size: 12px;
+                                    color: Theme.text-dim;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle {
+                                    horizontal-stretch: 0;
+                                    width: 28px;
+                                    height: 36px;
+                                    border-radius: 14px;
+                                    background: notice-remove.has-hover ? Theme.hover : transparent;
+                                    accessible-role: button;
+                                    accessible-label: "Remove notification \{i + 1}";
+                                    accessible-action-default => {
+                                        root.editor-notice-remove(i);
+                                    }
+
+                                    notice-remove := TouchArea {
+                                        clicked => {
+                                            root.editor-notice-remove(i);
+                                        }
+                                    }
+
+                                    Text {
+                                        text: "×";
+                                        font-size: 16px;
+                                        color: Theme.text-dim;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                alignment: start;
+                                spacing: 4px;
+
+                                if root.editor-notices.length < 5: TextButton {
+                                    text: @tr("Add notification");
+                                    height: 30px;
+                                    text-color: Theme.accent;
+                                    clicked => {
+                                        root.editor-notice-add(root.draft-calendar);
+                                        // The new line pushes this button down: keep it
+                                        // in sight.
+                                        editor-scroll.content-y = Math.max(Math.min(0px, editor-scroll.height - editor-form.preferred-height), Math.min(editor-scroll.content-y, editor-scroll.height - notice-row.y - notice-row.height - 8px));
+                                    }
+                                }
+                                if !root.editor-usual-notices: TextButton {
+                                    text: @tr("Use the calendar's usual");
+                                    height: 30px;
+                                    clicked => {
+                                        root.editor-notice-usual();
+                                    }
+                                }
                             }
                         }
                     }

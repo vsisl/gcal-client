@@ -29,6 +29,17 @@ pub struct CalendarListEntry {
     /// Set in incremental sync results when the calendar was removed from the list.
     #[serde(default)]
     pub deleted: bool,
+    /// The notifications events in this calendar get unless they say otherwise.
+    #[serde(default)]
+    pub default_reminders: Vec<Reminder>,
+}
+
+/// One notification before an event: how, and how many minutes ahead.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Reminder {
+    /// "popup" or "email".
+    pub method: Option<String>,
+    pub minutes: Option<i64>,
 }
 
 impl CalendarListEntry {

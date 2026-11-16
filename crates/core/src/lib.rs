@@ -9,5 +9,5 @@ pub mod week;
 
 pub use model::{
     Attachment, Attendee, CalendarListEntry, Event, EventDateTime, EventStatus, EventTime,
-    ResponseStatus,
+    Reminder, ResponseStatus,
 };
