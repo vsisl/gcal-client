@@ -15,6 +15,11 @@ def call(tool, **args):
     req = urllib.request.Request(f"http://127.0.0.1:{PORT}/mcp", data=body,
                                  headers={"Content-Type": "application/json"})
     return json.load(urllib.request.urlopen(req))["result"]
+def use(port, cache):
+    """Turns every helper to another running app: its test server and its cache.
+    For scripts that drive two apps (pair.py)."""
+    global PORT, dbpath
+    PORT, dbpath = port, cache
 def shot(name):
     for part in call("take_screenshot", windowHandle=W)["content"]:
         if part["type"] == "image":
