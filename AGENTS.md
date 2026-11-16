@@ -206,8 +206,10 @@ cache.db> <guest's cache.db>`). Both accounts must be test accounts of the owner
 must accept invitations from the other: in Google Calendar's settings on the web, "Add
 invitations to my calendar" set to "From everyone", or the other account known to it;
 otherwise Google keeps an invitation sent without e-mail out of the guest's calendar.
-Google passes a change on to the other account some seconds late, so the script
-refreshes every ten seconds while it waits.
+A change reaches the other account some seconds late, so the script refreshes every
+ten seconds while it waits. Before it writes anything it makes sure that each app works
+on the cache it was given; if a step fails after the event was created, it deletes the
+event again and ends with an error.
 
 Each script that needs a fixture uses it up or changes it: insert a fresh one before
 each. `ed.py … clean` deletes what the scripts left behind: every event on the month on
@@ -229,8 +231,9 @@ Rules for these runs:
   anything else in it is the owner's.
 - The Undo offer lasts ten seconds, so a script must not wait longer before pressing `z`.
 - Add a step to these scripts for every new kind of write.
-- No e-mail may leave a test: guests are made-up addresses (`@example.com`), and every
-  question about sending e-mails is unticked before it is confirmed, in clean-up too.
+- No e-mail may leave a test: every question about sending e-mails is unticked before
+  it is confirmed, in clean-up too. Guests are made-up addresses (`@example.com`); the
+  one exception is `pair.py`, whose guest is the owner's second test account.
 - The app opens on the view it was closed with; a script that needs a view picks it.
 
 Not covered by any test yet: Google failing or being slow, and the gestures the test
