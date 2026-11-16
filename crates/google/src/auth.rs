@@ -266,6 +266,7 @@ mod tests {
             auth: format!("{}/auth", server.uri()),
             token: format!("{}/token", server.uri()),
             calendar_api: server.uri(),
+            people_api: server.uri(),
         }
     }
 
@@ -328,6 +329,7 @@ mod tests {
             auth: "http://unused/auth".into(),
             token: "http://unused/token".into(),
             calendar_api: "http://unused".into(),
+            people_api: "http://unused".into(),
         };
         let pending = begin_login(&config, &endpoints, &["s"]).await.unwrap();
         let port = pending.listener.local_addr().unwrap().port();

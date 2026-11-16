@@ -53,6 +53,8 @@ pub struct Form {
     pub busy: bool,
     /// The guests' addresses, separated by commas, spaces or new lines.
     pub guests: String,
+    /// The addresses among them whose coming is optional.
+    pub optional: Vec<String>,
     /// Whether the event has a Google Meet video meeting.
     pub meet: bool,
     /// What the guests may do: change the event, invite others, see who else is
@@ -172,6 +174,12 @@ pub fn form_of(resource: &Value, start: EventTime, end: EventTime, zone: Tz) -> 
     let mut form = Form {
         meet: !kept.conference.is_null(),
         guests: guests.join(", "),
+        optional: kept
+            .attendees
+            .iter()
+            .filter(|guest| guest["optional"].as_bool() == Some(true))
+            .filter_map(|guest| guest["email"].as_str().map(str::to_owned))
+            .collect(),
         title: text("summary"),
         location: text("location"),
         description: plain_text(&text("description")),
@@ -337,14 +345,11 @@ fn request_id() -> String {
     )
 }
 
-/// The guests the form names, as Google's list of attendees. A guest the event had
-/// keeps its entry; a new one is its address alone. Fails with a sentence when
-/// something in the field is not an e-mail address.
-fn guest_list(form: &Form, kept: &Kept) -> Result<Vec<Value>, String> {
-    let same = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+/// The e-mail addresses in a text, separated by commas, semicolons, spaces or new
+/// lines, each once. Fails with a sentence when a part is not an address.
+pub fn addresses(text: &str) -> Result<Vec<&str>, String> {
     let mut addresses: Vec<&str> = Vec::new();
-    for address in form
-        .guests
+    for address in text
         .split([',', ';', ' ', '\n', '\t'])
         .filter(|part| !part.is_empty())
     {
@@ -352,10 +357,23 @@ fn guest_list(form: &Form, kept: &Kept) -> Result<Vec<Value>, String> {
         if name.is_empty() || !domain.contains('.') || domain.contains('@') {
             return Err(format!("“{address}” is not an e-mail address."));
         }
-        if !addresses.iter().any(|known| same(known, address)) {
+        if !addresses
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(address))
+        {
             addresses.push(address);
         }
     }
+    Ok(addresses)
+}
+
+/// The guests the form names, as Google's list of attendees. A guest the event had
+/// keeps its entry; a new one is its address alone. Fails with a sentence when
+/// something in the field is not an e-mail address.
+fn guest_list(form: &Form, kept: &Kept) -> Result<Vec<Value>, String> {
+    let same = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    let addresses = addresses(&form.guests)?;
+    let optional = |address: &str| form.optional.iter().any(|known| same(known, address));
     let named = |guest: &Value, address: &str| {
         guest["email"]
             .as_str()
@@ -373,9 +391,24 @@ fn guest_list(form: &Form, kept: &Kept) -> Result<Vec<Value>, String> {
         })
         .cloned()
         .collect();
+    // Whether a guest's coming is optional is the form's to say; an entry that says
+    // nothing about it and need not is left as it is.
+    for guest in &mut guests {
+        let Some(address) = guest["email"].as_str() else {
+            continue;
+        };
+        let (wanted, has) = (optional(address), guest["optional"].as_bool());
+        if has.unwrap_or(false) != wanted {
+            guest["optional"] = wanted.into();
+        }
+    }
     for address in &addresses {
         if !kept.attendees.iter().any(|guest| named(guest, address)) {
-            guests.push(json!({ "email": address }));
+            guests.push(if optional(address) {
+                json!({ "email": address, "optional": true })
+            } else {
+                json!({ "email": address })
+            });
         }
     }
     // The first guests of an event: the organiser joins them, as going.
@@ -800,6 +833,7 @@ mod tests {
                 visibility: 2,
                 busy: false,
                 guests: String::new(),
+                optional: Vec::new(),
                 meet: false,
                 may_modify: false,
                 may_invite: true,
@@ -1028,6 +1062,46 @@ mod tests {
         assert_eq!(
             fields(&form, &Kept::default(), zone()).unwrap()["attendees"],
             json!([{"email": "ann@x.org"}])
+        );
+    }
+
+    #[test]
+    fn a_guests_coming_can_be_optional() {
+        let (start, end) = (timed("2026-11-17T11:00:00Z"), timed("2026-11-17T12:00:00Z"));
+        // New guests: only the optional one says so.
+        let mut form = new_form(start, end, zone());
+        form.guests = "ann@x.org, bob@x.org".into();
+        form.optional = vec!["BOB@x.org".into()];
+        assert_eq!(
+            fields(&form, &Kept::default(), zone()).unwrap()["attendees"],
+            json!([{"email": "ann@x.org"}, {"email": "bob@x.org", "optional": true}])
+        );
+
+        // An existing event: the form shows who is optional; untouched, nothing is
+        // sent; a change touches that guest's entry alone and keeps the rest of it.
+        let resource = json!({
+            "summary": "Review",
+            "start": {"dateTime": "2026-11-17T11:00:00Z"},
+            "end": {"dateTime": "2026-11-17T12:00:00Z"},
+            "attendees": [
+                {"email": "ann@x.org", "responseStatus": "accepted", "comment": "ok"},
+                {"email": "bob@x.org", "optional": true, "responseStatus": "declined"},
+                {"email": "cy@x.org", "optional": false}
+            ]
+        });
+        let (opened, kept) = form_of(&resource, start, end, zone());
+        assert_eq!(opened.optional, vec!["bob@x.org".to_owned()]);
+        let before = fields(&opened, &kept, zone()).unwrap();
+        assert_eq!(before["attendees"], resource["attendees"]);
+        let mut edited = opened.clone();
+        edited.optional = vec!["ann@x.org".into()];
+        assert_eq!(
+            diff(&before, &fields(&edited, &kept, zone()).unwrap()),
+            json!({"attendees": [
+                {"email": "ann@x.org", "responseStatus": "accepted", "comment": "ok", "optional": true},
+                {"email": "bob@x.org", "optional": false, "responseStatus": "declined"},
+                {"email": "cy@x.org", "optional": false}
+            ]})
         );
     }
 

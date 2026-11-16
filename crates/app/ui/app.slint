@@ -35,6 +35,20 @@ export struct AllDayItem {
     text-color: color,
 }
 
+// A guest in the editor's list.
+export struct EditorGuest {
+    email: string,
+    // The guest's name, if one is known.
+    name: string,
+    optional: bool,
+}
+
+// Someone suggested as a guest while a name is typed.
+export struct Suggestion {
+    name: string,
+    email: string,
+}
+
 // A file attached to an event, opened in the browser.
 export struct Attachment {
     title: string,
@@ -258,6 +272,10 @@ component Field inherits Rectangle {
     callback edited(string);
     // Enter in a one-line box.
     callback accepted(string);
+    // Empties the box; its text no longer follows `value` once it was typed into.
+    public function clear() {
+        input.text = "";
+    }
 
     height: multiline ? 96px : 36px;
     border-radius: 4px;
@@ -599,6 +617,22 @@ export component AppWindow inherits Window {
     in property <[color]> editor-colors;
     // Why the form cannot be saved as it is.
     in property <string> editor-error;
+    // The guests of the event in the editor, one line each. The field above them
+    // holds what is being typed; Enter (or Save) adds it. Rust keeps the list.
+    in property <[EditorGuest]> editor-guests;
+    // Adds the addresses in the text; false (with editor-error set) if one is none.
+    callback editor-guest-add(string) -> bool;
+    callback editor-guest-remove(int);
+    // People matching what is being typed in the guests field, offered under it. The
+    // worker fills them in for the request numbered guest-suggest-serial and no other.
+    in-out property <[Suggestion]> guest-suggestions;
+    in-out property <int> guest-suggest-serial;
+    // Why there are none, when that is worth saying.
+    in-out property <string> guest-suggest-problem;
+    // The field's text changed (with the calendar chosen for a new event).
+    callback editor-guest-typed(string, int);
+    callback editor-guest-pick(int);
+    callback editor-guest-optional(int);
     callback editor-requested(int);
     callback editor-from-draft(string, int);
     callback editor-save(EditorForm, int);
@@ -2869,11 +2903,145 @@ export component AppWindow inherits Window {
 
                     EditorRow {
                         label: @tr("Guests");
-                        Field {
-                            hint: @tr("ann@example.com, bob@example.com");
-                            value: root.editor.guests;
-                            edited(text) => {
-                                root.editor.guests = text;
+                        VerticalLayout {
+                            spacing: 2px;
+
+                            guest-field := Field {
+                                hint: @tr("ann@example.com, bob@example.com");
+                                value: root.editor.guests;
+                                edited(text) => {
+                                    root.editor.guests = text;
+                                    root.editor-guest-typed(text, root.draft-calendar);
+                                }
+                                accepted(text) => {
+                                    if (root.editor-guest-add(text)) {
+                                        guest-field.clear();
+                                        root.editor.guests = "";
+                                    }
+                                }
+                            }
+
+                            for person[i] in root.guest-suggestions: Rectangle {
+                                height: 30px;
+                                border-radius: 4px;
+                                background: person-touch.has-hover ? Theme.selected : Theme.hover;
+                                accessible-role: list-item;
+                                accessible-label: "Suggestion: \{person.email}";
+                                accessible-action-default => {
+                                    root.editor-guest-pick(i);
+                                    guest-field.clear();
+                                    root.editor.guests = "";
+                                }
+
+                                person-touch := TouchArea {
+                                    clicked => {
+                                        root.editor-guest-pick(i);
+                                        guest-field.clear();
+                                        root.editor.guests = "";
+                                    }
+                                }
+
+                                Text {
+                                    x: 10px;
+                                    width: parent.width - 20px;
+                                    height: parent.height;
+                                    text: person.name != "" ? "\{person.name} · \{person.email}" : person.email;
+                                    font-size: 13px;
+                                    color: Theme.text;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                            if root.guest-suggest-problem != "": Text {
+                                text: root.guest-suggest-problem;
+                                font-size: 12px;
+                                color: Theme.text-dim;
+                                wrap: word-wrap;
+                            }
+
+                            for guest[i] in root.editor-guests: Rectangle {
+                                height: 30px;
+                                border-radius: 4px;
+                                accessible-role: list-item;
+                                accessible-label: guest.optional ? "Guest: \{guest.email}, optional" : "Guest: \{guest.email}";
+
+                                Text {
+                                    x: 10px;
+                                    width: parent.width - 150px;
+                                    height: parent.height;
+                                    text: guest.name != "" && guest.name != guest.email ? "\{guest.name} · \{guest.email}" : guest.email;
+                                    font-size: 13px;
+                                    color: Theme.text;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+
+                                Rectangle {
+                                    x: parent.width - 136px;
+                                    width: 100px;
+                                    height: parent.height;
+                                    border-radius: 4px;
+                                    background: optional-touch.has-hover ? Theme.hover : transparent;
+                                    accessible-role: checkbox;
+                                    accessible-label: "Optional: \{guest.email}";
+                                    accessible-checked: guest.optional;
+                                    accessible-action-default => {
+                                        root.editor-guest-optional(i);
+                                    }
+
+                                    optional-touch := TouchArea {
+                                        clicked => {
+                                            root.editor-guest-optional(i);
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        x: 6px;
+                                        y: (parent.height - self.height) / 2;
+                                        width: 14px;
+                                        height: 14px;
+                                        border-radius: 3px;
+                                        border-width: 2px;
+                                        border-color: guest.optional ? Theme.accent : Theme.text-dim;
+                                        background: guest.optional ? Theme.accent : transparent;
+                                    }
+
+                                    Text {
+                                        x: 28px;
+                                        height: parent.height;
+                                        text: @tr("Optional");
+                                        font-size: 12px;
+                                        color: Theme.text-dim;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                Rectangle {
+                                    x: parent.width - 30px;
+                                    width: 28px;
+                                    height: parent.height;
+                                    border-radius: 14px;
+                                    background: remove-touch.has-hover ? Theme.hover : transparent;
+                                    accessible-role: button;
+                                    accessible-label: "Remove \{guest.email}";
+                                    accessible-action-default => {
+                                        root.editor-guest-remove(i);
+                                    }
+
+                                    remove-touch := TouchArea {
+                                        clicked => {
+                                            root.editor-guest-remove(i);
+                                        }
+                                    }
+
+                                    Text {
+                                        text: "×";
+                                        font-size: 16px;
+                                        color: Theme.text-dim;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
                             }
                         }
                     }

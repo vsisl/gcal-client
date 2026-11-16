@@ -11,8 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use gcal_core::{Event, EventTime};
 use gcal_google::{
-    ApiError, AuthError, ClientConfig, Endpoints, GoogleClient, HttpClient, SCOPE_CALENDAR,
-    TokenSet,
+    ApiError, AuthError, ClientConfig, Endpoints, GoogleClient, HttpClient, TokenSet,
 };
 use gcal_store::{AccountId, Store};
 use gcal_sync::{Progress, SyncError, SyncReport};
@@ -39,6 +38,13 @@ pub enum Command {
     AddAccount,
     SyncAll,
     RemoveAccount(String),
+    /// Looks up people to suggest as guests while a name is typed in the editor. The
+    /// answer goes to the window only if `serial` is still the newest request there.
+    SuggestGuests {
+        account: AccountId,
+        query: String,
+        serial: i32,
+    },
     /// Deletes an event, or part of a series, at Google and then from the cache. With
     /// `notify`, Google tells the guests.
     DeleteEvent {
@@ -177,6 +183,9 @@ struct Activity {
     error: Option<String>,
 }
 
+/// An account and its connection to Google, kept between two suggestions.
+type Suggesting = (AccountId, Rc<GoogleClient>);
+
 #[derive(Clone)]
 struct Worker {
     ui: Weak<AppWindow>,
@@ -191,6 +200,10 @@ struct Worker {
     notify: Rc<Cell<bool>>,
     /// Held while accounts are synced or removed, so the two never interleave.
     cache: Rc<Mutex<()>>,
+    /// The account suggestions were last asked for, with its connection to Google:
+    /// a suggestion is asked for with every few letters typed, and a new connection
+    /// would fetch a new access token each time.
+    suggesting: Rc<RefCell<Option<Suggesting>>>,
 }
 
 /// Counts one activity for as long as it lives, also when its task is cancelled.
@@ -231,6 +244,7 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
         sign_in_attempt: Rc::new(watch::Sender::new(0)),
         notify: Rc::default(),
         cache: Rc::default(),
+        suggesting: Rc::default(),
     };
     while let Some(command) = commands.recv().await {
         // Each command runs as its own task: a sign-in waiting on the browser must not
@@ -239,7 +253,7 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
         tokio::task::spawn_local(async move {
             // A sync tells the window itself, and only when it changed something: every
             // reload closes an open details card and forgets the series' occurrences.
-            let reload = !matches!(command, Command::SyncAll);
+            let reload = !matches!(command, Command::SyncAll | Command::SuggestGuests { .. });
             // A change the user asked for and did not get is said in a dialog, not in
             // the status line, where it is easily missed.
             let failure = match command {
@@ -255,13 +269,24 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
             // otherwise put back the older version of an event just changed. The window
             // relies on the order too, to match each answer with its undo.
             let _cache = match command {
-                Command::AddAccount | Command::SyncAll | Command::RemoveAccount(_) => None,
+                Command::AddAccount
+                | Command::SyncAll
+                | Command::RemoveAccount(_)
+                | Command::SuggestGuests { .. } => None,
                 _ => Some(worker.cache.lock().await),
             };
             let result = match command {
                 Command::AddAccount => worker.add_account().await,
                 Command::SyncAll => worker.sync_all().await,
                 Command::RemoveAccount(email) => worker.remove_account(&email).await,
+                Command::SuggestGuests {
+                    account,
+                    query,
+                    serial,
+                } => {
+                    worker.suggest_guests(account, &query, serial).await;
+                    Ok(())
+                }
                 Command::DeleteEvent {
                     account,
                     calendar_id,
@@ -430,6 +455,50 @@ impl Worker {
         )
     }
 
+    /// Looks up people matching `query` and hands them to the editor, unless the user
+    /// has typed on in the meantime. A failure is said in a line under the field, not
+    /// as an error: the event can be saved without suggestions.
+    async fn suggest_guests(&self, account: AccountId, query: &str, serial: i32) {
+        let found = async {
+            let known = self.suggesting.borrow().clone();
+            let client = match known {
+                Some((of, client)) if of == account => client,
+                _ => {
+                    let client = Rc::new(self.account_client(&open_store()?, account).await?);
+                    self.suggesting.replace(Some((account, client.clone())));
+                    client
+                }
+            };
+            Ok::<_, anyhow::Error>(client.search_people(query).await?)
+        }
+        .await;
+        let (people, problem) = match found {
+            Ok(people) => (people, String::new()),
+            Err(error) => (Vec::new(), suggestion_problem(&error)),
+        };
+        let _ = self.ui.upgrade_in_event_loop(move |ui| {
+            if ui.get_guest_suggest_serial() != serial {
+                return;
+            }
+            let rows: Vec<crate::gui::Suggestion> = people
+                .into_iter()
+                .take(8)
+                .map(|person| crate::gui::Suggestion {
+                    // A name is one line of text, whatever was put into it.
+                    name: person
+                        .name
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .collect::<String>()
+                        .into(),
+                    email: person.email.into(),
+                })
+                .collect();
+            ui.set_guest_suggestions(slint::ModelRc::from(Rc::new(slint::VecModel::from(rows))));
+            ui.set_guest_suggest_problem(problem.into());
+        });
+    }
+
     async fn add_account(&self) -> Result<()> {
         self.clear_error();
         let mut attempt = 0;
@@ -477,7 +546,12 @@ impl Worker {
         let endpoints = Endpoints::default();
         let vault = Vault::open().await?;
 
-        let pending = gcal_google::begin_login(&config, &endpoints, &[SCOPE_CALENDAR]).await?;
+        let pending = gcal_google::begin_login(
+            &config,
+            &endpoints,
+            &gcal_google::scopes(crate::try_people()),
+        )
+        .await?;
         let _waiting = self.start(|activity| &mut activity.waiting_for_browser);
         open::that_detached(&pending.auth_url).context("cannot open your browser")?;
         let finish = pending.finish(&self.http, &config, &endpoints);
@@ -863,6 +937,21 @@ fn no_connection(error: &SyncError) -> bool {
         _ => return false,
     };
     network.is_connect() || network.is_timeout() || network.is_request()
+}
+
+/// What to say under the guests field when people could not be looked up. Nothing
+/// when Google cannot be reached: the banner says that already.
+fn suggestion_problem(error: &anyhow::Error) -> String {
+    match error.downcast_ref::<ApiError>() {
+        Some(ApiError::Status { status: 403, .. }) => {
+            "No suggestions: this account has not allowed the app to read its contacts. \
+             Remove the account and add it again; if that does not help, the People API \
+             is not enabled for the sign-in key (see README)."
+                .into()
+        }
+        Some(ApiError::Http(_) | ApiError::Auth(AuthError::Http(_))) => String::new(),
+        _ => format!("No suggestions: {}", sentence(&format!("{error:#}"))),
+    }
 }
 
 /// Whether an event still has, in each field named by `expected`, the value given

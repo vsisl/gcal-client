@@ -972,6 +972,7 @@ fn from_window(form: &EditorForm) -> Form {
         visibility: form.visibility.max(0) as usize,
         busy: form.busy,
         guests: form.guests.to_string(),
+        optional: Vec::new(),
         meet: form.meet,
         may_modify: form.may_modify,
         may_invite: form.may_invite,
@@ -1219,6 +1220,8 @@ struct View {
     generation: Cell<i32>,
     /// The event the editor is open for.
     editing: RefCell<Option<Editing>>,
+    /// The guests of the event in the editor, as the window lists them.
+    editor_guests: Rc<VecModel<EditorGuest>>,
     /// Hides the message about the last change after a while.
     toast_timer: Timer,
     commands: UnboundedSender<Command>,
@@ -2152,7 +2155,40 @@ impl View {
         ui.set_editor_custom_repeat(form.repeat == editor::REPEAT_CUSTOM);
         ui.set_editor_custom_reminder(form.reminder == editor::REMINDER_CUSTOM);
         ui.set_editor_error(SharedString::new());
-        ui.set_editor(to_window(&form));
+        // The guests go into the list, each on its line, with the name the event has
+        // for them; the field is for adding. A text that cannot be read as addresses
+        // (it never got past "Save") stays in the field as it is.
+        let mut window = to_window(&form);
+        let rows = match editor::addresses(&form.guests) {
+            Ok(addresses) => {
+                window.guests = SharedString::new();
+                addresses
+                    .into_iter()
+                    .map(|address| EditorGuest {
+                        email: address.into(),
+                        name: kept
+                            .attendees
+                            .iter()
+                            .find(|guest| {
+                                guest["email"]
+                                    .as_str()
+                                    .is_some_and(|known| known.eq_ignore_ascii_case(address))
+                            })
+                            .and_then(|guest| guest["displayName"].as_str())
+                            .unwrap_or("")
+                            .into(),
+                        optional: form
+                            .optional
+                            .iter()
+                            .any(|known| known.eq_ignore_ascii_case(address)),
+                    })
+                    .collect()
+            }
+            Err(_) => Vec::new(),
+        };
+        self.editor_guests.set_vec(rows);
+        self.clear_suggestions(ui);
+        ui.set_editor(window);
         self.editing.replace(Some(Editing {
             target,
             opened: form,
@@ -2162,6 +2198,120 @@ impl View {
         }));
         ui.set_detail_visible(false);
         ui.set_editor_visible(true);
+    }
+
+    /// The editor's form as the window has it: its fields, and the guests of the list
+    /// followed by whatever is still in the field for adding them.
+    fn form_from(&self, window: &EditorForm) -> Form {
+        let mut form = from_window(window);
+        let rows: Vec<EditorGuest> = self.editor_guests.iter().collect();
+        form.optional = rows
+            .iter()
+            .filter(|guest| guest.optional)
+            .map(|guest| guest.email.to_string())
+            .collect();
+        let mut guests: Vec<String> = rows.iter().map(|guest| guest.email.to_string()).collect();
+        if !form.guests.trim().is_empty() {
+            guests.push(form.guests.clone());
+        }
+        form.guests = guests.join(", ");
+        form
+    }
+
+    /// Adds the addresses in `text` to the editor's list of guests (Enter in the
+    /// field). A text that is no address stands for the first person suggested for
+    /// it; without one, nothing is added and the editor says so.
+    fn add_guests(&self, text: &str) -> bool {
+        let Some(ui) = self.ui.upgrade() else {
+            return false;
+        };
+        match editor::addresses(text) {
+            Ok(addresses) => {
+                for address in addresses {
+                    self.add_guest(address, "");
+                }
+                ui.set_editor_error(SharedString::new());
+                self.clear_suggestions(&ui);
+                true
+            }
+            Err(problem) => match ui.get_guest_suggestions().row_data(0) {
+                Some(first) => {
+                    self.add_guest(&first.email, &first.name);
+                    ui.set_editor_error(SharedString::new());
+                    self.clear_suggestions(&ui);
+                    true
+                }
+                None => {
+                    ui.set_editor_error(problem.into());
+                    false
+                }
+            },
+        }
+    }
+
+    /// Takes the suggestions away, and makes any answer still on its way too late.
+    fn clear_suggestions(&self, ui: &AppWindow) {
+        ui.set_guest_suggest_serial(ui.get_guest_suggest_serial().wrapping_add(1));
+        ui.set_guest_suggestions(ModelRc::default());
+        ui.set_guest_suggest_problem(SharedString::new());
+    }
+
+    /// The guests field was typed into: asks for people matching the word being
+    /// typed, once it has two letters. `calendar` is the one chosen for a new event.
+    fn suggest_guests(&self, text: &str, calendar: usize) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        self.clear_suggestions(&ui);
+        if !crate::try_people() {
+            return;
+        }
+        let word = text
+            .rsplit([',', ';', ' ', '\n', '\t'])
+            .next()
+            .unwrap_or("");
+        if word.chars().count() < 2 {
+            return;
+        }
+        let account = match self.editing.borrow().as_ref().map(|e| e.target.clone()) {
+            Some(Some(target)) => Some(target.account),
+            Some(None) => self
+                .draft
+                .borrow()
+                .as_ref()
+                .and_then(|draft| draft.calendars.get(calendar))
+                .map(|(account, _, _)| *account),
+            None => None,
+        };
+        if let Some(account) = account {
+            let _ = self.commands.send(Command::SuggestGuests {
+                account,
+                query: word.to_owned(),
+                serial: ui.get_guest_suggest_serial(),
+            });
+        }
+    }
+
+    /// A suggested person was chosen: joins the guests, by name.
+    fn pick_suggestion(&self, row: usize) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        if let Some(person) = ui.get_guest_suggestions().row_data(row) {
+            self.add_guest(&person.email, &person.name);
+            ui.set_editor_error(SharedString::new());
+        }
+        self.clear_suggestions(&ui);
+    }
+
+    fn add_guest(&self, address: &str, name: &str) {
+        let known = self
+            .editor_guests
+            .iter()
+            .any(|guest| guest.email.eq_ignore_ascii_case(address));
+        if !known {
+            self.editor_guests.push(EditorGuest {
+                email: address.into(),
+                name: name.into(),
+                optional: false,
+            });
+        }
     }
 
     /// "Save" in the editor: checks the form and sends what changed. For a repeating
@@ -2648,6 +2798,7 @@ pub fn run() -> Result<()> {
         undo: RefCell::default(),
         asked: RefCell::default(),
         editing: RefCell::default(),
+        editor_guests: Rc::new(VecModel::default()),
         pending: RefCell::default(),
         generation: Cell::new(0),
         toast_timer: Timer::default(),
@@ -2836,7 +2987,37 @@ pub fn run() -> Result<()> {
     });
     ui.on_editor_save({
         let view = view.clone();
-        move |form, calendar| view.save_editor(from_window(&form), calendar as usize)
+        move |form, calendar| view.save_editor(view.form_from(&form), calendar as usize)
+    });
+    ui.set_editor_guests(ModelRc::from(view.editor_guests.clone()));
+    ui.on_editor_guest_add({
+        let view = view.clone();
+        move |text| view.add_guests(&text)
+    });
+    ui.on_editor_guest_typed({
+        let view = view.clone();
+        move |text, calendar| view.suggest_guests(&text, calendar.max(0) as usize)
+    });
+    ui.on_editor_guest_pick({
+        let view = view.clone();
+        move |row| view.pick_suggestion(row.max(0) as usize)
+    });
+    ui.on_editor_guest_remove({
+        let view = view.clone();
+        move |row| {
+            if (row as usize) < view.editor_guests.row_count() {
+                view.editor_guests.remove(row as usize);
+            }
+        }
+    });
+    ui.on_editor_guest_optional({
+        let view = view.clone();
+        move |row| {
+            if let Some(mut guest) = view.editor_guests.row_data(row as usize) {
+                guest.optional = !guest.optional;
+                view.editor_guests.set_row_data(row as usize, guest);
+            }
+        }
     });
     ui.on_edit_scope_cancelled({
         let view = view.clone();

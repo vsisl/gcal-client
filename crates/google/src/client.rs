@@ -32,6 +32,39 @@ pub enum ApiError {
     Http(#[from] reqwest::Error),
 }
 
+/// Someone who can be invited: a contact of the account, someone it has written to, or
+/// a colleague from its organisation's directory.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Person {
+    /// The person's name, or empty if Google has none.
+    pub name: String,
+    pub email: String,
+}
+
+/// The people in one answer of the People API's searches.
+fn people_in(answer: &Value) -> Vec<Person> {
+    // Contact searches wrap each person in a result; the directory lists them bare.
+    let wrapped = answer["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|result| &result["person"]);
+    let bare = answer["people"].as_array().into_iter().flatten();
+    let mut people = Vec::new();
+    for person in wrapped.chain(bare) {
+        let name = person["names"][0]["displayName"].as_str().unwrap_or("");
+        for address in person["emailAddresses"].as_array().into_iter().flatten() {
+            if let Some(email) = address["value"].as_str() {
+                people.push(Person {
+                    name: name.to_owned(),
+                    email: email.to_owned(),
+                });
+            }
+        }
+    }
+    people
+}
+
 /// Every item of a collection, plus the token to ask only for changes next time.
 #[derive(Debug)]
 pub struct Listing {
@@ -254,6 +287,64 @@ impl GoogleClient {
         Ok(listing.items)
     }
 
+    /// People whose name or address starts with `query`, for suggesting guests: from
+    /// the account's contacts, the people it has written to, and its organisation's
+    /// directory, in that order, each address once. An empty `query` finds nobody; it
+    /// only tells Google to get its search ready, which Google asks for before the
+    /// first search.
+    ///
+    /// A source that cannot be asked (an ordinary account has no directory) is left
+    /// out. Only if none can be asked is that an error: the account was signed in
+    /// without this permission, or the People API is not enabled for the sign-in key.
+    pub async fn search_people(&self, query: &str) -> Result<Vec<Person>, ApiError> {
+        let common = [
+            ("query", query),
+            ("readMask", "names,emailAddresses"),
+            ("pageSize", "10"),
+        ];
+        let directory = [
+            ("query", query),
+            ("readMask", "names,emailAddresses"),
+            ("pageSize", "10"),
+            ("sources", "DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE"),
+        ];
+        let searches: [(&str, &[(&str, &str)]); 3] = [
+            ("people:searchContacts", &common),
+            ("otherContacts:search", &common),
+            ("people:searchDirectoryPeople", &directory),
+        ];
+        let mut people: Vec<Person> = Vec::new();
+        let (mut failure, mut answered) = (None, false);
+        for (path, parameters) in searches {
+            // The directory has no "get ready" request.
+            if query.is_empty() && path.ends_with("DirectoryPeople") {
+                continue;
+            }
+            let api = &self.endpoints.people_api;
+            let answer = self
+                .send_to(api, Method::GET, &[path], parameters, None, None)
+                .await;
+            match answer {
+                Ok(response) => {
+                    answered = true;
+                    for person in people_in(&response.json::<Value>().await?) {
+                        let known = people
+                            .iter()
+                            .any(|other| other.email.eq_ignore_ascii_case(&person.email));
+                        if !known {
+                            people.push(person);
+                        }
+                    }
+                }
+                Err(error) => failure = failure.or(Some(error)),
+            }
+        }
+        match failure {
+            Some(error) if !answered => Err(error),
+            _ => Ok(people),
+        }
+    }
+
     async fn get<T: serde::de::DeserializeOwned>(
         &self,
         path: &[&str],
@@ -278,8 +369,21 @@ impl GoogleClient {
         body: Option<&Value>,
         if_match: Option<&str>,
     ) -> Result<reqwest::Response, ApiError> {
-        let mut url =
-            Url::parse(&self.endpoints.calendar_api).expect("the API address must be a valid URL");
+        let api = &self.endpoints.calendar_api;
+        self.send_to(api, method, path, query, body, if_match).await
+    }
+
+    /// Sends one request to one of Google's APIs, as the signed-in account.
+    async fn send_to(
+        &self,
+        api: &str,
+        method: Method,
+        path: &[&str],
+        query: &[(&str, &str)],
+        body: Option<&Value>,
+        if_match: Option<&str>,
+    ) -> Result<reqwest::Response, ApiError> {
+        let mut url = Url::parse(api).expect("the API address must be a valid URL");
         // Calendar IDs contain characters such as `@` and `#`; pushing segments encodes them.
         url.path_segments_mut()
             .expect("the API address must be a base URL")
@@ -394,6 +498,7 @@ mod tests {
                 auth: format!("{}/auth", server.uri()),
                 token: format!("{}/token", server.uri()),
                 calendar_api: server.uri(),
+                people_api: format!("{}/people-api", server.uri()),
             },
             "refresh".into(),
         )
@@ -438,6 +543,68 @@ mod tests {
             .collect();
         assert_eq!(ids, ["a", "b"]);
         assert_eq!(listing.sync_token.as_deref(), Some("sync-1"));
+    }
+
+    #[tokio::test]
+    async fn people_are_searched_in_contacts_other_contacts_and_the_directory() {
+        let server = MockServer::start().await;
+        let person = |name: &str, emails: &[&str]| {
+            json!({
+                "names": [{"displayName": name}],
+                "emailAddresses": emails.iter().map(|e| json!({"value": e})).collect::<Vec<_>>()
+            })
+        };
+        Mock::given(method("GET"))
+            .and(path("/people-api/people:searchContacts"))
+            .and(query_param("query", "an"))
+            .and(query_param("readMask", "names,emailAddresses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{"person": person("Ann Lee", &["ann@x.org", "ann@home.example"])}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/people-api/otherContacts:search"))
+            .and(query_param("query", "an"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    {"person": person("A. Lee", &["ANN@x.org"])},
+                    {"person": {"emailAddresses": [{"value": "andy@y.org"}]}}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        // An ordinary account has no directory: that search is refused, and left out.
+        Mock::given(method("GET"))
+            .and(path("/people-api/people:searchDirectoryPeople"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let found = client(&server).await.search_people("an").await.unwrap();
+        let listed: Vec<(&str, &str)> = found
+            .iter()
+            .map(|p| (p.name.as_str(), p.email.as_str()))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("Ann Lee", "ann@x.org"),
+                ("Ann Lee", "ann@home.example"),
+                ("", "andy@y.org")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_search_no_source_answers_is_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("insufficient scopes"))
+            .mount(&server)
+            .await;
+        let result = client(&server).await.search_people("an").await;
+        assert!(matches!(result, Err(ApiError::Status { status: 403, .. })));
     }
 
     #[tokio::test]

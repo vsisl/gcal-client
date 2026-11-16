@@ -11,7 +11,7 @@ mod worker;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use gcal_google::{ClientConfig, Endpoints, GoogleClient, HttpClient, SCOPE_CALENDAR};
+use gcal_google::{ClientConfig, Endpoints, GoogleClient, HttpClient};
 use gcal_store::Store;
 use vault::Vault;
 
@@ -51,7 +51,12 @@ async fn login() -> Result<()> {
     let http = HttpClient::new();
     let vault = Vault::open().await?;
 
-    let pending = gcal_google::begin_login(&config, &endpoints, &[SCOPE_CALENDAR]).await?;
+    let pending = gcal_google::begin_login(
+        &config,
+        &endpoints,
+        &gcal_google::scopes(crate::try_people()),
+    )
+    .await?;
     println!(
         "Opening your browser to sign in. If nothing opens, visit:\n\n{}\n",
         pending.auth_url
@@ -232,6 +237,13 @@ async fn patch(
         .await?;
     println!("{}", serde_json::to_string_pretty(&now)?);
     Ok(())
+}
+
+/// Whether this run asks, at sign-in, for permission to read contacts, and suggests
+/// guests from them. Off unless the app is started with GCAL_CLIENT_TRY_PEOPLE=1:
+/// asking every user for that permission is the owner's decision, still open.
+pub fn try_people() -> bool {
+    std::env::var("GCAL_CLIENT_TRY_PEOPLE").is_ok_and(|value| value == "1")
 }
 
 fn main() -> Result<()> {
