@@ -57,8 +57,11 @@ jobs:
           # The runner has no FUSE to mount an AppImage with: the tool unpacks itself.
           printf '#!/bin/sh\nexec "%s/appimagetool" --appimage-extract-and-run "$@"\n' "$PWD" | sudo tee /usr/local/bin/appimagetool > /dev/null
           sudo chmod +x /usr/local/bin/appimagetool
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # The toolchain rust-toolchain.toml names, by the runner's own rustup, and no
+      # cache: what is published is built from a clean state, and by nothing but
+      # GitHub's own actions and the tool checked above.
+      - name: Install the Rust toolchain
+        run: rustup show
       - run: cargo test --workspace
       - run: cargo build --release -p gcal-client
       - name: Pack the AppImage
