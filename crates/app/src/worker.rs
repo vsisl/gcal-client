@@ -1086,7 +1086,15 @@ impl Worker {
             Err(other) => return Err(other.into()),
         }
         drop(saving);
-        let _ = self.sync_accounts().await;
+        // Done at Google; what is left is fetching the list again. If that fails, the
+        // sidebar still shows the old list, which must not pass for the outcome.
+        if let Err(error) = self.sync_accounts().await {
+            let done = if add { "added" } else { "removed" };
+            self.activity.borrow_mut().error = Some(format!(
+                "The calendar was {done} at Google, but the list could not be fetched \
+                 again ({error:#}). Choose Refresh to try again."
+            ));
+        }
         Ok(())
     }
 

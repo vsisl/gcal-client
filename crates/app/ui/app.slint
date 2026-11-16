@@ -870,6 +870,12 @@ export component AppWindow inherits Window {
     // Something the user must read before going on (a change that was refused, say).
     // Shown as a dialog until dismissed; empty when there is none.
     in-out property <string> notice;
+    changed notice => {
+        // A field of a card under it must not go on taking what is typed.
+        if (root.notice != "") {
+            keys.focus();
+        }
+    }
 
     function show-detail(instance: int, x: length, y: length) {
         detail-instance = instance;
@@ -3523,51 +3529,6 @@ export component AppWindow inherits Window {
             }
         }
 
-        // A message that must be read: dims the window and waits for "OK".
-        if root.notice != "": Rectangle {
-            background: #00000066;
-            TouchArea { }
-        }
-        if root.notice != "": Rectangle {
-            width: Math.min(440px, root.width - 24px);
-            height: Math.min(notice-box.preferred-height, root.height - 24px);
-            background: Theme.card;
-            border-radius: 12px;
-            border-width: 1px;
-            border-color: Theme.line;
-            drop-shadow-blur: 24px;
-            drop-shadow-offset-y: 6px;
-            drop-shadow-color: #00000040;
-            clip: true;
-            accessible-role: groupbox;
-            accessible-label: root.notice;
-
-            notice-box := VerticalLayout {
-                padding: 24px;
-                padding-bottom: 12px;
-                spacing: 16px;
-
-                Text {
-                    text: root.notice;
-                    font-size: 14px;
-                    color: Theme.text;
-                    wrap: word-wrap;
-                }
-
-                HorizontalLayout {
-                    alignment: end;
-                    TextButton {
-                        text: @tr("OK");
-                        height: 32px;
-                        text-color: Theme.accent;
-                        clicked => {
-                            root.notice = "";
-                        }
-                    }
-                }
-            }
-        }
-
         // Go to date.
         if root.goto-visible: Rectangle {
             background: #00000066;
@@ -4087,6 +4048,54 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+            }
+        }
+
+        // A message that must be read: dims the window and waits for "OK".
+        // Above the cards that are typed into (go to date, add a calendar, settings): a
+        // change can fail while one of them is open, and its message must not lie under
+        // the card, out of reach.
+        if root.notice != "": Rectangle {
+            background: #00000066;
+            TouchArea { }
+        }
+        if root.notice != "": Rectangle {
+            width: Math.min(440px, root.width - 24px);
+            height: Math.min(notice-box.preferred-height, root.height - 24px);
+            background: Theme.card;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.line;
+            drop-shadow-blur: 24px;
+            drop-shadow-offset-y: 6px;
+            drop-shadow-color: #00000040;
+            clip: true;
+            accessible-role: groupbox;
+            accessible-label: root.notice;
+
+            notice-box := VerticalLayout {
+                padding: 24px;
+                padding-bottom: 12px;
+                spacing: 16px;
+
+                Text {
+                    text: root.notice;
+                    font-size: 14px;
+                    color: Theme.text;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    TextButton {
+                        text: @tr("OK");
+                        height: 32px;
+                        text-color: Theme.accent;
+                        clicked => {
+                            root.notice = "";
+                        }
+                    }
+                }
             }
         }
 

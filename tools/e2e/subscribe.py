@@ -48,11 +48,12 @@ def add(what):
 (email,), = rows("select email from accounts")
 ok = True
 if calendar(PUBLIC):
-    print("the calendar is on the list already (an earlier run failed?): only removing it")
-else:
-    add(PUBLIC)
-    ok &= wait("added: the calendar is in the cache", lambda: calendar(PUBLIC) is not None, 60)
-    ok &= wait("its events came with it", lambda: its_events(PUBLIC) > 0, 60)
+    # Whoever put it there, it was not this run: the list is left as it was found.
+    sys.exit("the test account already has the holiday calendar on its list; "
+             "nothing was done. Take it off by hand if an earlier run left it.")
+add(PUBLIC)
+ok &= wait("added: the calendar is in the cache", lambda: calendar(PUBLIC) is not None, 60)
+ok &= wait("its events came with it", lambda: its_events(PUBLIC) > 0, 60)
 name = (calendar(PUBLIC) or {}).get("summaryOverride") or (calendar(PUBLIC) or {}).get("summary", "")
 ok &= wait("it is in the sidebar, ticked or not", lambda: len(by_label("Checkbox", name)) == 1)
 shot("subscribed")
