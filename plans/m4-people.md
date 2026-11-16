@@ -9,8 +9,10 @@ attachment links.
 1. **Guests in the details card**: names, answers, organiser, optional; "Join the video
    meeting". (`tools/e2e/rsvp.py`)
 2. **Answer an invitation**: Yes / No / Maybe, with undo, in the account's own calendar
-   only. For an occurrence of a series that was not changed on its own, the answer is
-   for the whole series, and the card says so.
+   only. For an event of a series it asks "this event / all events"
+   (`tools/e2e/rsvp_series.py`); an event already answered or changed on its own is
+   answered without the question. Google gives the web a third choice, "this and
+   following events"; not offered here.
 3. **Change events with guests** (drag, resize, editor), for the account that invited
    them; asks whether to send e-mails. A guest's own copy stays read-only.
 4. **Guests in the editor**: a field of e-mail addresses; inviting on a new event,
@@ -23,7 +25,6 @@ addresses, and every question about e-mails is answered "no".
 
 ## Left
 
-- **Answer for one occurrence** of a series (the web asks "this event / all events").
 - **Contact autocomplete** for the guests field: needs Google's People API and a further
   permission at sign-in (every signed-in account has to agree again). Decide with the
   owner before adding a scope.

@@ -425,6 +425,54 @@ fn rsvp_changes(
     ))
 }
 
+/// What to send to answer an invitation, and how to take it back. An occurrence of a
+/// series that was not changed on its own is answered alone (`Scope::This`, which
+/// makes it a changed one) or with its whole series; anything else answers itself.
+/// `None` if there is nothing to answer or the answer is given already.
+fn plan_rsvp(
+    target: &Target,
+    answer: ResponseStatus,
+    scope: Scope,
+    own: Option<serde_json::Value>,
+    series: Option<serde_json::Value>,
+) -> Option<(Edit, UndoKind)> {
+    let unchanged = target.occurrence.as_ref().filter(|o| !o.changed);
+    let resource = if unchanged.is_some() { series } else { own }?;
+    if let (Some(occurrence), Scope::This) = (unchanged, scope) {
+        // The occurrence has the guests of its series until it is changed. No "already
+        // given" short cut here: the series' answer says nothing sent for this event.
+        let before = resource.get("attendees")?.as_array()?;
+        let mut after = before.clone();
+        let own = after
+            .iter_mut()
+            .find(|guest| guest["self"].as_bool() == Some(true))?;
+        own["responseStatus"] = answer.as_str().into();
+        return Some((
+            Edit::Occurrence {
+                series_id: occurrence.series_id.clone(),
+                original_start: occurrence.original_start,
+                known_id: None,
+                etag: None,
+                changes: serde_json::json!({ "attendees": after }),
+            },
+            UndoKind::Occurrence(serde_json::json!({ "attendees": before })),
+        ));
+    }
+    let event_id = resource["id"].as_str()?.to_owned();
+    let (changes, before) = rsvp_changes(&resource, answer)?;
+    Some((
+        Edit::Event {
+            event_id: event_id.clone(),
+            etag: resource["etag"].as_str().map(str::to_owned),
+            changes,
+        },
+        UndoKind::Patch {
+            event_id,
+            changes: before,
+        },
+    ))
+}
+
 fn web_link(event: &Event, account_email: &str) -> String {
     match &event.html_link {
         Some(link) => {
@@ -804,6 +852,9 @@ enum Asked {
     Form(Box<Saved>),
     /// A new event with guests, waiting for "send them e-mails?".
     Create(Box<NewEvent>),
+    /// An answer to an invitation to a repeating event, waiting for "this event or
+    /// all?". It carries the event, not its place on screen.
+    Answer(Box<Target>, ResponseStatus),
 }
 
 /// A new event ready to be created.
@@ -1574,9 +1625,6 @@ impl View {
                         }
                         _ => -1,
                     },
-                    // An answer to an occurrence that was not changed on its own is
-                    // given for its whole series, which the card says.
-                    rsvp_series: event.is_recurring_master(),
                 }
             })
             .collect();
@@ -1613,7 +1661,10 @@ impl View {
         }
         // A drag refers to an instance on screen, which may now be another one. An
         // edit from the editor carries its event with it and stays.
-        if matches!(*self.asked.borrow(), Some(Asked::Drag(_))) {
+        if matches!(
+            *self.asked.borrow(),
+            Some(Asked::Drag(_) | Asked::Answer(..))
+        ) {
             self.asked.take();
         }
         Ok(())
@@ -1859,8 +1910,9 @@ impl View {
         }
     }
 
-    /// Answers the invitation to the event behind an instance. For an occurrence of a
-    /// series that was not changed on its own, the answer is for the whole series.
+    /// Answers the invitation to the event behind an instance. An occurrence of a
+    /// series that was not changed on its own first asks whether the answer is for
+    /// this event or for all of them.
     fn rsvp(&self, instance: usize, answer: ResponseStatus) {
         let Some(target) = self.targets.borrow().get(instance).cloned() else {
             return;
@@ -1868,33 +1920,27 @@ impl View {
         if !target.can_answer {
             return;
         }
-        let (own, series) = match self.resources(&target) {
+        if target.occurrence.as_ref().is_some_and(|o| !o.changed) {
+            self.asked
+                .replace(Some(Asked::Answer(Box::new(target), answer)));
+            if let Some(ui) = self.ui.upgrade() {
+                ui.invoke_ask_answer_scope();
+            }
+        } else {
+            self.send_rsvp(&target, answer, Scope::This);
+        }
+    }
+
+    fn send_rsvp(&self, target: &Target, answer: ResponseStatus, scope: Scope) {
+        let (own, series) = match self.resources(target) {
             Ok(resources) => resources,
             Err(error) => return self.show_error(&error),
         };
-        let changed = target.occurrence.as_ref().is_none_or(|o| o.changed);
-        let Some(resource) = (if changed { own } else { series }) else {
+        let Some((edit, undo)) = plan_rsvp(target, answer, scope, own, series) else {
             return;
         };
-        let (Some(event_id), Some((changes, before))) =
-            (resource["id"].as_str(), rsvp_changes(&resource, answer))
-        else {
-            return;
-        };
-        self.send_edit(
-            &target,
-            Edit::Event {
-                event_id: event_id.to_owned(),
-                etag: resource["etag"].as_str().map(str::to_owned),
-                changes,
-            },
-            Some(UndoKind::Patch {
-                event_id: event_id.to_owned(),
-                changes: before,
-            }),
-            // The organiser sees the answer in the event; no e-mail on top.
-            false,
-        );
+        // The organiser sees the answer in the event; no e-mail on top.
+        self.send_edit(target, edit, Some(undo), false);
     }
 
     /// Sends a change to Google and remembers how to take it back.
@@ -2022,7 +2068,7 @@ impl View {
                     editing.series = series;
                 }
             }
-            Some(Asked::Drag(_)) | None => {}
+            Some(Asked::Drag(_) | Asked::Answer(..)) | None => {}
         }
     }
 
@@ -2761,6 +2807,7 @@ pub fn run() -> Result<()> {
                 Some(Asked::Drag(drag)) => view.send_drag(drag, scope, notify),
                 Some(Asked::Form(saved)) => view.send_form(*saved, scope, notify),
                 Some(Asked::Create(new)) => view.create(*new, notify),
+                Some(Asked::Answer(target, answer)) => view.send_rsvp(&target, answer, scope),
                 None => {}
             }
         }
@@ -3168,6 +3215,131 @@ mod tests {
             ""
         );
         assert_eq!(organiser_address("me@x.org", "colleague@x.org"), "");
+    }
+
+    #[test]
+    fn an_answer_goes_to_one_occurrence_or_to_the_series() {
+        use serde_json::json;
+        let instant = |text: &str| EventTime::Timed(text.parse::<DateTime<Utc>>().unwrap());
+        let guests = |answer: &str| {
+            json!([
+                {"email": "boss@x.org", "organizer": true, "responseStatus": "accepted"},
+                {"email": "me@x.org", "self": true, "responseStatus": answer}
+            ])
+        };
+        let series = json!({"id": "m", "etag": "\"s\"", "attendees": guests("accepted"),
+            "recurrence": ["RRULE:FREQ=DAILY"]});
+        let target = |event_id: &str, changed: Option<bool>| Target {
+            account: 1,
+            calendar_id: "c".into(),
+            event_id: event_id.into(),
+            etag: None,
+            occurrence: changed.map(|changed| Occurrence {
+                series_id: "m".into(),
+                original_start: instant("2026-11-23T10:00:00Z"),
+                changed,
+            }),
+            movable: false,
+            guests: false,
+            can_answer: true,
+            start: instant("2026-11-23T10:00:00Z"),
+            end: instant("2026-11-23T11:00:00Z"),
+        };
+
+        // One occurrence of the series: an event of its own is made of it, with the
+        // series' guests and this answer. Also when the answer is the series' own:
+        // nothing says it was ever given for this event.
+        let unchanged = target("m", Some(false));
+        for answer in [ResponseStatus::Declined, ResponseStatus::Accepted] {
+            assert_eq!(
+                plan_rsvp(
+                    &unchanged,
+                    answer,
+                    Scope::This,
+                    Some(series.clone()),
+                    Some(series.clone())
+                ),
+                Some((
+                    Edit::Occurrence {
+                        series_id: "m".into(),
+                        original_start: instant("2026-11-23T10:00:00Z"),
+                        known_id: None,
+                        etag: None,
+                        changes: json!({"attendees": guests(answer.as_str())}),
+                    },
+                    UndoKind::Occurrence(json!({"attendees": guests("accepted")})),
+                ))
+            );
+        }
+        // All events: the series itself, under its version.
+        assert_eq!(
+            plan_rsvp(
+                &unchanged,
+                ResponseStatus::Declined,
+                Scope::All,
+                Some(series.clone()),
+                Some(series.clone())
+            ),
+            Some((
+                Edit::Event {
+                    event_id: "m".into(),
+                    etag: Some("\"s\"".into()),
+                    changes: json!({"attendees": guests("declined")}),
+                },
+                UndoKind::Patch {
+                    event_id: "m".into(),
+                    changes: json!({"attendees": guests("accepted")}),
+                },
+            ))
+        );
+        // The answer the series has already: nothing to send.
+        assert_eq!(
+            plan_rsvp(
+                &unchanged,
+                ResponseStatus::Accepted,
+                Scope::All,
+                Some(series.clone()),
+                Some(series.clone())
+            ),
+            None
+        );
+        // A changed occurrence and a single event answer for themselves.
+        let exception = json!({"id": "m_1", "etag": "\"x\"", "recurringEventId": "m",
+            "attendees": guests("needsAction")});
+        for target in [target("m_1", Some(true)), target("m_1", None)] {
+            assert_eq!(
+                plan_rsvp(
+                    &target,
+                    ResponseStatus::Tentative,
+                    Scope::This,
+                    Some(exception.clone()),
+                    Some(series.clone())
+                ),
+                Some((
+                    Edit::Event {
+                        event_id: "m_1".into(),
+                        etag: Some("\"x\"".into()),
+                        changes: json!({"attendees": guests("tentative")}),
+                    },
+                    UndoKind::Patch {
+                        event_id: "m_1".into(),
+                        changes: json!({"attendees": guests("needsAction")}),
+                    },
+                ))
+            );
+        }
+        // Not among the guests: nothing.
+        let foreign = json!({"id": "m", "attendees": [{"email": "boss@x.org"}]});
+        assert_eq!(
+            plan_rsvp(
+                &unchanged,
+                ResponseStatus::Accepted,
+                Scope::This,
+                None,
+                Some(foreign)
+            ),
+            None
+        );
     }
 
     #[test]

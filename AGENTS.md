@@ -195,6 +195,7 @@ which the real one usually does.
 | `ed.py` | the editor, also on a series | the `series` fixture |
 | `quick.py` | quick create and its undo | — |
 | `rsvp.py` | guests in the details, answering, changing an event with guests | the `invite` fixture (`fixture.py invite <file> <test account>`) |
+| `rsvp_series.py` | answering an invitation to a repeating event: this event / all events | the `invites` fixture (`fixture.py invites <file> <test account>`) |
 | `guests.py` | guests in the editor, the question about e-mails | — |
 | `meet.py` | a Google Meet link: create, remove, undo | — |
 | `zoom.py` | zoom through the settings | — |
