@@ -4,7 +4,7 @@
 //! cache changed or something is worth telling the user, the worker posts back to the
 //! window's event loop.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -29,6 +29,8 @@ use crate::{load_config, open_store};
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Limits on one request to Google. Without them a connection that stalls (suspend, captive
 /// portal) would never finish, and the sync holding it would block every later one.
+/// How long Google takes, generously, to finish setting up or removing a video meeting.
+const SETTLE_TIME: Duration = Duration::from_secs(3);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -50,6 +52,8 @@ pub enum Command {
         account: AccountId,
         calendar_id: String,
         edit: Edit,
+        /// Whether Google is to tell the event's guests.
+        notify: bool,
     },
     /// Changes fields of an event to take an earlier change back; with an `etag`, only
     /// if nothing else changed it since.
@@ -60,11 +64,13 @@ pub enum Command {
         etag: Option<String>,
         changes: Value,
     },
-    /// Creates an event from a resource the window put together.
+    /// Creates an event from a resource the window put together; with `notify`,
+    /// Google invites its guests.
     CreateEvent {
         account: AccountId,
         calendar_id: String,
         resource: Value,
+        notify: bool,
     },
     /// Undoes a deletion: creates the event again from its saved resource.
     RestoreEvent {
@@ -175,6 +181,9 @@ struct Worker {
     /// earlier attempt (the user may have closed its tab): an attempt gives up as soon as
     /// this no longer holds its own number.
     sign_in_attempt: Rc<watch::Sender<u64>>,
+    /// Whether the change being made is to be told to the event's guests. Changes run
+    /// one at a time, so this belongs to the one that is running.
+    notify: Rc<Cell<bool>>,
     /// Held while accounts are synced or removed, so the two never interleave.
     cache: Rc<Mutex<()>>,
 }
@@ -215,6 +224,7 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
         http,
         activity: Rc::default(),
         sign_in_attempt: Rc::new(watch::Sender::new(0)),
+        notify: Rc::default(),
         cache: Rc::default(),
     };
     while let Some(command) = commands.recv().await {
@@ -271,8 +281,11 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
                     account,
                     calendar_id,
                     edit,
+                    notify,
                 } => {
+                    worker.notify.set(notify);
                     let changed = worker.edit_event(account, &calendar_id, edit).await;
+                    worker.notify.set(false);
                     // The window may have drawn the change already and takes it back on
                     // failure; to undo a change to one occurrence it needs to know
                     // which event that is.
@@ -300,8 +313,11 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
                     account,
                     calendar_id,
                     resource,
+                    notify,
                 } => {
+                    worker.notify.set(notify);
                     let created = worker.insert_event(account, &calendar_id, resource).await;
+                    worker.notify.set(false);
                     // Always answered: on failure the window gives back what was
                     // typed.
                     let (ok, id, etag) = match &created {
@@ -545,6 +561,19 @@ impl Worker {
         result
     }
 
+    /// Syncs once more in a few seconds. Google goes on working on an event after
+    /// answering a change to its video meeting, and the event's version changes again
+    /// a moment later; until the app has that version, a further change to the event
+    /// would be refused as "changed somewhere else".
+    fn sync_soon(&self) {
+        let worker = self.clone();
+        tokio::task::spawn_local(async move {
+            tokio::time::sleep(SETTLE_TIME).await;
+            let _ = worker.sync_all().await;
+            worker.publish();
+        });
+    }
+
     /// A client for the account that owns what is being changed.
     async fn account_client(&self, store: &Store, account: AccountId) -> Result<GoogleClient> {
         let email = store
@@ -708,7 +737,9 @@ impl Worker {
                     return Ok((String::new(), String::new()));
                 };
                 // The second half did not come into being, and the first must not stay
-                // cut: its later occurrences would simply be gone. Give it its rule back.
+                // cut: its later occurrences would simply be gone. Give it its rule back
+                // (without a second round of e-mails to the guests).
+                self.notify.set(false);
                 let restored = self
                     .patch_event(
                         account,
@@ -743,7 +774,7 @@ impl Worker {
         let mut store = open_store()?;
         let client = self.account_client(&store, account).await?;
         let answer = client
-            .patch_event(calendar_id, event_id, &changes, etag, false)
+            .patch_event(calendar_id, event_id, &changes, etag, self.notify.get())
             .await;
         let Some(changed) = self.written(answer).await? else {
             let _ = self.sync_accounts().await;
@@ -752,6 +783,9 @@ impl Worker {
         store.apply_event(account, calendar_id, &changed)?;
         drop(saving);
         let _ = self.sync_accounts().await;
+        if changes.get("conferenceData").is_some() {
+            self.sync_soon();
+        }
         Ok(changed["etag"].as_str().unwrap_or_default().to_owned())
     }
 
@@ -767,10 +801,23 @@ impl Worker {
         let _saving = self.start(|activity| &mut activity.saving);
         let mut store = open_store()?;
         let client = self.account_client(&store, account).await?;
-        let created = client.insert_event(calendar_id, &resource).await?;
+        let created = client
+            .insert_event(calendar_id, &resource, self.notify.get())
+            .await?;
         store.apply_event(account, calendar_id, &created)?;
         let text = |name: &str| created[name].as_str().unwrap_or_default().to_owned();
-        Ok((text("id"), text("etag")))
+        let (id, mut etag) = (text("id"), text("etag"));
+        if !resource["conferenceData"]["createRequest"].is_null() {
+            // Google sets the video meeting up after it has answered, and the event
+            // changes once more. Without fetching that, the next change to the event
+            // would be refused as "changed somewhere else".
+            let _ = self.sync_accounts().await;
+            if let Ok(Some(settled)) = store.event_json(account, calendar_id, &id) {
+                etag = settled["etag"].as_str().unwrap_or_default().to_owned();
+            }
+            self.sync_soon();
+        }
+        Ok((id, etag))
     }
 
     async fn remove_account(&self, email: &str) -> Result<()> {

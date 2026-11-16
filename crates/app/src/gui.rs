@@ -16,7 +16,7 @@ use gcal_core::recurrence::{
 use gcal_core::schedule::{DayPart, schedule};
 use gcal_core::text::plain_text;
 use gcal_core::week::{WeekLayout, layout_days, local_day_start};
-use gcal_core::{CalendarListEntry, Event, EventTime};
+use gcal_core::{CalendarListEntry, Event, EventTime, ResponseStatus};
 use gcal_store::{Account, AccountId, Store, StoredCalendar};
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
@@ -372,6 +372,59 @@ fn own_zone_text(event: &Event, start: EventTime, end: EventTime, shown_in: Tz) 
     )
 }
 
+/// The address that organises events created in a calendar, if it is the account's:
+/// that is so in the account's own calendar, whose identifier is the account's address.
+/// Events in any other calendar (another of the account's, or one shared by someone
+/// else) are organised by that calendar, and the account is not to invite itself.
+fn organiser_address(account_email: &str, calendar_id: &str) -> String {
+    if account_email.eq_ignore_ascii_case(calendar_id) {
+        account_email.to_owned()
+    } else {
+        String::new()
+    }
+}
+
+/// Whether the account itself is invited and can answer here: only in its own
+/// calendar. In a calendar shared by someone else, or a room's, the entry Google marks
+/// as "self" is that calendar's owner, and answering would answer for them.
+fn can_answer(event: &Event, calendar: &CalendarListEntry) -> bool {
+    calendar.primary
+        && calendar.is_writable()
+        && event.own_invitation().is_some_and(|own| !own.resource)
+}
+
+/// A guest's answer as the window counts it: 0 none yet, 1 yes, 2 no, 3 maybe.
+fn answer_number(answer: ResponseStatus) -> i32 {
+    match answer {
+        ResponseStatus::NeedsAction | ResponseStatus::Unknown => 0,
+        ResponseStatus::Accepted => 1,
+        ResponseStatus::Declined => 2,
+        ResponseStatus::Tentative => 3,
+    }
+}
+
+/// What to send to answer the invitation in `resource` for this account, and what
+/// takes it back: the list of guests with only this account's answer changed. `None`
+/// if the account is not among the guests or has given this answer already.
+fn rsvp_changes(
+    resource: &serde_json::Value,
+    answer: ResponseStatus,
+) -> Option<(serde_json::Value, serde_json::Value)> {
+    let before = resource.get("attendees")?.as_array()?;
+    let mut after = before.clone();
+    let own = after
+        .iter_mut()
+        .find(|guest| guest["self"].as_bool() == Some(true))?;
+    if own["responseStatus"].as_str() == Some(answer.as_str()) {
+        return None;
+    }
+    own["responseStatus"] = answer.as_str().into();
+    Some((
+        serde_json::json!({ "attendees": after }),
+        serde_json::json!({ "attendees": before }),
+    ))
+}
+
 fn web_link(event: &Event, account_email: &str) -> String {
     match &event.html_link {
         Some(link) => {
@@ -452,6 +505,10 @@ struct Target {
     occurrence: Option<Occurrence>,
     /// Whether it can be dragged to another time.
     movable: bool,
+    /// Whether this account invited guests to it, who can be told of a change.
+    guests: bool,
+    /// Whether this account is invited to it and can answer.
+    can_answer: bool,
     /// When this instance starts and ends.
     start: EventTime,
     end: EventTime,
@@ -574,12 +631,13 @@ fn plan_drag(
     ))
 }
 
-/// Whether the event can be moved and resized by dragging. Not yet: events with guests
-/// (who would have to be told); never the special kinds of entry (birthdays, ...).
+/// Whether the event can be changed in the app: dragged, resized, opened in the
+/// editor. An event with guests only by the account that invited them (a guest's copy
+/// would drift from the organiser's); never the special kinds of entry (birthdays, ...).
 fn can_move(event: &Event, calendar: &CalendarListEntry) -> bool {
     calendar.is_writable()
         && matches!(event.event_type.as_deref(), None | Some("default"))
-        && event.attendees.is_empty()
+        && (event.attendees.is_empty() || event.has_guests_to_notify())
 }
 
 /// An instant moved by whole days and minutes on the local clock, so that a move across
@@ -744,6 +802,19 @@ fn plan_deletion(
 enum Asked {
     Drag(Drag),
     Form(Box<Saved>),
+    /// A new event with guests, waiting for "send them e-mails?".
+    Create(Box<NewEvent>),
+}
+
+/// A new event ready to be created.
+struct NewEvent {
+    account: AccountId,
+    calendar_id: String,
+    resource: serde_json::Value,
+    /// What it was made from, to give back if creating it fails.
+    form: Form,
+    calendar: usize,
+    draft: Draft,
 }
 
 /// The editor while it is open: the event it is for (`None` for a new one), and the
@@ -792,6 +863,8 @@ fn to_window(form: &Form) -> EditorForm {
         reminder: form.reminder as i32,
         visibility: form.visibility as i32,
         busy: form.busy,
+        guests: form.guests.as_str().into(),
+        meet: form.meet,
     }
 }
 
@@ -810,6 +883,8 @@ fn from_window(form: &EditorForm) -> Form {
         reminder: form.reminder.max(0) as usize,
         visibility: form.visibility.max(0) as usize,
         busy: form.busy,
+        guests: form.guests.to_string(),
+        meet: form.meet,
     }
 }
 
@@ -1479,6 +1554,29 @@ impl View {
                     can_edit: can_move(event, &calendar.entry),
                     repeating: event.is_recurring_master() || event.recurring_event_id.is_some(),
                     notify_guests: event.has_guests_to_notify(),
+                    guests: ModelRc::from(Rc::new(VecModel::from(
+                        event
+                            .attendees
+                            .iter()
+                            .map(|guest| Guest {
+                                name: guest.name().into(),
+                                status: answer_number(guest.response_status),
+                                organizer: guest.organizer,
+                                optional: guest.optional,
+                            })
+                            .collect::<Vec<_>>(),
+                    ))),
+                    meet: event.hangout_link.as_deref().unwrap_or("").into(),
+                    // An answer is given in the account's own calendar.
+                    rsvp: match event.own_invitation() {
+                        Some(own) if can_answer(event, &calendar.entry) => {
+                            answer_number(own.response_status)
+                        }
+                        _ => -1,
+                    },
+                    // An answer to an occurrence that was not changed on its own is
+                    // given for its whole series, which the card says.
+                    rsvp_series: event.is_recurring_master(),
                 }
             })
             .collect();
@@ -1494,6 +1592,8 @@ impl View {
                     etag: instance.event.etag.clone(),
                     occurrence: occurrence_of(instance.event, instance.start),
                     movable: can_move(instance.event, &calendar.entry),
+                    guests: instance.event.has_guests_to_notify(),
+                    can_answer: can_answer(instance.event, &calendar.entry),
                     start: instance.start,
                     end: instance.end,
                 }
@@ -1505,7 +1605,10 @@ impl View {
         // What they described may have moved or gone. The question about a change from
         // the editor stays: that change carries its event with it.
         ui.set_detail_visible(false);
-        if !matches!(*self.asked.borrow(), Some(Asked::Form(_))) {
+        if !matches!(
+            *self.asked.borrow(),
+            Some(Asked::Form(_) | Asked::Create(_))
+        ) {
             ui.set_delete_ask_visible(false);
         }
         // A drag refers to an instance on screen, which may now be another one. An
@@ -1714,19 +1817,21 @@ impl View {
         if !target.movable {
             return;
         }
-        if target.occurrence.is_some() {
+        // How much of a series, and whether the guests are told: asked where there is
+        // a choice.
+        if target.occurrence.is_some() || target.guests {
             self.asked.replace(Some(Asked::Drag(drag)));
             if let Some(ui) = self.ui.upgrade() {
-                ui.invoke_ask_edit_scope();
+                ui.invoke_ask_edit_scope(target.occurrence.is_some(), target.guests);
             }
         } else {
-            self.send_drag(drag, Scope::This);
+            self.send_drag(drag, Scope::This, false);
         }
     }
 
     /// Sends a drag to Google. The undo is prepared from the cache before anything is
     /// sent.
-    fn send_drag(&self, drag: Drag, scope: Scope) {
+    fn send_drag(&self, drag: Drag, scope: Scope, notify: bool) {
         let Some(target) = self.targets.borrow().get(drag.instance).cloned() else {
             return;
         };
@@ -1748,14 +1853,52 @@ impl View {
         let Some((edit, undo)) = plan_drag(&target, scope, drag, own, series, self.zone) else {
             return;
         };
-        self.send_edit(&target, edit, undo);
+        self.send_edit(&target, edit, undo, notify);
         if scope == Scope::This {
             self.draw_drag(drag);
         }
     }
 
+    /// Answers the invitation to the event behind an instance. For an occurrence of a
+    /// series that was not changed on its own, the answer is for the whole series.
+    fn rsvp(&self, instance: usize, answer: ResponseStatus) {
+        let Some(target) = self.targets.borrow().get(instance).cloned() else {
+            return;
+        };
+        if !target.can_answer {
+            return;
+        }
+        let (own, series) = match self.resources(&target) {
+            Ok(resources) => resources,
+            Err(error) => return self.show_error(&error),
+        };
+        let changed = target.occurrence.as_ref().is_none_or(|o| o.changed);
+        let Some(resource) = (if changed { own } else { series }) else {
+            return;
+        };
+        let (Some(event_id), Some((changes, before))) =
+            (resource["id"].as_str(), rsvp_changes(&resource, answer))
+        else {
+            return;
+        };
+        self.send_edit(
+            &target,
+            Edit::Event {
+                event_id: event_id.to_owned(),
+                etag: resource["etag"].as_str().map(str::to_owned),
+                changes,
+            },
+            Some(UndoKind::Patch {
+                event_id: event_id.to_owned(),
+                changes: before,
+            }),
+            // The organiser sees the answer in the event; no e-mail on top.
+            false,
+        );
+    }
+
     /// Sends a change to Google and remembers how to take it back.
-    fn send_edit(&self, target: &Target, edit: Edit, undo: Option<UndoKind>) {
+    fn send_edit(&self, target: &Target, edit: Edit, undo: Option<UndoKind>, notify: bool) {
         self.pending.borrow_mut().push_back(Pending {
             undo: undo.map(|kind| Undo {
                 account: target.account,
@@ -1772,6 +1915,7 @@ impl View {
             account: target.account,
             calendar_id: target.calendar_id.clone(),
             edit,
+            notify,
         });
     }
 
@@ -1815,21 +1959,70 @@ impl View {
             editor::adopt_series_rule(&mut form, &mut kept, series, self.zone);
         }
         let detail = self.details.borrow().get(instance).cloned();
-        let calendar_color = {
-            let loaded = self.loaded.borrow();
-            loaded
-                .calendars
-                .iter()
-                .find(|c| c.account_id == target.account && c.entry.id == target.calendar_id)
-                .and_then(|c| c.entry.background_color.as_deref().and_then(parse_color))
-                .unwrap_or(FALLBACK_COLOR)
-        };
+        let calendar_color = self.calendar_color(&target);
         ui.set_editor_new(false);
         ui.set_editor_calendar_name(detail.map(|d| d.calendar).unwrap_or_default());
+        kept.own_email = self
+            .loaded
+            .borrow()
+            .accounts
+            .iter()
+            .find(|a| a.id == target.account)
+            .map(|a| organiser_address(&a.email, &target.calendar_id))
+            .unwrap_or_default();
         self.show_editor(&ui, form, kept, Some(target), calendar_color);
         if let Some(editing) = self.editing.borrow_mut().as_mut() {
             editing.own = own;
             editing.series = series;
+        }
+    }
+
+    fn calendar_color(&self, target: &Target) -> Color {
+        let loaded = self.loaded.borrow();
+        loaded
+            .calendars
+            .iter()
+            .find(|c| c.account_id == target.account && c.entry.id == target.calendar_id)
+            .and_then(|c| c.entry.background_color.as_deref().and_then(parse_color))
+            .unwrap_or(FALLBACK_COLOR)
+    }
+
+    /// The question about a change was closed without an answer. What came from the
+    /// editor goes back into it as it was saved; a drag is simply dropped.
+    fn ask_cancelled(&self) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        match self.asked.take() {
+            Some(Asked::Create(new)) => {
+                let color = ui
+                    .get_draft_calendars()
+                    .row_data(new.calendar)
+                    .map_or(FALLBACK_COLOR, |c| c.color);
+                self.draft.replace(Some(new.draft));
+                ui.set_editor_new(true);
+                ui.set_draft_calendar(new.calendar as i32);
+                self.show_editor(&ui, new.form, Kept::default(), None, color);
+            }
+            Some(Asked::Form(saved)) => {
+                let Saved {
+                    target,
+                    form,
+                    opened,
+                    kept,
+                    own,
+                    series,
+                    ..
+                } = *saved;
+                let color = self.calendar_color(&target);
+                ui.set_editor_new(false);
+                self.show_editor(&ui, form, kept, Some(target), color);
+                // Still a change to the event as it was first opened.
+                if let Some(editing) = self.editing.borrow_mut().as_mut() {
+                    editing.opened = opened;
+                    editing.own = own;
+                    editing.series = series;
+                }
+            }
+            Some(Asked::Drag(_)) | None => {}
         }
     }
 
@@ -1885,7 +2078,21 @@ impl View {
         let Some(editing) = self.editing.borrow().clone() else {
             return;
         };
-        let after = match editor::fields(&form, &editing.kept, self.zone) {
+        let mut kept = editing.kept.clone();
+        if editing.target.is_none() {
+            // A new event belongs to the account of the calendar chosen for it; the
+            // text the choice is remembered under starts with that account's address.
+            kept.own_email = self
+                .draft
+                .borrow()
+                .as_ref()
+                .and_then(|draft| draft.calendars.get(calendar))
+                .and_then(|(_, calendar_id, key)| {
+                    Some(organiser_address(key.split('\t').next()?, calendar_id))
+                })
+                .unwrap_or_default();
+        }
+        let after = match editor::fields(&form, &kept, self.zone) {
             Ok(after) => after,
             Err(problem) => return ui.set_editor_error(problem.into()),
         };
@@ -1903,13 +2110,25 @@ impl View {
             let Some(draft) = self.draft.take() else {
                 return;
             };
-            self.creating(account, &calendar_id, form, calendar, draft);
-            let _ = self.commands.send(Command::CreateEvent {
+            let invites = after["attendees"]
+                .as_array()
+                .is_some_and(|guests| !guests.is_empty());
+            let new = NewEvent {
                 account,
                 calendar_id,
                 resource: editor::creation(after),
-            });
-            return self.close_editor(&ui);
+                form,
+                calendar,
+                draft,
+            };
+            self.close_editor(&ui);
+            if invites {
+                self.asked.replace(Some(Asked::Create(Box::new(new))));
+                ui.invoke_ask_edit_scope(false, true);
+            } else {
+                self.create(new, false);
+            }
+            return;
         };
         let before = match editor::fields(&editing.opened, &editing.kept, self.zone) {
             Ok(before) => before,
@@ -1931,11 +2150,14 @@ impl View {
             own: editing.own,
             series: editing.series,
         };
-        if saved.target.occurrence.is_some() {
+        // Guests are asked about when the event has some, or gets its first ones now.
+        let repeating = saved.target.occurrence.is_some();
+        let guests = saved.target.guests || saved.changes.get("attendees").is_some();
+        if repeating || guests {
             self.asked.replace(Some(Asked::Form(Box::new(saved))));
-            ui.invoke_ask_edit_scope();
+            ui.invoke_ask_edit_scope(repeating, guests);
         } else {
-            self.send_form(saved, Scope::This);
+            self.send_form(saved, Scope::This, false);
         }
     }
 
@@ -1945,7 +2167,7 @@ impl View {
     }
 
     /// Sends what the editor changed, for as much of a series as was chosen.
-    fn send_form(&self, saved: Saved, scope: Scope) {
+    fn send_form(&self, saved: Saved, scope: Scope, notify: bool) {
         match plan_form(
             &saved,
             scope,
@@ -1953,7 +2175,7 @@ impl View {
             saved.series.clone(),
             self.zone,
         ) {
-            Ok(Some((edit, undo))) => self.send_edit(&saved.target, edit, undo),
+            Ok(Some((edit, undo))) => self.send_edit(&saved.target, edit, undo, notify),
             Ok(None) => {}
             Err(problem) => {
                 if let Some(ui) = self.ui.upgrade() {
@@ -2004,6 +2226,23 @@ impl View {
                 self.all_day.set_row_data(row, bar);
             }
         }
+    }
+
+    /// Sends a new event to be created; with `notify`, its guests get an invitation.
+    fn create(&self, new: NewEvent, notify: bool) {
+        self.creating(
+            new.account,
+            &new.calendar_id,
+            new.form,
+            new.calendar,
+            new.draft,
+        );
+        let _ = self.commands.send(Command::CreateEvent {
+            account: new.account,
+            calendar_id: new.calendar_id,
+            resource: new.resource,
+            notify,
+        });
     }
 
     /// Notes a new event as sent: how to take it back once it exists, and what to show
@@ -2235,12 +2474,17 @@ impl View {
         let resource = event_resource(title, draft.start, draft.end, self.zone);
         let mut form = editor::new_form(draft.start, draft.end, self.zone);
         form.title = title.to_owned();
-        self.creating(account, &calendar_id, form, calendar, draft);
-        let _ = self.commands.send(Command::CreateEvent {
-            account,
-            calendar_id,
-            resource,
-        });
+        self.create(
+            NewEvent {
+                account,
+                calendar_id,
+                resource,
+                form,
+                calendar,
+                draft,
+            },
+            false,
+        );
     }
 
     /// Brings back the event deleted last.
@@ -2478,6 +2722,17 @@ pub fn run() -> Result<()> {
         let view = view.clone();
         move |changed, occurrence, etag| view.change_finished(changed, &occurrence, &etag)
     });
+    ui.on_rsvp({
+        let view = view.clone();
+        move |instance, answer| {
+            let answer = match answer {
+                1 => ResponseStatus::Accepted,
+                2 => ResponseStatus::Declined,
+                _ => ResponseStatus::Tentative,
+            };
+            view.rsvp(instance as usize, answer);
+        }
+    });
     ui.on_editor_requested({
         let view = view.clone();
         move |instance| view.open_editor(instance as usize)
@@ -2490,17 +2745,22 @@ pub fn run() -> Result<()> {
         let view = view.clone();
         move |form, calendar| view.save_editor(from_window(&form), calendar as usize)
     });
+    ui.on_edit_scope_cancelled({
+        let view = view.clone();
+        move || view.ask_cancelled()
+    });
     ui.on_edit_scope_chosen({
         let view = view.clone();
-        move |scope| {
+        move |scope, notify| {
             let scope = match scope {
                 1 => Scope::Following,
                 2 => Scope::All,
                 _ => Scope::This,
             };
             match view.asked.take() {
-                Some(Asked::Drag(drag)) => view.send_drag(drag, scope),
-                Some(Asked::Form(saved)) => view.send_form(*saved, scope),
+                Some(Asked::Drag(drag)) => view.send_drag(drag, scope, notify),
+                Some(Asked::Form(saved)) => view.send_form(*saved, scope, notify),
+                Some(Asked::Create(new)) => view.create(*new, notify),
                 None => {}
             }
         }
@@ -2875,6 +3135,76 @@ mod tests {
     }
 
     #[test]
+    fn an_invitation_is_answered_only_in_the_accounts_own_calendar() {
+        use serde_json::json;
+        let calendar = |extra: serde_json::Value| -> CalendarListEntry {
+            let mut value = json!({"id": "me@x.org", "accessRole": "owner"});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(value).unwrap()
+        };
+        let invited = |own: serde_json::Value| -> Event {
+            serde_json::from_value(json!({"id": "e", "attendees": [own]})).unwrap()
+        };
+        let me = invited(json!({"email": "me@x.org", "self": true}));
+        assert!(can_answer(&me, &calendar(json!({"primary": true}))));
+        // A colleague's calendar shared with write access: "self" there is the colleague.
+        assert!(!can_answer(
+            &me,
+            &calendar(json!({"id": "colleague@x.org"}))
+        ));
+        // A room's calendar, and an event the account is not a guest of.
+        let room = invited(json!({"email": "room@x.org", "self": true, "resource": true}));
+        assert!(!can_answer(&room, &calendar(json!({"primary": true}))));
+        let other = invited(json!({"email": "you@x.org"}));
+        assert!(!can_answer(&other, &calendar(json!({"primary": true}))));
+
+        // The account joins the first guests only where it organises: its own calendar.
+        assert_eq!(organiser_address("me@x.org", "ME@x.org"), "me@x.org");
+        assert_eq!(
+            organiser_address("me@x.org", "family123@group.calendar.google.com"),
+            ""
+        );
+        assert_eq!(organiser_address("me@x.org", "colleague@x.org"), "");
+    }
+
+    #[test]
+    fn answering_changes_only_this_accounts_entry() {
+        use serde_json::json;
+        let event = json!({
+            "id": "e",
+            "attendees": [
+                {"email": "boss@x.org", "organizer": true, "responseStatus": "accepted"},
+                {"email": "me@x.org", "self": true, "responseStatus": "needsAction", "comment": "hm"}
+            ]
+        });
+        let (changes, before) = rsvp_changes(&event, ResponseStatus::Declined).unwrap();
+        assert_eq!(
+            changes,
+            json!({"attendees": [
+                {"email": "boss@x.org", "organizer": true, "responseStatus": "accepted"},
+                {"email": "me@x.org", "self": true, "responseStatus": "declined", "comment": "hm"}
+            ]})
+        );
+        assert_eq!(before, json!({"attendees": event["attendees"]}));
+        // The same answer again, or an event this account is not a guest of: nothing.
+        assert_eq!(rsvp_changes(&event, ResponseStatus::NeedsAction), None);
+        assert_eq!(
+            rsvp_changes(&json!({"id": "e"}), ResponseStatus::Accepted),
+            None
+        );
+        assert_eq!(
+            rsvp_changes(
+                &json!({"id": "e", "attendees": [{"email": "a@x.org"}]}),
+                ResponseStatus::Accepted
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn web_link_names_the_owning_account() {
         let event = Event {
             html_link: Some("https://www.google.com/calendar/event?eid=abc".into()),
@@ -2927,6 +3257,13 @@ mod tests {
         ] {
             assert!(can_move(&event(repeating), &owner));
         }
+        // With guests: only the one who invited them.
+        assert!(can_move(
+            &event(serde_json::json!({
+                "organizer": {"self": true}, "attendees": [{"email": "a@example.com"}]
+            })),
+            &owner
+        ));
         for other in [
             serde_json::json!({"attendees": [{"email": "a@example.com"}]}),
             serde_json::json!({"eventType": "birthday"}),
@@ -3009,6 +3346,8 @@ mod tests {
                 changed: false,
             }),
             movable: true,
+            guests: false,
+            can_answer: false,
             start: instant("2026-11-23T10:00:00Z"),
             end: instant("2026-11-23T11:00:00Z"),
         };
@@ -3146,6 +3485,8 @@ mod tests {
             etag: Some("\"own\"".into()),
             occurrence,
             movable: false,
+            guests: false,
+            can_answer: false,
             start: instant("2026-11-18T10:00:00Z"),
             end: instant("2026-11-18T11:00:00Z"),
         };

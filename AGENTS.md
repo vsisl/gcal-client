@@ -194,6 +194,9 @@ which the real one usually does.
 | `sdrag.py` | dragging occurrences: this / all / following | the `series` fixture |
 | `ed.py` | the editor, also on a series | the `series` fixture |
 | `quick.py` | quick create and its undo | — |
+| `rsvp.py` | guests in the details, answering, changing an event with guests | the `invite` fixture (`fixture.py invite <file> <test account>`) |
+| `guests.py` | guests in the editor, the question about e-mails | — |
+| `meet.py` | a Google Meet link: create, remove, undo | — |
 | `zoom.py` | zoom through the settings | — |
 
 Each script that needs a fixture uses it up or changes it: insert a fresh one before
@@ -216,6 +219,9 @@ Rules for these runs:
   anything else in it is the owner's.
 - The Undo offer lasts ten seconds, so a script must not wait longer before pressing `z`.
 - Add a step to these scripts for every new kind of write.
+- No e-mail may leave a test: guests are made-up addresses (`@example.com`), and every
+  question about sending e-mails is unticked before it is confirmed, in clean-up too.
+- The app opens on the view it was closed with; a script that needs a view picks it.
 
 Not covered by any test yet: Google failing or being slow, and the gestures the test
 server cannot make (issue 9).

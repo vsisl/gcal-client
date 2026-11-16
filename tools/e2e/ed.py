@@ -26,6 +26,9 @@ if len(sys.argv) > 3 and sys.argv[3] == "clean":
         call("click_element", elementHandle=items("AT ")[0]); time.sleep(0.4)
         key(DEL); time.sleep(0.4)
         if "Cancel" in [label(b) for b in find("Button")]:
+            # Never cancellation e-mails for test events: their guests are made up.
+            for box in [h for h in find("Checkbox") if label(h) == "Send cancellation e-mails to guests"]:
+                call("click_element", elementHandle=box); time.sleep(0.3)
             key(DOWN); key(DOWN); key(ENTER)
         wait("clean", lambda: len(items("AT ")) < n)
     print("left:", [e.get("summary") for e in events() if e.get("status") != "cancelled"])
