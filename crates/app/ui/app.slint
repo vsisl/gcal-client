@@ -38,6 +38,8 @@ export struct AllDayItem {
 export struct EventDetail {
     title: string,
     when: string,
+    // The event's own time zone, when it is not the one the times are shown in.
+    zone: string,
     location: string,
     description: string,
     calendar: string,
@@ -224,6 +226,8 @@ component Field inherits Rectangle {
     in property <length> text-size: 14px;
     in property <bool> take-focus;
     callback edited(string);
+    // Enter in a one-line box.
+    callback accepted(string);
 
     height: multiline ? 96px : 36px;
     border-radius: 4px;
@@ -260,6 +264,9 @@ component Field inherits Rectangle {
         }
         edited => {
             root.edited(self.text);
+        }
+        accepted => {
+            root.accepted(self.text);
         }
     }
 }
@@ -472,6 +479,37 @@ export component AppWindow inherits Window {
     in property <int> view-index: 1;
     property <bool> is-month: root.view-index == 2;
     property <bool> is-schedule: root.view-index == 4;
+    property <bool> is-year: root.view-index == 5;
+    // The views in the order of their numbers, and the key of each. The fourth has as
+    // many days as the settings say.
+    in property <int> custom-days: 4;
+    property <[string]> view-labels: [@tr("Day"), @tr("Week"), @tr("Month"), @tr("{} days", root.custom-days), @tr("Schedule"), @tr("Year")];
+    property <[string]> view-keys: ["D", "W", "M", "X", "A", "Y"];
+    property <bool> view-menu-visible;
+    function pick-view(index: int) {
+        root.view-menu-visible = false;
+        root.set-view(index);
+    }
+    property <length> view-menu-x;
+    in-out property <int> custom-days-choice: 2;
+    callback custom-days-chosen(int);
+    // All events of one day of the month view, behind its "N more": Rust fills the
+    // list for the cell asked for and shows it where the click was.
+    callback day-list-requested(int);
+    in property <[ScheduleRow]> day-list;
+    in property <string> day-list-title;
+    in-out property <bool> day-list-visible;
+    property <length> day-list-x;
+    property <length> day-list-y;
+    function ask-day-list(cell: int, x: length, y: length) {
+        day-list-x = x;
+        day-list-y = y;
+        root.day-list-requested(cell);
+    }
+    // The year: twelve months' names and their days, 42 for each month.
+    in property <[string]> year-months;
+    in property <[MiniDay]> year-days;
+    callback year-pick(int);
     in property <[ScheduleRow]> schedule;
     // The sidebar's small month: 42 days, paged on its own, picks the day to show.
     in property <string> mini-title;
@@ -534,8 +572,27 @@ export component AppWindow inherits Window {
             keys.focus();
         }
     }
+    // "Go to date", opened with "g": a date is typed, Rust reads it and shows that day,
+    // or says why it could not.
+    in-out property <bool> goto-visible;
+    in property <string> goto-error;
+    callback goto-date(string);
+    changed goto-visible => {
+        if (!root.goto-visible) {
+            keys.focus();
+        }
+    }
     // The settings card, opened with "s" or its button.
     property <bool> settings-visible;
+    // The hours' labels beside the day columns, in the clock that was chosen.
+    in property <[string]> hour-labels;
+    // Choices of the settings card: the week's first day (Monday, Sunday, Saturday)
+    // and the clock (24 hours, 12 hours). Rust sets what is remembered and is told of
+    // a new choice.
+    in-out property <int> week-start-choice;
+    in-out property <int> clock-choice;
+    callback week-start-chosen(int);
+    callback clock-chosen(int);
     // Light or dark: 0 as the desktop, 1 light, 2 dark. Rust sets the remembered choice
     // at start and is told of a new one.
     in-out property <int> theme-mode <=> Theme.mode;
@@ -706,7 +763,8 @@ export component AppWindow inherits Window {
     property <length> month-row-h: (main.height - month-names-h) / Math.max(1, root.month-weeks);
 
     public function scroll-to-hour(hour: int) {
-        grid.content-y = -hour * hour-h;
+        // A little above the hour, so that its label is not cut by the edge.
+        grid.content-y = Math.min(0px, -hour * hour-h + 10px);
     }
 
     keys := FocusScope {
@@ -750,6 +808,13 @@ export component AppWindow inherits Window {
                 }
                 return accept;
             }
+            if (root.goto-visible) {
+                // Keys its field did not take.
+                if (event.text == Key.Escape) {
+                    root.goto-visible = false;
+                }
+                return accept;
+            }
             if (event.modifiers.control && (event.text == "+" || event.text == "=")) {
                 root.zoom-by(1);
                 return accept;
@@ -779,6 +844,33 @@ export component AppWindow inherits Window {
             }
             if (event.text == "s") {
                 root.settings-visible = true;
+                return accept;
+            }
+            if (event.text == "g") {
+                root.goto-visible = true;
+                return accept;
+            }
+            if (root.view-menu-visible) {
+                // Escape, or the key or number of a view; nothing else gets through.
+                if (event.text == Key.Escape) {
+                    root.view-menu-visible = false;
+                } else if (event.text == "d" || event.text == "1") {
+                    root.pick-view(0);
+                } else if (event.text == "w" || event.text == "2") {
+                    root.pick-view(1);
+                } else if (event.text == "m" || event.text == "3") {
+                    root.pick-view(2);
+                } else if (event.text == "x" || event.text == "4") {
+                    root.pick-view(3);
+                } else if (event.text == "a" || event.text == "5") {
+                    root.pick-view(4);
+                } else if (event.text == "y" || event.text == "6") {
+                    root.pick-view(5);
+                }
+                return accept;
+            }
+            if (event.text == Key.Escape && root.day-list-visible && !root.detail-visible) {
+                root.day-list-visible = false;
                 return accept;
             }
             if (event.text == Key.Escape && root.detail-visible) {
@@ -835,6 +927,10 @@ export component AppWindow inherits Window {
             }
             if (event.text == "a" || event.text == "5") {
                 root.set-view(4);
+                return accept;
+            }
+            if (event.text == "y" || event.text == "6") {
+                root.set-view(5);
                 return accept;
             }
             if (event.text == "r") {
@@ -909,14 +1005,16 @@ export component AppWindow inherits Window {
                     max-width: 420px;
                 }
 
-                for label[index] in [@tr("Day"), @tr("Week"), @tr("Month"), @tr("4 days"), @tr("Schedule")]: VerticalLayout {
+                // The view, as a button that opens the list of views, as on the web.
+                VerticalLayout {
                     alignment: center;
                     TextButton {
-                        text: label;
-                        outlined: root.view-index == index;
-                        text-color: root.view-index == index ? Theme.accent : Theme.text;
+                        text: "\{root.view-labels[root.view-index]}  ▾";
+                        outlined: true;
+                        accessible-label: @tr("View: {}", root.view-labels[root.view-index]);
                         clicked => {
-                            root.set-view(index);
+                            root.view-menu-x = self.absolute-position.x;
+                            root.view-menu-visible = true;
                         }
                     }
                 }
@@ -1213,7 +1311,7 @@ export component AppWindow inherits Window {
 
                     // The day, 4-day and week views: day columns under an all-day strip.
                     Rectangle {
-                        visible: !root.is-month && !root.is-schedule;
+                        visible: !root.is-month && !root.is-schedule && !root.is-year;
 
                         // Day headers.
                         for day[d] in root.days: Rectangle {
@@ -1416,7 +1514,7 @@ export component AppWindow inherits Window {
                                 y: h * hour-h - 7px;
                                 width: gutter - 12px;
                                 horizontal-alignment: right;
-                                text: h == 0 ? "" : "\{h}:00";
+                                text: root.hour-labels[h];
                                 font-size: 10px;
                                 color: Theme.text-dim;
                             }
@@ -1691,7 +1789,7 @@ export component AppWindow inherits Window {
                                 accessible-role: button;
                                 accessible-label: more.text;
                                 accessible-action-default => {
-                                    root.open-day(i);
+                                    root.ask-day-list(i, self.absolute-position.x, self.absolute-position.y);
                                 }
 
                                 more := Text {
@@ -1708,7 +1806,7 @@ export component AppWindow inherits Window {
                                 more-touch := TouchArea {
                                     mouse-cursor: pointer;
                                     clicked => {
-                                        root.open-day(i);
+                                        root.ask-day-list(i, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
                                     }
                                 }
                             }
@@ -1756,6 +1854,84 @@ export component AppWindow inherits Window {
                                 overflow: elide;
                             }
                         }
+                    }
+                    // The year: twelve small months, four in a row. A day opens that day.
+                    if root.is-year: Flickable {
+                        interactive: false;
+                        content-height: year.height;
+
+                    year := Rectangle {
+                        // Three rows of months fill the height; in a low window they
+                        // keep the height six weeks need, and the wheel scrolls.
+                        property <length> month-w: self.width / 4;
+                        property <length> month-h: Math.max(main.height / 3, 46px + 6 * 14px + 8px);
+                        width: main.width;
+                        height: 3 * self.month-h;
+                        property <length> cell: Math.max(14px, Math.min((self.month-w - 32px) / 7, (self.month-h - 44px) / 7));
+
+                        for name[m] in root.year-months: Rectangle {
+                            property <length> left: (self.width - 7 * parent.cell) / 2;
+                            x: Math.mod(m, 4) * parent.month-w;
+                            y: Math.floor(m / 4) * parent.month-h;
+                            width: parent.month-w;
+                            height: parent.month-h;
+
+                            Text {
+                                x: parent.left + 6px;
+                                y: 8px;
+                                height: 24px;
+                                text: name;
+                                font-size: 14px;
+                                font-weight: 500;
+                                color: Theme.text;
+                                vertical-alignment: center;
+                            }
+
+                            for weekday[d] in root.weekday-names: Text {
+                                x: parent.left + d * year.cell;
+                                y: 32px;
+                                width: year.cell;
+                                height: 12px;
+                                text: weekday;
+                                font-size: 8px;
+                                color: Theme.text-dim;
+                                horizontal-alignment: center;
+                            }
+                        }
+                        for day[i] in root.year-days: Rectangle {
+                            property <int> m: Math.floor(i / 42);
+                            property <int> at: Math.mod(i, 42);
+                            property <length> left: (parent.month-w - 7 * parent.cell) / 2;
+                            // Days of the neighbouring months are left out, as on the web.
+                            visible: !day.dim;
+                            x: Math.mod(self.m, 4) * parent.month-w + self.left + Math.mod(self.at, 7) * parent.cell + 1px;
+                            y: Math.floor(self.m / 4) * parent.month-h + 46px + Math.floor(self.at / 7) * parent.cell + 1px;
+                            width: parent.cell - 2px;
+                            height: parent.cell - 2px;
+                            border-radius: self.height / 2;
+                            background: day.today ? Theme.accent : year-touch.has-hover ? Theme.hover : transparent;
+                            accessible-role: button;
+                            accessible-label: "\{root.year-months[self.m]} \{day.label}";
+                            accessible-action-default => {
+                                root.year-pick(i);
+                            }
+
+                            Text {
+                                text: day.label;
+                                font-size: Math.min(12px, parent.height * 0.5);
+                                color: day.today ? Theme.on-accent : Theme.text;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+
+                            year-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    root.year-pick(i);
+                                }
+                            }
+                        }
+                    }
                     }
                     // The schedule: the coming days' events as a list.
                     Flickable {
@@ -1863,6 +2039,167 @@ export component AppWindow inherits Window {
             }
         }
 
+        // The list of views, under its button.
+        if root.view-menu-visible: TouchArea {
+            clicked => {
+                root.view-menu-visible = false;
+            }
+        }
+        if root.view-menu-visible: Rectangle {
+            x: Math.max(12px, Math.min(root.view-menu-x, root.width - self.width - 12px));
+            y: 56px;
+            width: 200px;
+            height: view-menu-box.preferred-height;
+            background: Theme.card;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: Theme.line;
+            drop-shadow-blur: 16px;
+            drop-shadow-offset-y: 4px;
+            drop-shadow-color: #00000040;
+            clip: true;
+            accessible-role: groupbox;
+            accessible-label: @tr("View");
+
+            view-menu-box := VerticalLayout {
+                padding-top: 6px;
+                padding-bottom: 6px;
+
+                for label[index] in root.view-labels: Rectangle {
+                    height: 36px;
+                    background: root.view-index == index ? Theme.selected : view-touch.has-hover ? Theme.hover : transparent;
+                    accessible-role: list-item;
+                    accessible-label: label;
+                    accessible-item-selected: root.view-index == index;
+                    accessible-action-default => {
+                        root.view-menu-visible = false;
+                        root.set-view(index);
+                    }
+
+                    view-touch := TouchArea {
+                        clicked => {
+                            root.view-menu-visible = false;
+                            root.set-view(index);
+                        }
+                    }
+
+                    Text {
+                        x: 16px;
+                        height: parent.height;
+                        text: label;
+                        font-size: 14px;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                    }
+
+                    Text {
+                        x: parent.width - 16px - self.width;
+                        height: parent.height;
+                        text: root.view-keys[index];
+                        font-size: 12px;
+                        color: Theme.text-dim;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // All events of a day of the month view. Under the details card, which opens
+        // from it.
+        if root.day-list-visible: TouchArea {
+            clicked => {
+                root.day-list-visible = false;
+            }
+        }
+        if root.day-list-visible: Rectangle {
+            property <length> margin: 12px;
+            width: Math.min(300px, root.width - 2 * self.margin);
+            height: Math.min(day-list-box.preferred-height, root.height - 2 * self.margin);
+            x: Math.max(self.margin, Math.min(root.day-list-x - 40px, root.width - self.width - self.margin));
+            y: Math.max(self.margin, Math.min(root.day-list-y - 60px, root.height - self.height - self.margin));
+            background: Theme.card;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.line;
+            drop-shadow-blur: 24px;
+            drop-shadow-offset-y: 6px;
+            drop-shadow-color: #00000040;
+            clip: true;
+            accessible-role: groupbox;
+            accessible-label: root.day-list-title;
+
+            TouchArea { }
+
+            Flickable {
+                interactive: false;
+                content-height: day-list-box.preferred-height;
+
+                day-list-box := VerticalLayout {
+                    padding: 12px;
+                    spacing: 2px;
+
+                    HorizontalLayout {
+                        Text {
+                            text: root.day-list-title;
+                            font-size: 15px;
+                            font-weight: 500;
+                            color: Theme.text;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+
+                        TextButton {
+                            text: "✕";
+                            height: 28px;
+                            width: 28px;
+                            accessible-label: @tr("Close");
+                            clicked => {
+                                root.day-list-visible = false;
+                            }
+                        }
+                    }
+
+                    for row in root.day-list: Rectangle {
+                        height: 28px;
+                        border-radius: 4px;
+                        background: list-touch.has-hover ? Theme.hover : transparent;
+                        accessible-role: list-item;
+                        accessible-label: "\{row.title == "" ? @tr("(No title)") : row.title}, \{row.time}";
+                        accessible-action-default => {
+                            root.show-detail(row.instance, self.absolute-position.x, self.absolute-position.y);
+                        }
+
+                        list-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.show-detail(row.instance, self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                            }
+                        }
+
+                        Rectangle {
+                            x: 6px;
+                            y: (parent.height - self.height) / 2;
+                            width: 10px;
+                            height: 10px;
+                            border-radius: 5px;
+                            background: row.color;
+                        }
+
+                        Text {
+                            x: 24px;
+                            width: parent.width - 28px;
+                            height: parent.height;
+                            text: "\{row.time}  \{row.title == "" ? @tr("(No title)") : row.title}";
+                            font-size: 13px;
+                            color: Theme.text;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                }
+            }
+        }
+
         // Event details. An overlay inside the window: we place it ourselves so that it
         // never leaves the window (M0 finding), and it does not take keyboard focus.
         if root.detail-visible: TouchArea {
@@ -1959,6 +2296,13 @@ export component AppWindow inherits Window {
                             text: root.detail.when;
                             font-size: 13px;
                             color: Theme.text;
+                            wrap: word-wrap;
+                        }
+
+                        if root.detail.zone != "": Text {
+                            text: root.detail.zone;
+                            font-size: 12px;
+                            color: Theme.text-dim;
                             wrap: word-wrap;
                         }
                     }
@@ -2558,6 +2902,84 @@ export component AppWindow inherits Window {
             }
         }
 
+        // Go to date.
+        if root.goto-visible: Rectangle {
+            background: #00000066;
+            TouchArea {
+                clicked => {
+                    root.goto-visible = false;
+                }
+            }
+        }
+        if root.goto-visible: Rectangle {
+            width: Math.min(340px, root.width - 24px);
+            height: Math.min(goto-box.preferred-height, root.height - 24px);
+            background: Theme.card;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.line;
+            drop-shadow-blur: 24px;
+            drop-shadow-offset-y: 6px;
+            drop-shadow-color: #00000040;
+            clip: true;
+            accessible-role: groupbox;
+            accessible-label: @tr("Go to date");
+
+            TouchArea { }
+
+            goto-box := VerticalLayout {
+                padding: 20px;
+                padding-bottom: 12px;
+                spacing: 10px;
+
+                Text {
+                    text: @tr("Go to date");
+                    font-size: 18px;
+                    color: Theme.text;
+                }
+
+                goto-field := Field {
+                    hint: @tr("17.11.2026, 2026-11-17, tomorrow…");
+                    take-focus: true;
+                    property <string> typed;
+                    edited(text) => {
+                        self.typed = text;
+                    }
+                    accepted(text) => {
+                        root.goto-date(text);
+                    }
+                }
+
+                if root.goto-error != "": Text {
+                    text: root.goto-error;
+                    font-size: 13px;
+                    color: Theme.danger;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 4px;
+                    TextButton {
+                        text: @tr("Cancel");
+                        height: 32px;
+                        clicked => {
+                            root.goto-visible = false;
+                        }
+                    }
+
+                    TextButton {
+                        text: @tr("Go");
+                        height: 32px;
+                        filled: true;
+                        clicked => {
+                            root.goto-date(goto-field.typed);
+                        }
+                    }
+                }
+            }
+        }
+
         // Settings. Kept on this computer, for all accounts.
         if root.settings-visible: Rectangle {
             background: #00000066;
@@ -2582,6 +3004,11 @@ export component AppWindow inherits Window {
             accessible-label: @tr("Settings");
 
             TouchArea { }
+
+            // Taller than a small window when its lists are open: the wheel scrolls it.
+            Flickable {
+                interactive: false;
+                content-height: settings-box.preferred-height;
 
             settings-box := VerticalLayout {
                 padding: 24px;
@@ -2611,6 +3038,66 @@ export component AppWindow inherits Window {
                     clicked => {
                         root.theme-mode = i;
                         root.theme-chosen(i);
+                    }
+                }
+
+                Rectangle {
+                    height: 8px;
+                }
+
+                Text {
+                    text: @tr("Week starts on");
+                    font-size: 12px;
+                    font-weight: 500;
+                    color: Theme.text-dim;
+                }
+
+                Choice {
+                    options: [@tr("Monday"), @tr("Sunday"), @tr("Saturday")];
+                    current: root.week-start-choice;
+                    chosen(i) => {
+                        root.week-start-choice = i;
+                        root.week-start-chosen(i);
+                    }
+                }
+
+                Rectangle {
+                    height: 8px;
+                }
+
+                Text {
+                    text: @tr("Days in the custom view (X)");
+                    font-size: 12px;
+                    font-weight: 500;
+                    color: Theme.text-dim;
+                }
+
+                Choice {
+                    options: [@tr("2 days"), @tr("3 days"), @tr("4 days"), @tr("5 days"), @tr("6 days"), @tr("7 days")];
+                    current: root.custom-days-choice;
+                    chosen(i) => {
+                        root.custom-days-choice = i;
+                        root.custom-days-chosen(i);
+                    }
+                }
+
+                Rectangle {
+                    height: 8px;
+                }
+
+                Text {
+                    text: @tr("Time format");
+                    font-size: 12px;
+                    font-weight: 500;
+                    color: Theme.text-dim;
+                }
+
+                Choice {
+                    options: [@tr("13:00"), @tr("1:00pm")];
+                    current: root.clock-choice;
+                    chosen(i) => {
+                        root.clock-choice = i;
+                        root.clock-chosen(i);
                     }
                 }
 
@@ -2678,6 +3165,7 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+            }
         }
 
         // Keyboard shortcuts. Until it is closed, keys do nothing else.
@@ -2723,9 +3211,11 @@ export component AppWindow inherits Window {
                     { keys: "d / 1", what: @tr("Day view") },
                     { keys: "w / 2", what: @tr("Week view") },
                     { keys: "m / 3", what: @tr("Month view") },
-                    { keys: "x / 4", what: @tr("4 days view") },
+                    { keys: "x / 4", what: @tr("Custom view (a few days)") },
                     { keys: "a / 5", what: @tr("Schedule view") },
+                    { keys: "y / 6", what: @tr("Year view") },
                     { keys: "r", what: @tr("Refresh") },
+                    { keys: "g", what: @tr("Go to a date") },
                     { keys: "c", what: @tr("Create an event") },
                     { keys: "e", what: @tr("Edit the open event") },
                     { keys: "Ctrl+S", what: @tr("Save in the editor") },

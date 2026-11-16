@@ -37,6 +37,13 @@ const NEW_EVENT_CALENDAR: &str = "new_event_calendar";
 /// Setting: light or dark, as the number the window uses (0 as the desktop, 1 light,
 /// 2 dark).
 const THEME: &str = "theme";
+/// Settings: the first day of the week (0 Monday to 6 Sunday), whether times are shown
+/// on the 12-hour clock (1) and the view that was open last (its place in `Span::ALL`).
+const WEEK_START: &str = "week_start";
+const TWELVE_HOUR: &str = "twelve_hour";
+const LAST_VIEW: &str = "last_view";
+/// Setting: how many days the custom view shows.
+const CUSTOM_DAYS: &str = "custom_days";
 /// Setting: the height of an hour in the day columns, in pixels (the zoom).
 const HOUR_HEIGHT: &str = "hour_height";
 /// How long "Undo" stays on offer after a deletion.
@@ -108,9 +115,90 @@ fn local_zone() -> Tz {
         .unwrap_or(chrono_tz::UTC)
 }
 
-/// The Monday on or before `day`. (The first day of the week becomes a setting in M2.)
+/// The date someone typed into "go to date", if it can be read as one: `2026-11-17`,
+/// `17.11.2026`, `17/11/2026`, `17.11.` (this year), or today, tomorrow, yesterday.
+fn typed_date(text: &str, today: NaiveDate) -> Option<NaiveDate> {
+    let text = text.trim().to_lowercase();
+    match text.as_str() {
+        "today" => return Some(today),
+        "tomorrow" => return Some(today + Duration::days(1)),
+        "yesterday" => return Some(today - Duration::days(1)),
+        _ => {}
+    }
+    let parts: Vec<&str> = text
+        .split(['.', '/', '-', ' '])
+        .filter(|part| !part.is_empty())
+        .collect();
+    let number = |part: &&str| part.parse::<u32>().ok();
+    let date = match parts.as_slice() {
+        [day, month] => NaiveDate::from_ymd_opt(today.year(), number(month)?, number(day)?),
+        // A year of four digits in front: year, month, day.
+        [year, month, day] if year.len() == 4 => {
+            NaiveDate::from_ymd_opt(year.parse().ok()?, number(month)?, number(day)?)
+        }
+        // Else day first, as in most of the world.
+        [day, month, year] => {
+            let year = year.parse::<i32>().ok()?;
+            // "26" means 2026.
+            let year = if (0..100).contains(&year) {
+                2000 + year
+            } else {
+                year
+            };
+            NaiveDate::from_ymd_opt(year, number(month)?, number(day)?)
+        }
+        _ => None,
+    }?;
+    // Only what the calendar can show; see `shown_dates`.
+    (date == shown_dates(date)).then_some(date)
+}
+
+/// The day nearest to `day` that the calendar shows: nothing before 1900 or after 2200.
+/// Dates near the limits of what the date type can hold would overflow when the views
+/// work out the days around them.
+fn shown_dates(day: NaiveDate) -> NaiveDate {
+    let first = NaiveDate::from_ymd_opt(1900, 1, 1).unwrap_or_default();
+    let last = NaiveDate::from_ymd_opt(2200, 12, 31).unwrap_or_default();
+    day.clamp(first, last)
+}
+
+/// How dates and times are shown, as chosen in the settings.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Prefs {
+    /// The first day of the week, counted from Monday (0) to Sunday (6).
+    week_start: u32,
+    twelve_hour: bool,
+    /// How many days the custom view shows: 2 to 7.
+    custom_days: i64,
+}
+
+thread_local! {
+    /// The window's thread is the only one that formats dates for the screen, and it
+    /// does so in dozens of places far from the window's state; the choice is kept
+    /// here for them rather than handed through every one. Tests, each on a thread of
+    /// its own, see the defaults: Monday and the 24-hour clock.
+    static PREFS: Cell<Prefs> = const {
+        Cell::new(Prefs {
+            week_start: 0,
+            twelve_hour: false,
+            custom_days: 4,
+        })
+    };
+}
+
+fn prefs() -> Prefs {
+    PREFS.with(Cell::get)
+}
+
+/// The first day of the week `day` is in, by the setting.
 fn week_start_of(day: NaiveDate) -> NaiveDate {
-    day - Duration::days(i64::from(day.weekday().num_days_from_monday()))
+    week_start_from(day, prefs().week_start)
+}
+
+/// The day on or before `day` that weeks start on; `first` counts from Monday (0).
+fn week_start_from(day: NaiveDate, first: u32) -> NaiveDate {
+    let into_week = (day.weekday().num_days_from_monday() + 7 - first % 7) % 7;
+    day - Duration::days(i64::from(into_week))
 }
 
 /// Which stretch of days the window shows.
@@ -122,17 +210,25 @@ enum Span {
     FourDays,
     /// A list of the coming days' events.
     Schedule,
+    /// Twelve small months, for finding a date; no events.
+    Year,
 }
 
 impl Span {
     /// The order used by the interface's view switcher and the number keys, as on the web.
-    const ALL: [Span; 5] = [
+    const ALL: [Span; 6] = [
         Span::Day,
         Span::Week,
         Span::Month,
         Span::FourDays,
         Span::Schedule,
+        Span::Year,
     ];
+
+    /// Whether the view is the one with a column per day.
+    fn has_columns(self) -> bool {
+        !matches!(self, Span::Month | Span::Schedule | Span::Year)
+    }
 
     /// The first day shown and the number of days, when the user is looking at `anchor`.
     /// The week view snaps to the start of the week, the month view shows the whole weeks
@@ -140,9 +236,14 @@ impl Span {
     fn range(self, anchor: NaiveDate) -> (NaiveDate, i64) {
         match self {
             Span::Day => (anchor, 1),
-            Span::FourDays => (anchor, 4),
+            Span::FourDays => (anchor, prefs().custom_days),
             Span::Schedule => (anchor, SCHEDULE_DAYS),
             Span::Week => (week_start_of(anchor), 7),
+            Span::Year => {
+                let first = anchor.with_ordinal(1).unwrap_or(anchor);
+                let next = NaiveDate::from_ymd_opt(anchor.year() + 1, 1, 1).unwrap_or(first);
+                (first, (next - first).num_days())
+            }
             Span::Month => {
                 let first = week_start_of(anchor.with_day(1).unwrap_or(anchor));
                 let next_month = (anchor.with_day(1).unwrap_or(anchor)) + Months::new(1);
@@ -158,6 +259,9 @@ impl Span {
             // Lands on the same day of the neighbouring month, or its last day.
             Span::Month if direction < 0 => anchor - Months::new(1),
             Span::Month => anchor + Months::new(1),
+            // The same day a year on, or the last of February for the 29th.
+            Span::Year if direction < 0 => anchor - Months::new(12),
+            Span::Year => anchor + Months::new(12),
             _ => anchor + Duration::days(direction * self.range(anchor).1),
         }
     }
@@ -166,6 +270,7 @@ impl Span {
     fn title(self, anchor: NaiveDate) -> String {
         match self {
             Span::Month => anchor.format("%B %Y").to_string(),
+            Span::Year => anchor.year().to_string(),
             _ => {
                 let (first, days) = self.range(anchor);
                 period_title(first, days)
@@ -226,6 +331,47 @@ fn when_text(start: EventTime, end: EventTime, zone: Tz) -> String {
 
 /// The event's page in Google's web interface, opened for the account that owns it (the
 /// browser may be signed in to several).
+/// For an event made in another time zone than the one times are shown in: its times
+/// on its own clock, as "10:00 – 11:00 in Asia/Tokyo". Empty otherwise.
+fn own_zone_text(event: &Event, start: EventTime, end: EventTime, shown_in: Tz) -> String {
+    let (EventTime::Timed(start), EventTime::Timed(end)) = (start, end) else {
+        return String::new();
+    };
+    let Some(own) = event
+        .start
+        .as_ref()
+        .and_then(|start| start.time_zone.as_deref())
+        .and_then(|name| name.parse::<Tz>().ok())
+    else {
+        return String::new();
+    };
+    // Zones with other names may still keep the same time (Prague and Zurich).
+    let offset = |zone: Tz, at: DateTime<Utc>| at.with_timezone(&zone).naive_local();
+    if offset(own, start) == offset(shown_in, start) && offset(own, end) == offset(shown_in, end) {
+        return String::new();
+    }
+    // The day is said wherever it is not the one the main line names: the start's when
+    // it falls on another day there, the end's when the event crosses midnight there.
+    let day = |at: DateTime<Utc>| at.with_timezone(&own).format("%-d %b ").to_string();
+    let date = |zone: Tz, at: DateTime<Utc>| at.with_timezone(&zone).date_naive();
+    let start_day = if date(own, start) == date(shown_in, start) {
+        String::new()
+    } else {
+        day(start)
+    };
+    let end_day = if date(own, end) == date(own, start) {
+        String::new()
+    } else {
+        day(end)
+    };
+    format!(
+        "{start_day}{} – {end_day}{} in {}",
+        clock(start, own),
+        clock(end, own),
+        own.name().replace('_', " ")
+    )
+}
+
 fn web_link(event: &Event, account_email: &str) -> String {
     match &event.html_link {
         Some(link) => {
@@ -238,7 +384,24 @@ fn web_link(event: &Event, account_email: &str) -> String {
 
 fn clock(instant: DateTime<Utc>, zone: Tz) -> String {
     let local = instant.with_timezone(&zone);
-    format!("{}:{:02}", local.hour(), local.minute())
+    clock_text(local.hour(), local.minute(), prefs().twelve_hour)
+}
+
+/// A time of day as 14:05, or as the web writes the 12-hour clock: 2:05pm, 2pm.
+fn clock_text(hour: u32, minute: u32, twelve_hour: bool) -> String {
+    if !twelve_hour {
+        return format!("{hour}:{minute:02}");
+    }
+    let half = if hour < 12 { "am" } else { "pm" };
+    let hour = match hour % 12 {
+        0 => 12,
+        hour => hour,
+    };
+    if minute == 0 {
+        format!("{hour}{half}")
+    } else {
+        format!("{hour}:{minute:02}{half}")
+    }
 }
 
 /// Makes `model` equal to `rows` while touching only the rows that differ. Replacing a
@@ -894,6 +1057,10 @@ struct View {
     commands: UnboundedSender<Command>,
     all_day: Rc<VecModel<AllDayItem>>,
     month_cells: Rc<VecModel<MonthCell>>,
+    /// For each day of the month view, all its events: shown as a list when "N more"
+    /// is chosen.
+    day_lists: RefCell<Vec<Vec<ScheduleRow>>>,
+    year_days: Rc<VecModel<MiniDay>>,
     month_chips: Rc<VecModel<MonthChip>>,
     schedule: Rc<VecModel<ScheduleRow>>,
     sidebar: Rc<VecModel<SidebarRow>>,
@@ -907,6 +1074,44 @@ impl View {
 
     fn today(&self) -> NaiveDate {
         Utc::now().with_timezone(&self.zone).date_naive()
+    }
+
+    /// Shows the settings for dates and times in the window: the names of the weekdays
+    /// in the week's order, the hours' labels, and the choices in the settings card.
+    fn apply_prefs(&self) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let Prefs {
+            week_start,
+            twelve_hour,
+            custom_days,
+        } = prefs();
+        ui.set_custom_days(custom_days as i32);
+        ui.set_custom_days_choice(custom_days as i32 - 2);
+        // 2026-11-16 is a Monday.
+        let monday = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap_or_default();
+        let names: Vec<SharedString> = (0..7)
+            .map(|offset| {
+                let day = monday + Duration::days(i64::from(week_start) + offset);
+                SharedString::from(day.format("%a").to_string().to_uppercase())
+            })
+            .collect();
+        ui.set_weekday_names(ModelRc::from(Rc::new(VecModel::from(names))));
+        let hours: Vec<SharedString> = (0..24)
+            .map(|hour| {
+                if hour == 0 {
+                    SharedString::new()
+                } else {
+                    clock_text(hour, 0, twelve_hour).into()
+                }
+            })
+            .collect();
+        ui.set_hour_labels(ModelRc::from(Rc::new(VecModel::from(hours))));
+        ui.set_week_start_choice(match week_start {
+            6 => 1,
+            5 => 2,
+            _ => 0,
+        });
+        ui.set_clock_choice(i32::from(twelve_hour));
     }
 
     /// Re-reads the cache after it changed, then redraws.
@@ -959,12 +1164,15 @@ impl View {
         let (week_start, days) = self.range();
         let is_month = span == Span::Month;
         let is_schedule = span == Span::Schedule;
+        let is_year = span == Span::Year;
         let today = self.today();
         ui.set_view_index(Span::ALL.iter().position(|s| *s == span).unwrap_or(0) as i32);
         self.drawn_today.set(Some(today));
         ui.set_period_title(span.title(self.anchor.get()).into());
         if is_month {
             ui.set_month_weeks((days / 7) as i32);
+        } else if is_year {
+            self.update_year(ui, today);
         } else if !is_schedule {
             ui.set_day_count(days as i32);
             patch(
@@ -1017,7 +1225,9 @@ impl View {
         patch(&self.sidebar, sidebar);
 
         let from = local_day_start(week_start, self.zone);
-        let to = local_day_start(week_start + Duration::days(days), self.zone);
+        // The year shows no events, so none are looked up for it.
+        let shown_days = if is_year { 0 } else { days };
+        let to = local_day_start(week_start + Duration::days(shown_days), self.zone);
         let singles = self
             .store
             .single_events_for_range(from.timestamp() - 86_400, to.timestamp() + 86_400)?;
@@ -1033,7 +1243,7 @@ impl View {
         }));
         let spans: Vec<_> = instances.iter().map(|i| (i.start, i.end)).collect();
         // Only one of the views is on screen; the models of the others are emptied.
-        let layout = if is_month || is_schedule {
+        let layout = if !span.has_columns() {
             WeekLayout::default()
         } else {
             layout_days(&spans, week_start, days, self.zone)
@@ -1160,6 +1370,39 @@ impl View {
         );
         ui.set_all_day_rows(layout.all_day_rows);
 
+        // Every event of each day of the month view, for the list behind "N more".
+        let mut day_lists: Vec<Vec<ScheduleRow>> = Vec::new();
+        if is_month {
+            day_lists.resize(days as usize, Vec::new());
+            for entry in schedule(&spans, week_start, days, self.zone) {
+                let day = week_start + Duration::days(i64::from(entry.day));
+                let time = match (entry.part, spans[entry.index]) {
+                    (DayPart::Whole, (EventTime::Timed(start), EventTime::Timed(end))) => {
+                        format!("{} – {}", clock(start, self.zone), clock(end, self.zone))
+                    }
+                    (DayPart::Starts, (EventTime::Timed(start), _)) => clock(start, self.zone),
+                    (DayPart::Ends, (_, EventTime::Timed(end))) => {
+                        format!("Until {}", clock(end, self.zone))
+                    }
+                    _ => "All day".to_owned(),
+                };
+                if let Some(list) = day_lists.get_mut(entry.day as usize) {
+                    list.push(ScheduleRow {
+                        instance: entry.index as i32,
+                        first_of_day: list.is_empty(),
+                        day_number: day.day().to_string().into(),
+                        day_name: day.format("%A").to_string().into(),
+                        today: day == today,
+                        time: time.into(),
+                        title: title(entry.index),
+                        color: color(entry.index),
+                    });
+                }
+            }
+        }
+        self.day_lists.replace(day_lists);
+        ui.set_day_list_visible(false);
+
         let shown_month = self.anchor.get().month();
         patch(
             &self.month_cells,
@@ -1223,6 +1466,7 @@ impl View {
                 EventDetail {
                     title: title(index),
                     when: when_text(instance.start, instance.end, self.zone).into(),
+                    zone: own_zone_text(event, instance.start, instance.end, self.zone).into(),
                     location: event.location.as_deref().unwrap_or("").into(),
                     description: plain_text(event.description.as_deref().unwrap_or("")).into(),
                     calendar: calendar.entry.display_name().into(),
@@ -1277,7 +1521,7 @@ impl View {
         let now = Utc::now().with_timezone(&self.zone);
         let (first, days) = self.range();
         let offset = (now.date_naive() - first).num_days();
-        let has_columns = !matches!(self.span.get(), Span::Month | Span::Schedule);
+        let has_columns = self.span.get().has_columns();
         if has_columns && (0..days).contains(&offset) {
             ui.set_now_day(offset as i32);
             ui.set_now_min((now.hour() * 60 + now.minute()) as i32);
@@ -1308,9 +1552,18 @@ impl View {
     }
 
     fn show(&self, anchor: NaiveDate) {
+        let anchor = shown_dates(anchor);
         self.anchor.set(anchor);
         self.mini_month.set(anchor);
         self.refresh();
+    }
+
+    /// Changes the view and remembers it: the app opens on the view it was closed with.
+    fn set_span(&self, span: Span) {
+        self.span.set(span);
+        if let Some(index) = Span::ALL.iter().position(|s| *s == span) {
+            let _ = self.store.set_setting(LAST_VIEW, &index.to_string());
+        }
     }
 
     /// Draws the sidebar's small month: always six weeks, so its height never changes.
@@ -1320,7 +1573,7 @@ impl View {
         let (shown_first, shown_days) = self.range();
         let today = self.today();
         // Marking every day of a month or of the schedule would say nothing.
-        let marks_range = !matches!(self.span.get(), Span::Month | Span::Schedule);
+        let marks_range = self.span.get().has_columns();
         ui.set_mini_title(month.format("%B %Y").to_string().into());
         patch(
             &self.mini_days,
@@ -1337,6 +1590,44 @@ impl View {
                 })
                 .collect(),
         );
+    }
+
+    /// Draws the year: twelve months of six weeks each, in the week's order.
+    fn update_year(&self, ui: &AppWindow, today: NaiveDate) {
+        let year = self.anchor.get().year();
+        let mut names = Vec::with_capacity(12);
+        let mut days = Vec::with_capacity(12 * MINI_MONTH_DAYS as usize);
+        for month in 1..=12 {
+            let Some(first_of_month) = NaiveDate::from_ymd_opt(year, month, 1) else {
+                continue;
+            };
+            names.push(SharedString::from(first_of_month.format("%B").to_string()));
+            let (first, _) = Span::Month.range(first_of_month);
+            for offset in 0..MINI_MONTH_DAYS {
+                let day = first + Duration::days(offset);
+                days.push(MiniDay {
+                    label: day.day().to_string().into(),
+                    today: day == today,
+                    dim: day.month() != month,
+                    shown: false,
+                });
+            }
+        }
+        ui.set_year_months(ModelRc::from(Rc::new(VecModel::from(names))));
+        patch(&self.year_days, days);
+    }
+
+    /// Opens the day view on a day picked in the year: `cell` counts the days of all
+    /// twelve months' grids.
+    fn pick_year_day(&self, cell: i64) {
+        let month = (cell / MINI_MONTH_DAYS) as u32 + 1;
+        let Some(first_of_month) = NaiveDate::from_ymd_opt(self.anchor.get().year(), month, 1)
+        else {
+            return;
+        };
+        let (first, _) = Span::Month.range(first_of_month);
+        self.set_span(Span::Day);
+        self.show(first + Duration::days(cell % MINI_MONTH_DAYS));
     }
 
     /// Pages the small month back (-1) or forward (1) without moving the main view.
@@ -1832,7 +2123,7 @@ impl View {
         let length = if length > 0 { length } else { 60 };
         let Some(ui) = self.ui.upgrade() else { return };
         let (first, days) = self.range();
-        let has_columns = !matches!(self.span.get(), Span::Month | Span::Schedule);
+        let has_columns = self.span.get().has_columns();
         let (day, minute) = if day < 0 {
             // The next half hour, today if today is on screen.
             let now = Utc::now().with_timezone(&self.zone);
@@ -1993,7 +2284,7 @@ impl View {
     /// Opens the day view on the day of a cell of the month grid.
     fn open_day(&self, cell: i64) {
         let day = self.range().0 + Duration::days(cell);
-        self.span.set(Span::Day);
+        self.set_span(Span::Day);
         self.show(day);
     }
 }
@@ -2026,6 +2317,8 @@ pub fn run() -> Result<()> {
         commands: commands.clone(),
         all_day: Rc::default(),
         month_cells: Rc::default(),
+        day_lists: RefCell::default(),
+        year_days: Rc::default(),
         month_chips: Rc::default(),
         schedule: Rc::default(),
         sidebar: Rc::default(),
@@ -2034,19 +2327,84 @@ pub fn run() -> Result<()> {
     ui.set_timed(ModelRc::from(view.timed.clone()));
     ui.set_all_day(ModelRc::from(view.all_day.clone()));
     ui.set_month_cells(ModelRc::from(view.month_cells.clone()));
+    ui.set_year_days(ModelRc::from(view.year_days.clone()));
+    ui.on_day_list_requested({
+        let view = view.clone();
+        move |cell| {
+            let rows = view.day_lists.borrow().get(cell as usize).cloned();
+            if let (Some(rows), Some(ui)) = (rows, view.ui.upgrade()) {
+                let title = rows
+                    .first()
+                    .map(|row| format!("{}, {}", row.day_name, row.day_number))
+                    .unwrap_or_default();
+                ui.set_day_list_title(title.into());
+                ui.set_day_list(ModelRc::from(Rc::new(VecModel::from(rows))));
+                ui.set_day_list_visible(true);
+            }
+        }
+    });
+    ui.on_year_pick({
+        let view = view.clone();
+        move |cell| view.pick_year_day(i64::from(cell))
+    });
     ui.set_month_chips(ModelRc::from(view.month_chips.clone()));
     ui.set_schedule(ModelRc::from(view.schedule.clone()));
     ui.set_sidebar(ModelRc::from(view.sidebar.clone()));
-    // Monday first, like the week view. 2026-11-16 is a Monday.
-    let monday = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap_or_default();
-    ui.set_weekday_names(ModelRc::from(Rc::new(VecModel::from(
-        (0..7)
-            .map(|offset| {
-                let day = monday + Duration::days(offset);
-                SharedString::from(day.format("%a").to_string().to_uppercase())
-            })
-            .collect::<Vec<_>>(),
-    ))));
+    let number =
+        |key: &str| -> Option<u32> { view.store.setting(key).ok().flatten()?.parse().ok() };
+    PREFS.set(Prefs {
+        week_start: number(WEEK_START).filter(|day| *day < 7).unwrap_or(0),
+        twelve_hour: number(TWELVE_HOUR) == Some(1),
+        custom_days: number(CUSTOM_DAYS)
+            .filter(|days| (2..=7).contains(days))
+            .map_or(4, i64::from),
+    });
+    view.apply_prefs();
+    if let Some(span) = number(LAST_VIEW).and_then(|index| Span::ALL.get(index as usize)) {
+        view.span.set(*span);
+    }
+    ui.on_week_start_chosen({
+        let view = view.clone();
+        move |choice| {
+            // The list offers Monday, Sunday, Saturday.
+            let week_start = [0, 6, 5].get(choice as usize).copied().unwrap_or(0);
+            PREFS.set(Prefs {
+                week_start,
+                ..prefs()
+            });
+            let _ = view.store.set_setting(WEEK_START, &week_start.to_string());
+            view.apply_prefs();
+            view.refresh();
+        }
+    });
+    ui.on_custom_days_chosen({
+        let view = view.clone();
+        move |choice| {
+            // The list offers 2 to 7 days.
+            let custom_days = i64::from(choice.clamp(0, 5)) + 2;
+            PREFS.set(Prefs {
+                custom_days,
+                ..prefs()
+            });
+            let _ = view
+                .store
+                .set_setting(CUSTOM_DAYS, &custom_days.to_string());
+            view.apply_prefs();
+            view.refresh();
+        }
+    });
+    ui.on_clock_chosen({
+        let view = view.clone();
+        move |choice| {
+            PREFS.set(Prefs {
+                twelve_hour: choice == 1,
+                ..prefs()
+            });
+            let _ = view.store.set_setting(TWELVE_HOUR, &choice.to_string());
+            view.apply_prefs();
+            view.refresh();
+        }
+    });
 
     let theme = view.store.setting(THEME).ok().flatten();
     ui.set_theme_mode(theme.and_then(|mode| mode.parse().ok()).unwrap_or(0));
@@ -2167,6 +2525,22 @@ pub fn run() -> Result<()> {
         let view = view.clone();
         move || view.undo_delete()
     });
+    ui.on_goto_date({
+        let view = view.clone();
+        move |text| {
+            let Some(ui) = view.ui.upgrade() else { return };
+            match typed_date(&text, view.today()) {
+                Some(date) => {
+                    ui.set_goto_error(SharedString::new());
+                    ui.set_goto_visible(false);
+                    view.show(date);
+                }
+                None => ui.set_goto_error(
+                    "That is not a date this understands. Try 17.11.2026 or 2026-11-17.".into(),
+                ),
+            }
+        }
+    });
     ui.on_go_today({
         let view = view.clone();
         move || view.show(view.today())
@@ -2183,7 +2557,7 @@ pub fn run() -> Result<()> {
         let view = view.clone();
         move |index| {
             if let Some(span) = Span::ALL.get(index as usize) {
-                view.span.set(*span);
+                view.set_span(*span);
                 view.refresh();
             }
         }
@@ -2305,6 +2679,53 @@ mod tests {
     }
 
     #[test]
+    fn a_typed_date_is_read_in_the_usual_ways() {
+        let today = date("2026-11-15");
+        let read = |text: &str| typed_date(text, today);
+        assert_eq!(read("2026-11-17"), Some(date("2026-11-17")));
+        assert_eq!(read(" 17.11.2026 "), Some(date("2026-11-17")));
+        // Day first with any separator, also with a short year; year first only with
+        // four digits.
+        assert_eq!(read("17-11-26"), Some(date("2026-11-17")));
+        assert_eq!(read("17-11-2026"), Some(date("2026-11-17")));
+        assert_eq!(read("2026/11/17"), Some(date("2026-11-17")));
+        assert_eq!(read("2026.1.5"), Some(date("2026-01-05")));
+        // Outside what the calendar shows.
+        assert_eq!(read("31.12.262142"), None);
+        assert_eq!(read("1.1.1899"), None);
+        assert_eq!(read("31.12.2200"), Some(date("2200-12-31")));
+        assert_eq!(shown_dates(NaiveDate::MAX), date("2200-12-31"));
+        assert_eq!(shown_dates(NaiveDate::MIN), date("1900-01-01"));
+        assert_eq!(read("17/11/26"), Some(date("2026-11-17")));
+        assert_eq!(read("1. 2."), Some(date("2026-02-01")));
+        assert_eq!(read("Tomorrow"), Some(date("2026-11-16")));
+        assert_eq!(read("today"), Some(today));
+        assert_eq!(read("yesterday"), Some(date("2026-11-14")));
+        for nonsense in ["", "soon", "31.2.2026", "17", "1.2.3.4", "é.ÿ"] {
+            assert_eq!(read(nonsense), None, "{nonsense}");
+        }
+    }
+
+    #[test]
+    fn the_week_can_start_on_another_day_and_the_clock_have_twelve_hours() {
+        // Wednesday 18 November 2026.
+        let day = date("2026-11-18");
+        assert_eq!(week_start_from(day, 0), date("2026-11-16"));
+        assert_eq!(week_start_from(day, 6), date("2026-11-15"));
+        assert_eq!(week_start_from(day, 5), date("2026-11-14"));
+        // A day that starts the week is its own week's start.
+        assert_eq!(week_start_from(date("2026-11-15"), 6), date("2026-11-15"));
+        assert_eq!(week_start_from(date("2026-11-15"), 0), date("2026-11-09"));
+
+        assert_eq!(clock_text(14, 5, false), "14:05");
+        assert_eq!(clock_text(0, 0, false), "0:00");
+        assert_eq!(clock_text(14, 5, true), "2:05pm");
+        assert_eq!(clock_text(14, 0, true), "2pm");
+        assert_eq!(clock_text(0, 30, true), "12:30am");
+        assert_eq!(clock_text(12, 0, true), "12pm");
+    }
+
+    #[test]
     fn week_starts_on_the_monday_on_or_before() {
         assert_eq!(week_start_of(date("2026-11-15")), date("2026-11-09")); // a Sunday
         assert_eq!(week_start_of(date("2026-11-16")), date("2026-11-16")); // a Monday
@@ -2348,6 +2769,17 @@ mod tests {
         assert_eq!(Span::Month.step(date("2026-11-18"), 1), date("2026-12-18"));
         // There is no 31 November.
         assert_eq!(Span::Month.step(date("2026-12-31"), -1), date("2026-11-30"));
+        assert_eq!(Span::Year.step(date("2026-11-18"), 1), date("2027-11-18"));
+        assert_eq!(Span::Year.step(date("2028-02-29"), -1), date("2027-02-28"));
+        assert_eq!(
+            Span::Year.range(date("2026-11-18")),
+            (date("2026-01-01"), 365)
+        );
+        assert_eq!(
+            Span::Year.range(date("2028-03-01")),
+            (date("2028-01-01"), 366)
+        );
+        assert_eq!(Span::Year.title(date("2026-11-18")), "2026");
     }
 
     #[test]
@@ -2400,6 +2832,46 @@ mod tests {
             all_day("2026-11-17", "2026-11-20"),
             "17 November 2026 – 19 November 2026"
         );
+    }
+
+    #[test]
+    fn an_event_from_another_time_zone_says_its_own_time() {
+        let prague: Tz = "Europe/Prague".parse().unwrap();
+        let event = |zone: &str| -> Event {
+            serde_json::from_value(serde_json::json!({
+                "id": "e",
+                "start": {"dateTime": "2026-11-17T01:00:00Z", "timeZone": zone},
+                "end": {"dateTime": "2026-11-17T02:00:00Z", "timeZone": zone}
+            }))
+            .unwrap()
+        };
+        let (start, end) = (
+            EventTime::Timed("2026-11-17T01:00:00Z".parse().unwrap()),
+            EventTime::Timed("2026-11-17T02:00:00Z".parse().unwrap()),
+        );
+        assert_eq!(
+            own_zone_text(&event("Asia/Tokyo"), start, end, prague),
+            "10:00 – 11:00 in Asia/Tokyo"
+        );
+        // There it is still the evening before, which is said.
+        assert_eq!(
+            own_zone_text(&event("America/New_York"), start, end, prague),
+            "16 Nov 20:00 – 21:00 in America/New York"
+        );
+        // Across midnight there: both days.
+        let late_end = EventTime::Timed("2026-11-17T06:00:00Z".parse().unwrap());
+        assert_eq!(
+            own_zone_text(&event("America/New_York"), start, late_end, prague),
+            "16 Nov 20:00 – 17 Nov 1:00 in America/New York"
+        );
+        // The same clock under another name, no zone at all, or nonsense: nothing.
+        assert_eq!(
+            own_zone_text(&event("Europe/Zurich"), start, end, prague),
+            ""
+        );
+        assert_eq!(own_zone_text(&event("Not/AZone"), start, end, prague), "");
+        let day = EventTime::AllDay(date("2026-11-17"));
+        assert_eq!(own_zone_text(&event("Asia/Tokyo"), day, day, prague), "");
     }
 
     #[test]
