@@ -288,6 +288,38 @@ impl GoogleClient {
         Ok(())
     }
 
+    /// Adds a calendar to the account's list (subscribes to it): a colleague's, by
+    /// their address, or any other by its identifier. A calendar the account may not
+    /// see, or that does not exist, is reported as [`ApiError::Gone`]; Google does not
+    /// tell the two apart.
+    pub async fn subscribe_calendar(&self, calendar_id: &str) -> Result<(), ApiError> {
+        self.send(
+            Method::POST,
+            &["users", "me", "calendarList"],
+            &[],
+            Some(&serde_json::json!({ "id": calendar_id })),
+            None,
+        )
+        .await
+        .map_err(gone_if_missing)?;
+        Ok(())
+    }
+
+    /// Takes a calendar off the account's list. The calendar itself is not touched.
+    /// One that is not on the list is reported as [`ApiError::Gone`].
+    pub async fn unsubscribe_calendar(&self, calendar_id: &str) -> Result<(), ApiError> {
+        self.send(
+            Method::DELETE,
+            &["users", "me", "calendarList", calendar_id],
+            &[],
+            None,
+            None,
+        )
+        .await
+        .map_err(gone_if_missing)?;
+        Ok(())
+    }
+
     /// The occurrences of a series between two instants, each as an event of its own
     /// (with its own identifier, which is what deleting one occurrence needs).
     pub async fn instances(
@@ -662,6 +694,43 @@ mod tests {
         let searches = asked.iter().filter(|r| r.url.path().contains("people-api"));
         // The one allowed source twice: to get ready, and the search.
         assert_eq!(searches.count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_calendar_is_added_to_the_list_and_taken_off_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/users/me/calendarList"))
+            .and(body_json(json!({"id": "ann@example.com"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // An identifier with characters that mean something in an address.
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/users/me/calendarList/en.usa%23holiday@group.v.calendar.google.com",
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/users/me/calendarList"))
+            .and(body_json(json!({"id": "stranger@example.com"})))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        client.subscribe_calendar("ann@example.com").await.unwrap();
+        client
+            .unsubscribe_calendar("en.usa#holiday@group.v.calendar.google.com")
+            .await
+            .unwrap();
+        // Not shared with the account, or not there at all.
+        let refused = client.subscribe_calendar("stranger@example.com").await;
+        assert!(matches!(refused, Err(ApiError::Gone)));
     }
 
     #[tokio::test]

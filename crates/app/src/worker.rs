@@ -44,6 +44,17 @@ pub enum Command {
         email: String,
         permission: Permission,
     },
+    /// Adds a calendar to the account's list at Google (a colleague's, by their
+    /// address), then fetches it.
+    Subscribe {
+        account: AccountId,
+        calendar_id: String,
+    },
+    /// Takes a calendar off the account's list at Google. The calendar itself stays.
+    Unsubscribe {
+        account: AccountId,
+        calendar_id: String,
+    },
     /// Looks up people to suggest as guests while a name is typed in the editor. The
     /// answer goes to the window only if `serial` is still the newest request there.
     SuggestGuests {
@@ -276,6 +287,8 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
                 Command::PatchEvent { .. } => Some("The change could not be taken back."),
                 Command::CreateEvent { .. } => Some("The event was not saved."),
                 Command::RestoreEvent { .. } => Some("The event could not be brought back."),
+                Command::Subscribe { .. } => Some("The calendar was not added."),
+                Command::Unsubscribe { .. } => Some("The calendar was not removed from the list."),
                 _ => None,
             };
             // Changes run one at a time, in the order they were asked for, and never
@@ -295,6 +308,14 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
                 Command::SyncAll => worker.sync_all().await,
                 Command::RemoveAccount(email) => worker.remove_account(&email).await,
                 Command::Grant { email, permission } => worker.grant(&email, permission).await,
+                Command::Subscribe {
+                    account,
+                    calendar_id,
+                } => worker.subscribe(account, &calendar_id, true).await,
+                Command::Unsubscribe {
+                    account,
+                    calendar_id,
+                } => worker.subscribe(account, &calendar_id, false).await,
                 Command::SuggestGuests {
                     account,
                     query,
@@ -1039,6 +1060,34 @@ impl Worker {
             self.sync_soon();
         }
         Ok((id, etag))
+    }
+
+    /// Adds a calendar to the account's list at Google (`add`), or takes it off, and
+    /// then syncs: the calendar and its events come, or go, with the list. The caller
+    /// holds the cache lock.
+    async fn subscribe(&self, account: AccountId, calendar_id: &str, add: bool) -> Result<()> {
+        self.clear_error();
+        let saving = self.start(|activity| &mut activity.saving);
+        let client = self.account_client(&open_store()?, account).await?;
+        let answer = if add {
+            client.subscribe_calendar(calendar_id).await
+        } else {
+            client.unsubscribe_calendar(calendar_id).await
+        };
+        match answer {
+            Ok(()) => {}
+            Err(ApiError::Gone) if add => bail!(
+                "Google knows no calendar “{calendar_id}” that this account may see. If it \
+                 is a colleague's, check the address, or ask them to share their calendar \
+                 with this account."
+            ),
+            // Off the list already: that is what was wanted.
+            Err(ApiError::Gone) => {}
+            Err(other) => return Err(other.into()),
+        }
+        drop(saving);
+        let _ = self.sync_accounts().await;
+        Ok(())
     }
 
     async fn remove_account(&self, email: &str) -> Result<()> {

@@ -209,6 +209,8 @@ export struct SidebarRow {
     email: string,
     color: color,
     shown: bool,
+    // A calendar the account subscribed to: it can be taken off the list again.
+    removable: bool,
 }
 
 export enum StatusKind {
@@ -677,6 +679,22 @@ export component AppWindow inherits Window {
             keys.focus();
         }
     }
+    // "Add a calendar", opened from an account's row: that account's address (empty
+    // while the card is closed) and number.
+    property <string> subscribe-email;
+    property <int> subscribe-account;
+    changed subscribe-email => {
+        if (root.subscribe-email == "") {
+            keys.focus();
+        }
+    }
+    // Account, and what was typed: a colleague's address or a calendar's identifier.
+    callback subscribe-calendar(int, string);
+    // Account and calendar: off the account's list.
+    callback unsubscribe-calendar(int, string);
+    // The calendar whose removal from the list is being confirmed in the sidebar, as
+    // "account/calendar"; empty when none.
+    property <string> confirm-unsubscribe;
     // The settings card, opened with "s" or its button.
     property <bool> settings-visible;
     // Whether the settings card shows its page of permissions.
@@ -958,6 +976,13 @@ export component AppWindow inherits Window {
                 // Keys its title did not take.
                 if (event.text == Key.Escape) {
                     root.close-draft();
+                }
+                return accept;
+            }
+            if (root.subscribe-email != "") {
+                // Keys its field did not take.
+                if (event.text == Key.Escape) {
+                    root.subscribe-email = "";
                 }
                 return accept;
             }
@@ -1389,6 +1414,19 @@ export component AppWindow inherits Window {
                                 if root.confirm-remove != row.email: VerticalLayout {
                                     alignment: center;
                                     TextButton {
+                                        text: "+";
+                                        height: 28px;
+                                        width: 28px;
+                                        accessible-label: @tr("Add a calendar to {}", row.email);
+                                        clicked => {
+                                            root.subscribe-account = row.account-id;
+                                            root.subscribe-email = row.email;
+                                        }
+                                    }
+                                }
+                                if root.confirm-remove != row.email: VerticalLayout {
+                                    alignment: center;
+                                    TextButton {
                                         text: "✕";
                                         height: 28px;
                                         width: 28px;
@@ -1446,6 +1484,44 @@ export component AppWindow inherits Window {
                                     vertical-alignment: center;
                                     overflow: elide;
                                     horizontal-stretch: 1;
+                                }
+
+                                // A subscribed calendar can leave the list, asked twice.
+                                if row.removable && root.confirm-unsubscribe != "\{row.account-id}/\{row.calendar-id}": VerticalLayout {
+                                    alignment: center;
+                                    TextButton {
+                                        text: "✕";
+                                        height: 24px;
+                                        width: 24px;
+                                        text-color: Theme.text-dim;
+                                        accessible-label: @tr("Remove calendar {}", row.text);
+                                        clicked => {
+                                            root.confirm-unsubscribe = "\{row.account-id}/\{row.calendar-id}";
+                                        }
+                                    }
+                                }
+                                if root.confirm-unsubscribe == "\{row.account-id}/\{row.calendar-id}": VerticalLayout {
+                                    alignment: center;
+                                    TextButton {
+                                        text: @tr("Remove");
+                                        height: 24px;
+                                        text-color: Theme.danger;
+                                        accessible-label: @tr("Remove {} from the list", row.text);
+                                        clicked => {
+                                            root.confirm-unsubscribe = "";
+                                            root.unsubscribe-calendar(row.account-id, row.calendar-id);
+                                        }
+                                    }
+                                }
+                                if root.confirm-unsubscribe == "\{row.account-id}/\{row.calendar-id}": VerticalLayout {
+                                    alignment: center;
+                                    TextButton {
+                                        text: @tr("Keep");
+                                        height: 24px;
+                                        clicked => {
+                                            root.confirm-unsubscribe = "";
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -3559,6 +3635,91 @@ export component AppWindow inherits Window {
                         filled: true;
                         clicked => {
                             root.goto-date(goto-field.typed);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Add a calendar to an account's list.
+        if root.subscribe-email != "": Rectangle {
+            background: #00000066;
+            TouchArea {
+                clicked => {
+                    root.subscribe-email = "";
+                }
+            }
+        }
+        if root.subscribe-email != "": Rectangle {
+            width: Math.min(380px, root.width - 24px);
+            height: Math.min(subscribe-box.preferred-height, root.height - 24px);
+            background: Theme.card;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.line;
+            drop-shadow-blur: 24px;
+            drop-shadow-offset-y: 6px;
+            drop-shadow-color: #00000040;
+            clip: true;
+            accessible-role: groupbox;
+            accessible-label: @tr("Add a calendar");
+
+            TouchArea { }
+
+            subscribe-box := VerticalLayout {
+                padding: 20px;
+                padding-bottom: 12px;
+                spacing: 10px;
+
+                Text {
+                    text: @tr("Add a calendar");
+                    font-size: 18px;
+                    color: Theme.text;
+                }
+
+                Text {
+                    text: @tr("To {}: a colleague's calendar, by their e-mail address. They must have shared it with this account or with their organisation.", root.subscribe-email);
+                    font-size: 13px;
+                    color: Theme.text-dim;
+                    wrap: word-wrap;
+                    height: self.preferred-height;
+                }
+
+                subscribe-field := Field {
+                    hint: @tr("ann@example.com");
+                    take-focus: true;
+                    property <string> typed;
+                    edited(text) => {
+                        self.typed = text;
+                    }
+                    accepted(text) => {
+                        if (text != "") {
+                            root.subscribe-calendar(root.subscribe-account, text);
+                            root.subscribe-email = "";
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 4px;
+                    TextButton {
+                        text: @tr("Cancel");
+                        height: 32px;
+                        clicked => {
+                            root.subscribe-email = "";
+                        }
+                    }
+
+                    TextButton {
+                        text: @tr("Add");
+                        height: 32px;
+                        filled: true;
+                        clicked => {
+                            if (subscribe-field.typed != "") {
+                                root.subscribe-calendar(root.subscribe-account, subscribe-field.typed);
+                                root.subscribe-email = "";
+                            }
                         }
                     }
                 }

@@ -181,6 +181,13 @@ fn typed_before_suggestion(text: &str) -> Result<Vec<&str>, String> {
     }
 }
 
+/// Whether a calendar can be taken off its account's list from the sidebar: one the
+/// account subscribed to. Its own calendars stay (Google does not let the main one
+/// go at all, and an owned one taken off the list is hard to find again).
+fn can_leave_list(entry: &CalendarListEntry) -> bool {
+    !entry.primary && entry.access_role.as_deref() != Some("owner")
+}
+
 /// For the settings: what each account lets the app do. One number for each of
 /// `Permission::ALL`, in that order: 0 not known yet (the account was signed in before
 /// the app kept this; the next sync tells), 1 allowed, 2 not allowed.
@@ -1467,6 +1474,7 @@ impl View {
                 email: account.email.as_str().into(),
                 color: FALLBACK_COLOR,
                 shown: true,
+                removable: false,
             });
             for calendar in calendars.iter().filter(|c| c.account_id == account.id) {
                 let entry = &calendar.entry;
@@ -1482,6 +1490,7 @@ impl View {
                         .and_then(parse_color)
                         .unwrap_or(FALLBACK_COLOR),
                     shown: calendar.shown,
+                    removable: can_leave_list(entry),
                 });
             }
         }
@@ -3378,6 +3387,27 @@ pub fn run() -> Result<()> {
             let _ = commands.send(Command::RemoveAccount(email.into()));
         }
     });
+    ui.on_subscribe_calendar({
+        let commands = commands.clone();
+        move |account, calendar| {
+            let calendar_id = calendar.trim().to_owned();
+            if !calendar_id.is_empty() {
+                let _ = commands.send(Command::Subscribe {
+                    account: AccountId::from(account),
+                    calendar_id,
+                });
+            }
+        }
+    });
+    ui.on_unsubscribe_calendar({
+        let commands = commands.clone();
+        move |account, calendar| {
+            let _ = commands.send(Command::Unsubscribe {
+                account: AccountId::from(account),
+                calendar_id: calendar.into(),
+            });
+        }
+    });
     ui.on_grant_permission({
         let commands = commands.clone();
         move |email, permission| {
@@ -3460,6 +3490,21 @@ mod tests {
             typed_before_suggestion("žo@example.com, šá"),
             Ok(vec!["žo@example.com"])
         );
+    }
+
+    #[test]
+    fn only_a_subscribed_calendar_can_be_taken_off_the_list() {
+        let entry = |primary: bool, role: &str| -> CalendarListEntry {
+            serde_json::from_value(serde_json::json!({
+                "id": "c", "primary": primary, "accessRole": role
+            }))
+            .unwrap()
+        };
+        assert!(can_leave_list(&entry(false, "reader")));
+        assert!(can_leave_list(&entry(false, "freeBusyReader")));
+        assert!(can_leave_list(&entry(false, "writer")));
+        assert!(!can_leave_list(&entry(true, "owner")));
+        assert!(!can_leave_list(&entry(false, "owner")));
     }
 
     #[test]
