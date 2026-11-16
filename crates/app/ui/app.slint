@@ -70,8 +70,6 @@ export struct EventDetail {
     // This account's own answer to the invitation: 0 none yet, 1 yes, 2 no, 3 maybe;
     // -1 when it is not invited (or cannot answer here).
     rsvp: int,
-    // The answer is for every event of the series, not this one alone.
-    rsvp-series: bool,
 }
 
 // A day of the month view.
@@ -152,6 +150,10 @@ export struct EditorForm {
     guests: string,
     // Whether it has a Google Meet video meeting.
     meet: bool,
+    // What the guests may do. Who may change the event may do the other two as well.
+    may-modify: bool,
+    may-invite: bool,
+    may-see: bool,
 }
 
 export struct DayHeader {
@@ -297,7 +299,12 @@ component Choice inherits VerticalLayout {
     in property <[string]> options;
     in property <int> current;
     callback chosen(int);
+    // The list was opened or closed, and the line is now that much higher or lower.
+    callback toggled();
     property <bool> open;
+    changed open => {
+        root.toggled();
+    }
 
     Rectangle {
         height: 36px;
@@ -648,6 +655,9 @@ export component AppWindow inherits Window {
     property <bool> ask-edit;
     property <bool> ask-repeating;
     property <bool> ask-guests;
+    // The question is about an answer to an invitation to a repeating event: this
+    // event or all of them (there is no "this and following" for an answer).
+    property <bool> ask-answer;
     // What the open question offers, whether it is about a change or a deletion.
     property <bool> ask-has-scope: root.ask-edit ? root.ask-repeating : root.detail.repeating;
     property <bool> ask-has-guests: root.ask-edit ? root.ask-guests : root.detail.notify-guests;
@@ -658,6 +668,20 @@ export component AppWindow inherits Window {
         root.ask-repeating = repeating;
         root.ask-guests = guests;
         root.delete-notify = guests;
+        root.ask-answer = false;
+        root.ask-edit = true;
+        root.delete-ask-visible = true;
+    }
+
+    // Asks whether an answer to an invitation is for this event or the whole series;
+    // answers with edit-scope-chosen (0 or 2).
+    public function ask-answer-scope() {
+        root.detail-visible = false;
+        root.delete-scope = 0;
+        root.ask-repeating = true;
+        root.ask-guests = false;
+        root.delete-notify = false;
+        root.ask-answer = true;
         root.ask-edit = true;
         root.delete-ask-visible = true;
     }
@@ -696,6 +720,7 @@ export component AppWindow inherits Window {
         if (root.detail.repeating || root.detail.notify-guests) {
             root.delete-scope = 0;
             root.delete-notify = root.detail.notify-guests;
+            root.ask-answer = false;
             root.ask-edit = false;
             root.delete-ask-visible = true;
         } else {
@@ -828,9 +853,9 @@ export component AppWindow inherits Window {
                 } else if (event.text == Key.Return) {
                     root.confirm-ask();
                 } else if (event.text == Key.DownArrow && root.ask-has-scope) {
-                    root.delete-scope = Math.min(2, root.delete-scope + 1);
+                    root.delete-scope = root.ask-answer ? 2 : Math.min(2, root.delete-scope + 1);
                 } else if (event.text == Key.UpArrow && root.ask-has-scope) {
-                    root.delete-scope = Math.max(0, root.delete-scope - 1);
+                    root.delete-scope = root.ask-answer ? 0 : Math.max(0, root.delete-scope - 1);
                 }
                 return accept;
             }
@@ -2412,7 +2437,7 @@ export component AppWindow inherits Window {
                     alignment: start;
 
                     Text {
-                        text: root.detail.rsvp-series ? @tr("Going to all events of the series?") : @tr("Going?");
+                        text: @tr("Going?");
                         font-size: 13px;
                         color: Theme.text;
                         vertical-alignment: center;
@@ -2485,7 +2510,7 @@ export component AppWindow inherits Window {
                 spacing: 6px;
 
                 delete-title := Text {
-                    text: root.ask-edit ? (root.ask-repeating ? @tr("Edit repeating event") : @tr("Guests")) : root.detail.repeating ? @tr("Delete repeating event") : @tr("Delete event");
+                    text: root.ask-answer ? @tr("Answer to repeating event") : root.ask-edit ? (root.ask-repeating ? @tr("Edit repeating event") : @tr("Guests")) : root.detail.repeating ? @tr("Delete repeating event") : @tr("Delete event");
                     font-size: 18px;
                     color: Theme.text;
                 }
@@ -2494,7 +2519,16 @@ export component AppWindow inherits Window {
                     height: 8px;
                 }
 
-                if root.ask-has-scope: VerticalLayout {
+                if root.ask-has-scope && root.ask-answer: VerticalLayout {
+                    for label[i] in [@tr("This event"), @tr("All events")]: RadioRow {
+                        text: label;
+                        selected: root.delete-scope == i * 2;
+                        clicked => {
+                            root.delete-scope = i * 2;
+                        }
+                    }
+                }
+                if root.ask-has-scope && !root.ask-answer: VerticalLayout {
                     for label[i] in [@tr("This event"), @tr("This and following events"), @tr("All events")]: RadioRow {
                         text: label;
                         selected: root.delete-scope == i;
@@ -2701,7 +2735,7 @@ export component AppWindow inherits Window {
         }
         if root.editor-visible: Rectangle {
             width: Math.min(560px, root.width - 24px);
-            height: Math.min(editor-form.preferred-height, root.height - 24px);
+            height: Math.min(editor-form.preferred-height + editor-foot.preferred-height, root.height - 24px);
             background: Theme.card;
             border-radius: 12px;
             border-width: 1px;
@@ -2715,13 +2749,15 @@ export component AppWindow inherits Window {
 
             TouchArea { }
 
-            Flickable {
+            editor-scroll := Flickable {
+                y: 0;
+                height: parent.height - editor-foot.preferred-height;
                 interactive: false;
                 content-height: editor-form.preferred-height;
 
                 editor-form := VerticalLayout {
                     padding: 20px;
-                    padding-bottom: 12px;
+                    padding-bottom: 4px;
                     spacing: 8px;
 
                     Field {
@@ -2786,9 +2822,14 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    EditorRow {
+                    repeat-row := EditorRow {
                         label: @tr("Repeats");
                         Choice {
+                            // Scrolled so that the open list is in sight, and back
+                            // within the form when it closes.
+                            toggled => {
+                                editor-scroll.content-y = Math.max(Math.min(0px, editor-scroll.height - editor-form.preferred-height), Math.min(editor-scroll.content-y, editor-scroll.height - repeat-row.y - repeat-row.height - 8px));
+                            }
                             options: root.editor-custom-repeat ? [@tr("Does not repeat"), @tr("Daily"), @tr("Weekly on the same weekday"), @tr("Monthly on the same day"), @tr("Annually on the same date"), @tr("Every weekday (Monday to Friday)"), @tr("As it repeats now")] : [@tr("Does not repeat"), @tr("Daily"), @tr("Weekly on the same weekday"), @tr("Monthly on the same day"), @tr("Annually on the same date"), @tr("Every weekday (Monday to Friday)")];
                             current: root.editor.repeat;
                             chosen(i) => {
@@ -2804,6 +2845,47 @@ export component AppWindow inherits Window {
                             value: root.editor.guests;
                             edited(text) => {
                                 root.editor.guests = text;
+                            }
+                        }
+                    }
+
+                    // Three boxes of unequal width, as wide as their texts need.
+                    EditorRow {
+                        label: @tr("Guests may");
+                        CheckRow {
+                            horizontal-stretch: 0;
+                            width: 112px;
+                            text: @tr("Change it");
+                            checked: root.editor.may-modify;
+                            toggled => {
+                                root.editor.may-modify = !root.editor.may-modify;
+                                if (root.editor.may-modify) {
+                                    root.editor.may-invite = true;
+                                    root.editor.may-see = true;
+                                }
+                            }
+                        }
+
+                        CheckRow {
+                            horizontal-stretch: 0;
+                            width: 138px;
+                            text: @tr("Invite others");
+                            checked: root.editor.may-invite;
+                            toggled => {
+                                // Part of "change it" while that is ticked.
+                                if (!root.editor.may-modify) {
+                                    root.editor.may-invite = !root.editor.may-invite;
+                                }
+                            }
+                        }
+
+                        CheckRow {
+                            text: @tr("See guests");
+                            checked: root.editor.may-see;
+                            toggled => {
+                                if (!root.editor.may-modify) {
+                                    root.editor.may-see = !root.editor.may-see;
+                                }
                             }
                         }
                     }
@@ -2842,9 +2924,14 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    EditorRow {
+                    calendar-row := EditorRow {
                         label: @tr("Calendar");
                         if root.editor-new: Choice {
+                            // Scrolled so that the open list is in sight, and back
+                            // within the form when it closes.
+                            toggled => {
+                                editor-scroll.content-y = Math.max(Math.min(0px, editor-scroll.height - editor-form.preferred-height), Math.min(editor-scroll.content-y, editor-scroll.height - calendar-row.y - calendar-row.height - 8px));
+                            }
                             options: root.editor-calendars;
                             current: root.draft-calendar;
                             chosen(i) => {
@@ -2895,9 +2982,14 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    EditorRow {
+                    reminder-row := EditorRow {
                         label: @tr("Reminder");
                         Choice {
+                            // Scrolled so that the open list is in sight, and back
+                            // within the form when it closes.
+                            toggled => {
+                                editor-scroll.content-y = Math.max(Math.min(0px, editor-scroll.height - editor-form.preferred-height), Math.min(editor-scroll.content-y, editor-scroll.height - reminder-row.y - reminder-row.height - 8px));
+                            }
                             options: root.editor-custom-reminder ? [@tr("The calendar's usual reminders"), @tr("None"), @tr("When it starts"), @tr("5 minutes before"), @tr("10 minutes before"), @tr("15 minutes before"), @tr("30 minutes before"), @tr("1 hour before"), @tr("1 day before"), @tr("As it reminds now")] : [@tr("The calendar's usual reminders"), @tr("None"), @tr("When it starts"), @tr("5 minutes before"), @tr("10 minutes before"), @tr("15 minutes before"), @tr("30 minutes before"), @tr("1 hour before"), @tr("1 day before")];
                             current: root.editor.reminder;
                             chosen(i) => {
@@ -2906,9 +2998,14 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    EditorRow {
+                    visibility-row := EditorRow {
                         label: @tr("Visibility");
                         Choice {
+                            // Scrolled so that the open list is in sight, and back
+                            // within the form when it closes.
+                            toggled => {
+                                editor-scroll.content-y = Math.max(Math.min(0px, editor-scroll.height - editor-form.preferred-height), Math.min(editor-scroll.content-y, editor-scroll.height - visibility-row.y - visibility-row.height - 8px));
+                            }
                             options: [@tr("The calendar's default"), @tr("Public"), @tr("Private")];
                             current: root.editor.visibility;
                             chosen(i) => {
@@ -2917,9 +3014,14 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    EditorRow {
+                    busy-row := EditorRow {
                         label: @tr("Shown as");
                         Choice {
+                            // Scrolled so that the open list is in sight, and back
+                            // within the form when it closes.
+                            toggled => {
+                                editor-scroll.content-y = Math.max(Math.min(0px, editor-scroll.height - editor-form.preferred-height), Math.min(editor-scroll.content-y, editor-scroll.height - busy-row.y - busy-row.height - 8px));
+                            }
                             options: [@tr("Busy"), @tr("Free")];
                             current: root.editor.busy ? 0 : 1;
                             chosen(i) => {
@@ -2927,33 +3029,43 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
+                }
+            }
 
-                    if root.editor-error != "": Text {
-                        text: root.editor-error;
-                        font-size: 13px;
-                        color: Theme.danger;
-                        wrap: word-wrap;
+            // Below the fields and always in sight, however low the window is.
+            editor-foot := VerticalLayout {
+                y: parent.height - self.height;
+                height: self.preferred-height;
+                padding-left: 20px;
+                padding-right: 20px;
+                padding-top: 8px;
+                padding-bottom: 12px;
+                spacing: 8px;
+
+                if root.editor-error != "": Text {
+                    text: root.editor-error;
+                    font-size: 13px;
+                    color: Theme.danger;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 4px;
+                    TextButton {
+                        text: @tr("Cancel");
+                        height: 32px;
+                        clicked => {
+                            root.editor-visible = false;
+                        }
                     }
 
-                    HorizontalLayout {
-                        alignment: end;
-                        spacing: 4px;
-                        padding-top: 4px;
-                        TextButton {
-                            text: @tr("Cancel");
-                            height: 32px;
-                            clicked => {
-                                root.editor-visible = false;
-                            }
-                        }
-
-                        TextButton {
-                            text: @tr("Save");
-                            height: 32px;
-                            filled: true;
-                            clicked => {
-                                root.editor-save(root.editor, root.draft-calendar);
-                            }
+                    TextButton {
+                        text: @tr("Save");
+                        height: 32px;
+                        filled: true;
+                        clicked => {
+                            root.editor-save(root.editor, root.draft-calendar);
                         }
                     }
                 }

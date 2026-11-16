@@ -1,11 +1,12 @@
 """Writes the event the end-to-end scripts start from, dated in the current week.
 
-usage: fixture.py series|plain|invite <file to write> [<account>, for invite]
+usage: fixture.py series|plain|invite|invites <file to write> [<account>, for invite(s)]
 
 The app opens on the week with today in it, so the fixtures are made for that week:
 "series" is a daily event from its Monday, six times, 09:00 to 09:30 UTC; "plain" is one
 event on its Tuesday, 09:00 to 10:00 UTC; "invite" is one on its Wednesday, 13:00 to
-14:00 UTC, with the test account and a made-up address as guests. Create it in the test account with the test
+14:00 UTC, with the test account and a made-up address as guests; "invites" is the same
+as a daily series of three from its Monday, 15:00 to 15:30 UTC. Create it in the test account with the test
 build:  gcal-uitest insert <account> <calendar> <file>
 """
 import json
@@ -40,6 +41,18 @@ elif kind == "invite":
             {"email": "nobody@example.com", "displayName": "Nobody There"},
         ],
     }
+elif kind == "invites":
+    account = sys.argv[3]
+    event = {
+        "summary": "AT invites",
+        "start": {"dateTime": at(0, "15:00:00"), "timeZone": "UTC"},
+        "end": {"dateTime": at(0, "15:30:00"), "timeZone": "UTC"},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=3"],
+        "attendees": [
+            {"email": account, "responseStatus": "needsAction"},
+            {"email": "nobody@example.com", "displayName": "Nobody There"},
+        ],
+    }
 else:
-    sys.exit("usage: fixture.py series|plain|invite <file to write> [<account> for invite]")
+    sys.exit("usage: fixture.py series|plain|invite|invites <file to write> [<account> for invite(s)]")
 json.dump(event, open(target, "w"), indent=1)

@@ -99,6 +99,11 @@ pub enum Edit {
         known_id: Option<String>,
         etag: Option<String>,
         changes: Value,
+        /// For an occurrence the cache has no version of: fields the change was worked
+        /// out from, with the values the window saw. The occurrence is fetched first,
+        /// and the change is made only if it still has them, and under the version
+        /// just fetched. Without this the change is sent unconditionally (issue 7).
+        expected: Option<Value>,
     },
     /// An occurrence and all later ones: the series ends before it (`recurrence` is
     /// its shortened rule, `old_recurrence` the one it had) and `resource` becomes a
@@ -699,13 +704,26 @@ impl Worker {
                 known_id,
                 etag,
                 changes,
+                expected,
             } => {
-                let id = match known_id {
-                    Some(id) => id,
+                let (id, etag) = match known_id {
+                    Some(id) => (id, etag),
                     None => {
                         let store = open_store()?;
                         let client = self.account_client(&store, account).await?;
-                        occurrence_id(&client, calendar_id, &series_id, original_start).await?
+                        let found =
+                            occurrence(&client, calendar_id, &series_id, original_start).await?;
+                        let id = found["id"].as_str().unwrap_or_default().to_owned();
+                        match expected {
+                            Some(expected) => {
+                                if !still_has(&found, &expected) {
+                                    // Brings the calendar up to date and says so.
+                                    self.written::<()>(Err(ApiError::Changed)).await?;
+                                }
+                                (id, found["etag"].as_str().map(str::to_owned))
+                            }
+                            None => (id, etag),
+                        }
                     }
                 };
                 let now = self
@@ -847,6 +865,16 @@ fn no_connection(error: &SyncError) -> bool {
     network.is_connect() || network.is_timeout() || network.is_request()
 }
 
+/// Whether an event still has, in each field named by `expected`, the value given
+/// there.
+fn still_has(event: &Value, expected: &Value) -> bool {
+    expected.as_object().is_some_and(|fields| {
+        fields
+            .iter()
+            .all(|(name, value)| event.get(name) == Some(value))
+    })
+}
+
 /// Finds the identifier Google gives the occurrence of a series that would start at
 /// `original_start`.
 async fn occurrence_id(
@@ -855,6 +883,18 @@ async fn occurrence_id(
     series_id: &str,
     original_start: EventTime,
 ) -> Result<String> {
+    let found = occurrence(client, calendar_id, series_id, original_start).await?;
+    Ok(found["id"].as_str().unwrap_or_default().to_owned())
+}
+
+/// Fetches the occurrence of a series that would start at `original_start`, as Google
+/// has it now.
+async fn occurrence(
+    client: &GoogleClient,
+    calendar_id: &str,
+    series_id: &str,
+    original_start: EventTime,
+) -> Result<Value> {
     // Only occurrences touching this window are listed; the right one is then told by
     // its original start. An all-day occurrence has no instant of its own, so its
     // window is generous.
@@ -871,15 +911,13 @@ async fn occurrence_id(
     let instances = client.instances(calendar_id, series_id, from, to).await?;
     instances
         .into_iter()
-        .filter_map(|instance| serde_json::from_value::<Event>(instance).ok())
         .find(|instance| {
-            instance
-                .original_start_time
-                .as_ref()
+            serde_json::from_value::<Event>(instance.clone())
+                .ok()
+                .and_then(|event| event.original_start_time)
                 .and_then(|start| start.time())
                 == Some(original_start)
         })
-        .map(|instance| instance.id)
         .context("that occurrence no longer exists")
 }
 
@@ -944,6 +982,25 @@ fn restorable(mut resource: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_occurrence_is_changed_only_if_it_still_has_what_the_window_saw() {
+        use serde_json::json;
+        let guests = json!([{"email": "me@x.org", "self": true, "responseStatus": "needsAction"}]);
+        let event = json!({"id": "m_1", "etag": "\"1\"", "attendees": guests});
+        assert!(still_has(&event, &json!({"attendees": guests})));
+        // Someone's answer changed, or a guest was added, since the window's version.
+        assert!(!still_has(
+            &event,
+            &json!({"attendees": [{"email": "me@x.org", "self": true, "responseStatus": "accepted"}]})
+        ));
+        // A field the event does not have at all is not "still the same".
+        assert!(!still_has(
+            &json!({"id": "m_1"}),
+            &json!({"attendees": guests})
+        ));
+        assert!(!still_has(&event, &json!(null)));
+    }
     use serde_json::json;
 
     #[test]

@@ -197,6 +197,43 @@ async fn insert(email: &str, calendar_id: &str, file: &str) -> Result<()> {
     Ok(())
 }
 
+/// Sends a change to an event as the one account of a test folder and prints Google's
+/// answer; the cache is left alone. Only in builds for automated tests: for trying what
+/// Google does with a change before the window is taught to make it.
+#[cfg(feature = "ui-testing")]
+async fn patch(
+    email: &str,
+    calendar_id: &str,
+    event_id: &str,
+    file: &str,
+    notify: bool,
+) -> Result<()> {
+    let changes: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(file).with_context(|| format!("cannot read {file}"))?,
+    )?;
+    let store = open_store()?;
+    let accounts = store.accounts()?;
+    if accounts.len() != 1 || accounts[0].email != email {
+        bail!("`patch` only runs on a test folder whose one account is {email}");
+    }
+    let refresh_token = Vault::open()
+        .await?
+        .load(email)
+        .await?
+        .with_context(|| format!("{email}: not signed in"))?;
+    let client = GoogleClient::new(
+        HttpClient::new(),
+        load_config()?,
+        Endpoints::default(),
+        refresh_token,
+    );
+    let now = client
+        .patch_event(calendar_id, event_id, &changes, None, notify)
+        .await?;
+    println!("{}", serde_json::to_string_pretty(&now)?);
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -214,6 +251,14 @@ fn main() -> Result<()> {
             ["logout", email] => logout(email).await,
             #[cfg(feature = "ui-testing")]
             ["insert", email, calendar_id, file] => insert(email, calendar_id, file).await,
+            #[cfg(feature = "ui-testing")]
+            ["patch", email, calendar_id, event_id, file] => {
+                patch(email, calendar_id, event_id, file, false).await
+            }
+            #[cfg(feature = "ui-testing")]
+            ["patch", email, calendar_id, event_id, file, "--email"] => {
+                patch(email, calendar_id, event_id, file, true).await
+            }
             _ => {
                 eprintln!("{USAGE}");
                 std::process::exit(2);

@@ -9,26 +9,29 @@ attachment links.
 1. **Guests in the details card**: names, answers, organiser, optional; "Join the video
    meeting". (`tools/e2e/rsvp.py`)
 2. **Answer an invitation**: Yes / No / Maybe, with undo, in the account's own calendar
-   only. For an occurrence of a series that was not changed on its own, the answer is
-   for the whole series, and the card says so.
+   only. For an event of a series it asks "this event / all events"
+   (`tools/e2e/rsvp_series.py`); an event already answered or changed on its own is
+   answered without the question. Google gives the web a third choice, "this and
+   following events"; not offered here.
 3. **Change events with guests** (drag, resize, editor), for the account that invited
    them; asks whether to send e-mails. A guest's own copy stays read-only.
 4. **Guests in the editor**: a field of e-mail addresses; inviting on a new event,
    adding and removing on an existing one; the organiser joins the first guests.
    (`tools/e2e/guests.py`)
 5. **Google Meet** from the editor: create, keep, remove. (`tools/e2e/meet.py`)
+6. **What guests may do**, in the editor: change the event, invite others, see the
+   guest list. Who may change the event may do the other two, as on the web. A new
+   event says nothing about them unless they differ from Google's defaults.
+   (`tools/e2e/guests.py`)
 
 Sending e-mails has not been tried by the scripts on purpose: their guests are made-up
 addresses, and every question about e-mails is answered "no".
 
 ## Left
 
-- **Answer for one occurrence** of a series (the web asks "this event / all events").
 - **Contact autocomplete** for the guests field: needs Google's People API and a further
   permission at sign-in (every signed-in account has to agree again). Decide with the
   owner before adding a scope.
-- **Guest permissions**: guests may modify the event / invite others / see the guest
-  list (`guestsCanModify`, `guestsCanInviteOthers`, `guestsCanSeeOtherGuests`).
 - **Optional guests**, and a note with an answer.
 - **Find a time**: other people's free/busy (`freebusy.query`) beside the event in the
   editor.
@@ -37,6 +40,14 @@ addresses, and every question about e-mails is answered "no".
 - A guest's copy of an event: "propose a new time" has no API and goes to the browser.
 
 ## Known rough edges
+
+- A guest's own copy of an event stays read-only here, also when the organiser lets
+  guests change it. Tried with the two test accounts (2026-11-16): a guest's change
+  through the guest's own calendar is saved in that copy alone and never reaches the
+  organiser (not after minutes, not with `sendUpdates=all`); sent to the organiser's
+  calendar it is refused as "not found". The web can do it; the public API, as far as
+  these tries show, cannot. The details card's link opens the event on the web.
+  (Issue 17.)
 
 - After a change to a video meeting the app fetches the event again three seconds
   later, which closes an open details card; within those seconds another change to the

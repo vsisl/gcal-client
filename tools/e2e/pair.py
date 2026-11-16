@@ -282,6 +282,10 @@ try:
     run()
 except Exception as error:
     print("FAIL", f"{type(error).__name__}: {error}")
+    # Both copies as the caches have them, to see which side is behind.
+    for who, copy in (("organiser", created and mine()), ("guest", uid and theirs())):
+        if copy:
+            print(f"   {who}:", {name: copy.get(name) for name in ("summary", "location", "updated", "sequence", "guestsCanModify", "etag")})
     try:
         shot("fail-last")
         if created and mine():
