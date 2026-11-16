@@ -36,8 +36,23 @@ def answers(name):
     return {g["email"]: g.get("responseStatus") for g in named(name)[0].get("attendees", [])}
 
 
-def refresh():
-    key(ESC); key("r")
+def synced(what, cond):
+    """Waits for a change made in the other account to reach this app's cache,
+    refreshing every ten seconds: Google takes a while (often more than half a
+    minute) to pass a change on to the other account's calendar."""
+    key(ESC)
+    start = time.time()
+    while time.time() - start < 120:
+        key("r")
+        end = time.time() + 10
+        while time.time() < end:
+            try:
+                if cond():
+                    print("PASS", what, f"({time.time() - start:.0f} s)"); return True
+            except Exception:
+                pass
+            time.sleep(0.5)
+    print("FAIL", what); shot("fail-" + what.replace(" ", "-")[:40]); return False
 
 
 organiser, guest = account(ORGANISER[1]), account(GUEST[1])
@@ -62,8 +77,7 @@ wait("organiser: created with the guest unanswered", lambda: answers(NAME) == {o
 
 # 2. It arrives in the guest's calendar, and the guest says yes.
 common.use(*GUEST)
-refresh()
-wait("guest: the invitation arrived", lambda: named(NAME)[0]["organizer"]["email"] == organiser and answers(NAME)[guest] == "needsAction", timeout=40)
+synced("guest: the invitation arrived", lambda: named(NAME)[0]["organizer"]["email"] == organiser and answers(NAME)[guest] == "needsAction")
 wait("guest: it is on screen", lambda: len(items(NAME)) == 1)
 call("click_element", elementHandle=items(NAME)[0]); time.sleep(0.5)
 shot("pair-guest-invited")
@@ -72,9 +86,8 @@ wait("guest: yes saved at Google", lambda: answers(NAME)[guest] == "accepted")
 
 # 3. The organiser sees the answer.
 common.use(*ORGANISER)
-refresh()
-wait("organiser: sees the guest's yes", lambda: answers(NAME)[guest] == "accepted", timeout=40)
-time.sleep(1)
+synced("organiser: sees the guest's yes", lambda: answers(NAME)[guest] == "accepted")
+wait("organiser: it is on screen", lambda: len(items(NAME)) == 1)
 call("click_element", elementHandle=items(NAME)[0]); time.sleep(0.5)
 shot("pair-organiser-answered")
 
@@ -86,17 +99,15 @@ click("Checkbox", ASK)
 key(ENTER)
 wait("organiser: renamed at Google", lambda: len(named(NAME + " 2")) == 1)
 common.use(*GUEST)
-refresh()
-wait("guest: sees the new name, still yes", lambda: answers(NAME + " 2")[guest] == "accepted" and not named(NAME), timeout=40)
+synced("guest: sees the new name, still yes", lambda: answers(NAME + " 2")[guest] == "accepted" and not named(NAME))
 
 # 5. The guest changes the answer; the organiser sees it.
-time.sleep(1)
+wait("guest: the new name is on screen", lambda: len(items(NAME + " 2")) == 1)
 call("click_element", elementHandle=items(NAME + " 2")[0]); time.sleep(0.5)
 click("Button", "No")
 wait("guest: no saved at Google", lambda: answers(NAME + " 2")[guest] == "declined")
 common.use(*ORGANISER)
-refresh()
-wait("organiser: sees the guest's no", lambda: answers(NAME + " 2")[guest] == "declined", timeout=40)
+synced("organiser: sees the guest's no", lambda: answers(NAME + " 2")[guest] == "declined")
 
 # 6. The organiser deletes it, without cancellation e-mails; it leaves the guest's
 #    calendar too.
@@ -107,5 +118,4 @@ click("Checkbox", "Send cancellation e-mails to guests")
 key(ENTER)
 wait("organiser: deleted", lambda: not named(NAME + " 2"))
 common.use(*GUEST)
-refresh()
-wait("guest: gone from the guest's calendar", lambda: not named(NAME + " 2"), timeout=40)
+synced("guest: gone from the guest's calendar", lambda: not named(NAME + " 2"))
