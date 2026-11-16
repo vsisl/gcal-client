@@ -454,6 +454,9 @@ fn plan_rsvp(
                 known_id: None,
                 etag: None,
                 changes: serde_json::json!({ "attendees": after }),
+                // The whole list of guests is sent: only if nobody's entry differs
+                // by now from the one this was made from.
+                expected: Some(serde_json::json!({ "attendees": before })),
             },
             UndoKind::Occurrence(serde_json::json!({ "attendees": before })),
         ));
@@ -622,6 +625,7 @@ fn plan_drag(
                 known_id: occurrence.changed.then(|| target.event_id.clone()),
                 etag: target.etag.clone().filter(|_| occurrence.changed),
                 changes: time_changes(&resource, start, end),
+                expected: None,
             },
             Some(UndoKind::Occurrence(time_changes(
                 &resource,
@@ -856,7 +860,7 @@ enum Asked {
     /// A new event with guests, waiting for "send them e-mails?".
     Create(Box<NewEvent>),
     /// An answer to an invitation to a repeating event, waiting for "this event or
-    /// all?". It carries the event, not its place on screen.
+    /// all?". It carries the event, not its place on screen, and so outlives a redraw.
     Answer(Box<Target>, ResponseStatus),
 }
 
@@ -998,6 +1002,7 @@ fn plan_form(
                 known_id: occurrence.changed.then(|| target.event_id.clone()),
                 etag: target.etag.clone().filter(|_| occurrence.changed),
                 changes,
+                expected: None,
             },
             Some(UndoKind::Occurrence(was)),
         )));
@@ -1664,16 +1669,13 @@ impl View {
         ui.set_detail_visible(false);
         if !matches!(
             *self.asked.borrow(),
-            Some(Asked::Form(_) | Asked::Create(_))
+            Some(Asked::Form(_) | Asked::Create(_) | Asked::Answer(..))
         ) {
             ui.set_delete_ask_visible(false);
         }
         // A drag refers to an instance on screen, which may now be another one. An
         // edit from the editor carries its event with it and stays.
-        if matches!(
-            *self.asked.borrow(),
-            Some(Asked::Drag(_) | Asked::Answer(..))
-        ) {
+        if matches!(*self.asked.borrow(), Some(Asked::Drag(_))) {
             self.asked.take();
         }
         Ok(())
@@ -3275,6 +3277,8 @@ mod tests {
                         known_id: None,
                         etag: None,
                         changes: json!({"attendees": guests(answer.as_str())}),
+                        // Only if the guests are still as this was worked out from.
+                        expected: Some(json!({"attendees": guests("accepted")})),
                     },
                     UndoKind::Occurrence(json!({"attendees": guests("accepted")})),
                 ))
@@ -3559,6 +3563,7 @@ mod tests {
                     known_id: None,
                     etag: None,
                     changes: moved.clone(),
+                    expected: None,
                 },
                 Some(UndoKind::Occurrence(was)),
             )
