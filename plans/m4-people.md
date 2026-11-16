@@ -15,8 +15,9 @@ attachment links.
    following events"; not offered here.
 3. **Change events with guests** (drag, resize, editor), for the account that invited
    them; asks whether to send e-mails. A guest's own copy stays read-only.
-4. **Guests in the editor**: a field of e-mail addresses; inviting on a new event,
-   adding and removing on an existing one; the organiser joins the first guests.
+4. **Guests in the editor**: a field for addresses and, under it, the list of guests,
+   each with "optional" and a remove button; inviting on a new event, adding and
+   removing on an existing one; the organiser joins the first guests.
    (`tools/e2e/guests.py`)
 5. **Google Meet** from the editor: create, keep, remove. (`tools/e2e/meet.py`)
 6. **What guests may do**, in the editor: change the event, invite others, see the
@@ -30,13 +31,26 @@ addresses, and every question about e-mails is answered "no".
 7. **Attachments** in the details card: each file a link that opens in the browser.
    Only web addresses are offered, and only web addresses are ever handed to the
    desktop to open (also the event's own link and the video meeting's).
+8. **Notifications** in the editor (the web's word; they were "Reminder", one per
+   event): the calendar's usual ones, or up to five of the event's own, each with a
+   time from a list. Those by e-mail or at another time are kept and shown, but the
+   editor cannot make them. (`tools/e2e/ed.py`)
+
+## To try, behind a switch
+
+- **Suggestions for the guests field** from the account's contacts, the people it has
+  written to, and its organisation's directory (Google's People API). They need three
+  further read-only permissions at sign-in, so they exist only when the app is started
+  with `GCAL_CLIENT_TRY_PEOPLE=1`, and only for accounts signed in that way. Tried by
+  the owner by hand (2026-11-16); the test accounts have no contacts, so no script
+  covers the answers from Google, only the mock-server tests do. The owner's decisions,
+  still open: whether every sign-in asks for these permissions, and whether the
+  directory ("See and download your organization's directory") is among them. Not done:
+  choosing a suggestion with the arrow keys (Enter takes the first).
 
 ## Left
 
-- **Contact autocomplete** for the guests field: needs Google's People API and a further
-  permission at sign-in (every signed-in account has to agree again). Decide with the
-  owner before adding a scope.
-- **Optional guests**, and a note with an answer.
+- A note with an answer to an invitation.
 - **Find a time**: other people's free/busy (`freebusy.query`) beside the event in the
   editor.
 - **Rooms**: adding a room by name or address (a room is a guest with `resource`).
@@ -57,4 +71,7 @@ addresses, and every question about e-mails is answered "no".
 - After a change to a video meeting the app fetches the event again three seconds
   later, which closes an open details card; within those seconds another change to the
   event may be refused as "changed somewhere else".
-- The guests field takes addresses only; names are shown in the details card.
+- Without the suggestions the guests field takes addresses only; names are shown in
+  the details card.
+- A notification's time is one of ten in a list, not a number typed in, and it is
+  always on the screen, not by e-mail.

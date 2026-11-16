@@ -41,7 +41,7 @@ unless said otherwise.
 6. **Repeating events**: this / this and following / all for delete, drag and the
    editor. *Done. No undo after a split ("this and following" edit).*
 7. **Editor** (`e`, "Edit", "More options"): title, dates and times, all-day, repeat
-   presets, location, description, calendar (new events), colour, reminder,
+   presets, location, description, calendar (new events), colour, reminder (since M4: several notifications),
    visibility, busy/free. Sends only what changed. *Done.*
 8. **Offline banner**, editing off while Google cannot be reached. *Done.*
 9. **Tests against Google without the user**: `tools/e2e`. *Done.*
