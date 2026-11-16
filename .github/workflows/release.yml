@@ -1,0 +1,77 @@
+name: Release
+
+# A tag "v<version>" publishes that version: the AppImage and its .zsync file are
+# attached to a GitHub release. Started by hand instead (Actions → Release → Run
+# workflow) it builds the same AppImage and keeps it with the run, for trying it out
+# without publishing anything.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  # A pull request that changes the packaging builds the AppImage too, so that a
+  # broken release is found before the tag.
+  pull_request:
+    paths: ["packaging/**", ".github/workflows/release.yml"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Where published versions are found, written into each AppImage: the newest GitHub
+  # release of this repository. Gear Lever and other AppImage updaters read it.
+  UPDATE_INFORMATION: gh-releases-zsync|vsisl|gcal-client|latest|gcal-client-*-x86_64.AppImage.zsync
+
+jobs:
+  appimage:
+    # The oldest image there is: the binary runs on this distribution's C library
+    # and every newer one.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version
+        id: version
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # A release is named by its tag and built from Cargo.toml: the two must agree.
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "The tag $GITHUB_REF_NAME does not match the version $version in Cargo.toml." >&2
+            exit 1
+          fi
+      - name: Install system libraries and packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libfontconfig-dev libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev libdbus-1-dev zsync desktop-file-utils
+          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          # The runner has no FUSE to mount an AppImage with: the tool unpacks itself.
+          printf '#!/bin/sh\nexec "%s/appimagetool" --appimage-extract-and-run "$@"\n' "$PWD" | sudo tee /usr/local/bin/appimagetool > /dev/null
+          sudo chmod +x /usr/local/bin/appimagetool
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+      - run: cargo build --release -p gcal-client
+      - name: Pack the AppImage
+        env:
+          # Through the environment, not pasted into the script: it comes from a file
+          # a pull request can change.
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          packaging/build-appimage.sh target/release/gcal-client "$VERSION" dist "$UPDATE_INFORMATION"
+          ls -l dist
+          # It must start, and be the version it is named after.
+          chmod +x dist/*.AppImage
+          dist/*.AppImage --appimage-extract-and-run --version | grep -F "gcal-client $VERSION"
+          test -f "dist/gcal-client-$VERSION-x86_64.AppImage.zsync"
+      - name: Keep the AppImage with this run
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gcal-client-appimage
+          path: dist/*
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes

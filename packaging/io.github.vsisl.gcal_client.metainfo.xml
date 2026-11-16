@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.vsisl.gcal_client</id>
+  <name>gcal-client</name>
+  <summary>Several Google accounts' calendars in one view</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="io.github.vsisl">
+    <name>Václav Šísl</name>
+  </developer>
+  <description>
+    <p>
+      A native desktop client for Google Calendar that shows the calendars of several
+      Google accounts, for example a personal and a work one, in one view. It follows
+      the web interface in its views and keyboard shortcuts.
+    </p>
+    <p>
+      It talks to Google and to nothing else: no statistics, no crash reports, no
+      update checks. Not affiliated with or endorsed by Google.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.vsisl.gcal_client.desktop</launchable>
+  <url type="homepage">https://github.com/vsisl/gcal-client</url>
+  <url type="bugtracker">https://github.com/vsisl/gcal-client/issues</url>
+  <content_rating type="oars-1.1"/>
+  <provides>
+    <binary>gcal-client</binary>
+  </provides>
+</component>

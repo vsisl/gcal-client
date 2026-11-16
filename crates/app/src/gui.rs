@@ -2999,7 +2999,13 @@ impl View {
     }
 }
 
+/// The app's name for the desktop: by it a window is matched with the launcher's
+/// entry and icon (`packaging/`, where the files carry the same name).
+const APP_ID: &str = "io.github.vsisl.gcal_client";
+
 pub fn run() -> Result<()> {
+    // Before the window exists. A desktop that does not take it is no reason to stop.
+    let _ = slint::set_xdg_app_id(APP_ID);
     let ui = AppWindow::new()?;
     let zone = local_zone();
     let commands = worker::spawn(ui.as_weak());

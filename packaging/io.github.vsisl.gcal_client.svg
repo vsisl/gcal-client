@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- The app's own icon: a calendar sheet with three accounts' events on it. -->
+  <rect x="16" y="16" width="224" height="224" rx="48" fill="#2f3a8f"/>
+  <rect x="48" y="64" width="160" height="144" rx="18" fill="#ffffff"/>
+  <path d="M48 82a18 18 0 0 1 18-18h124a18 18 0 0 1 18 18v22H48z" fill="#e8eaf6"/>
+  <rect x="80" y="46" width="14" height="38" rx="7" fill="#ffffff" stroke="#2f3a8f" stroke-width="4"/>
+  <rect x="162" y="46" width="14" height="38" rx="7" fill="#ffffff" stroke="#2f3a8f" stroke-width="4"/>
+  <rect x="66" y="120" width="76" height="18" rx="9" fill="#f2994a"/>
+  <rect x="114" y="146" width="76" height="18" rx="9" fill="#27ae8f"/>
+  <rect x="66" y="172" width="52" height="18" rx="9" fill="#9b59d0"/>
+</svg>
