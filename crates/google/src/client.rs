@@ -1,5 +1,7 @@
 //! Authenticated access to the Calendar API for one signed-in account.
 
+use std::sync::atomic::Ordering;
+
 use chrono::{DateTime, Utc};
 use reqwest::Method;
 use reqwest::header::IF_MATCH;
@@ -96,6 +98,8 @@ pub struct GoogleClient {
     endpoints: Endpoints,
     refresh_token: String,
     access: Mutex<Option<Access>>,
+    /// Whether Google has been told to get its search of contacts ready.
+    people_ready: std::sync::atomic::AtomicBool,
 }
 
 impl GoogleClient {
@@ -111,6 +115,7 @@ impl GoogleClient {
             endpoints,
             refresh_token,
             access: Mutex::new(None),
+            people_ready: Default::default(),
         }
     }
 
@@ -341,6 +346,12 @@ impl GoogleClient {
                 &directory,
             ),
         ];
+        // Google searches contacts in a copy it prepares on request: without this
+        // first, empty search it may answer from an old copy, without contacts added
+        // since. Once for each connection; if it fails, the search says why.
+        if !query.is_empty() && !self.people_ready.swap(true, Ordering::Relaxed) {
+            let _ = Box::pin(self.search_people("", sources)).await;
+        }
         let mut people: Vec<Person> = Vec::new();
         let (mut failure, mut answered) = (None, false);
         for (source, path, parameters) in searches {
@@ -649,7 +660,50 @@ mod tests {
         assert_eq!(client.search_people("an", &[]).await.unwrap(), vec![]);
         let asked = server.received_requests().await.unwrap();
         let searches = asked.iter().filter(|r| r.url.path().contains("people-api"));
-        assert_eq!(searches.count(), 1);
+        // The one allowed source twice: to get ready, and the search.
+        assert_eq!(searches.count(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_first_search_tells_google_to_get_ready_first() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        let client = client(&server).await;
+        let all = [
+            Permission::Contacts,
+            Permission::OtherContacts,
+            Permission::Directory,
+        ];
+        client.search_people("an", &all).await.unwrap();
+        client.search_people("ann", &all).await.unwrap();
+
+        let asked = server.received_requests().await.unwrap();
+        let searches: Vec<String> = asked
+            .iter()
+            .filter(|r| r.url.path().contains("people-api"))
+            .map(|r| {
+                let query = r.url.query_pairs().find(|(k, _)| k == "query").unwrap().1;
+                format!("{} {query}", r.url.path().rsplit('/').next().unwrap())
+            })
+            .collect();
+        assert_eq!(
+            searches,
+            [
+                // Getting ready: contacts and other contacts; the directory has none.
+                "people:searchContacts ",
+                "otherContacts:search ",
+                "people:searchContacts an",
+                "otherContacts:search an",
+                "people:searchDirectoryPeople an",
+                // Once is enough.
+                "people:searchContacts ann",
+                "otherContacts:search ann",
+                "people:searchDirectoryPeople ann",
+            ]
+        );
     }
 
     #[tokio::test]

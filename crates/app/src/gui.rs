@@ -163,6 +163,24 @@ fn shown_dates(day: NaiveDate) -> NaiveDate {
     day.clamp(first, last)
 }
 
+/// The addresses typed in the guests field before the word a suggestion stands for
+/// ("ann@example.com, bo" with a suggestion for "bo"). Earlier words of a name being
+/// typed ("bob sm") are no addresses and are dropped with it; but something that was
+/// meant as an address and is none fails with a sentence, as it does without a
+/// suggestion.
+fn typed_before_suggestion(text: &str) -> Result<Vec<&str>, String> {
+    let word = text
+        .rsplit([',', ';', ' ', '\n', '\t'])
+        .next()
+        .unwrap_or("");
+    let before = &text[..text.len() - word.len()];
+    if before.contains('@') {
+        editor::addresses(before)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
 /// For the settings: what each account lets the app do. One number for each of
 /// `Permission::ALL`, in that order: 0 not known yet (the account was signed in before
 /// the app kept this; the next sync tells), 1 allowed, 2 not allowed.
@@ -2383,17 +2401,33 @@ impl View {
                 true
             }
             Err(problem) => match ui.get_guest_suggestions().row_data(0) {
-                Some(first) => {
-                    self.add_guest(&first.email, &first.name);
-                    ui.set_editor_error(SharedString::new());
-                    self.clear_suggestions(&ui);
-                    true
-                }
+                Some(first) => self.add_suggested(&ui, text, &first),
                 None => {
                     ui.set_editor_error(problem.into());
                     false
                 }
             },
+        }
+    }
+
+    /// Adds a suggested person, and with them the addresses typed before the word
+    /// they were suggested for. If something there is wrong, nothing is added and
+    /// the editor says so; the field then keeps its text.
+    fn add_suggested(&self, ui: &AppWindow, text: &str, person: &Suggestion) -> bool {
+        match typed_before_suggestion(text) {
+            Ok(addresses) => {
+                for address in addresses {
+                    self.add_guest(address, "");
+                }
+                self.add_guest(&person.email, &person.name);
+                ui.set_editor_error(SharedString::new());
+                self.clear_suggestions(ui);
+                true
+            }
+            Err(problem) => {
+                ui.set_editor_error(problem.into());
+                false
+            }
         }
     }
 
@@ -2435,14 +2469,18 @@ impl View {
         }
     }
 
-    /// A suggested person was chosen: joins the guests, by name.
-    fn pick_suggestion(&self, row: usize) {
-        let Some(ui) = self.ui.upgrade() else { return };
-        if let Some(person) = ui.get_guest_suggestions().row_data(row) {
-            self.add_guest(&person.email, &person.name);
-            ui.set_editor_error(SharedString::new());
-        }
-        self.clear_suggestions(&ui);
+    /// A suggested person was chosen: joins the guests, by name, after the addresses
+    /// typed before. Says whether the field's text was used up.
+    fn pick_suggestion(&self, row: usize) -> bool {
+        let Some(ui) = self.ui.upgrade() else {
+            return false;
+        };
+        let Some(person) = ui.get_guest_suggestions().row_data(row) else {
+            self.clear_suggestions(&ui);
+            return false;
+        };
+        let text = ui.get_editor().guests;
+        self.add_suggested(&ui, &text, &person)
     }
 
     fn add_guest(&self, address: &str, name: &str) {
@@ -3401,6 +3439,27 @@ mod tests {
 
     fn date(text: &str) -> NaiveDate {
         text.parse().unwrap()
+    }
+
+    #[test]
+    fn a_suggestion_keeps_the_addresses_typed_before_it() {
+        assert_eq!(typed_before_suggestion("bo"), Ok(vec![]));
+        assert_eq!(
+            typed_before_suggestion("ann@example.com, cy@example.com;bo"),
+            Ok(vec!["ann@example.com", "cy@example.com"])
+        );
+        // A name of two words is one person, not an address gone wrong.
+        assert_eq!(typed_before_suggestion("bob sm"), Ok(vec![]));
+        // What was meant as an address and is none is said, not dropped.
+        assert_eq!(
+            typed_before_suggestion("ann@example, bo"),
+            Err("“ann@example” is not an e-mail address.".into())
+        );
+        // Text that is not ASCII is cut at the word, not inside a letter.
+        assert_eq!(
+            typed_before_suggestion("žo@example.com, šá"),
+            Ok(vec!["žo@example.com"])
+        );
     }
 
     #[test]

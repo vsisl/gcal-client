@@ -656,7 +656,8 @@ export component AppWindow inherits Window {
     in-out property <string> guest-suggest-problem;
     // The field's text changed (with the calendar chosen for a new event).
     callback editor-guest-typed(string, int);
-    callback editor-guest-pick(int);
+    // Returns whether the field's text was used up (and is to be emptied).
+    callback editor-guest-pick(int) -> bool;
     callback editor-guest-optional(int);
     callback editor-requested(int);
     callback editor-from-draft(string, int);
@@ -2974,16 +2975,18 @@ export component AppWindow inherits Window {
                                 accessible-role: list-item;
                                 accessible-label: "Suggestion: \{person.email}";
                                 accessible-action-default => {
-                                    root.editor-guest-pick(i);
-                                    guest-field.clear();
-                                    root.editor.guests = "";
+                                    if (root.editor-guest-pick(i)) {
+                                        guest-field.clear();
+                                        root.editor.guests = "";
+                                    }
                                 }
 
                                 person-touch := TouchArea {
                                     clicked => {
-                                        root.editor-guest-pick(i);
-                                        guest-field.clear();
-                                        root.editor.guests = "";
+                                        if (root.editor-guest-pick(i)) {
+                                            guest-field.clear();
+                                            root.editor.guests = "";
+                                        }
                                     }
                                 }
 
@@ -3179,6 +3182,9 @@ export component AppWindow inherits Window {
                             current: root.draft-calendar;
                             chosen(i) => {
                                 root.draft-calendar = i;
+                                // Suggested guests are another account's now: they
+                                // go, and are asked for again from this one.
+                                root.editor-guest-typed(root.editor.guests, i);
                             }
                         }
                         if !root.editor-new: Text {
