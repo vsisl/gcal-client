@@ -6,6 +6,11 @@
 # Needs `appimagetool` on the PATH (https://github.com/AppImage/appimagetool) and,
 # with update information, `zsyncmake` (package "zsync").
 #
+# APPIMAGE_RUNTIME, if set, is the runtime file to put at the front of the AppImage
+# (https://github.com/AppImage/type2-runtime). Without it appimagetool downloads the
+# newest one, which nothing has checked: releases set it to a file with a known
+# checksum.
+#
 # Nothing but the binary goes in. It links to the C library and fontconfig and loads
 # the desktop's own Wayland/X11, keyboard and OpenGL libraries when it starts: all of
 # them belong to the system the AppImage runs on, and the AppImage project's list of
@@ -49,9 +54,12 @@ out=$(cd "$out" && pwd)
 name="gcal-client-$version-x86_64.AppImage"
 # appimagetool writes the .zsync file into the folder it is run in.
 cd "$out"
-if [ -n "$update" ]; then
-    ARCH=x86_64 VERSION="$version" appimagetool --updateinformation "$update" "$app" "$name"
-else
-    ARCH=x86_64 VERSION="$version" appimagetool "$app" "$name"
+set --
+if [ -n "${APPIMAGE_RUNTIME:-}" ]; then
+    set -- --runtime-file "$APPIMAGE_RUNTIME"
 fi
+if [ -n "$update" ]; then
+    set -- "$@" --updateinformation "$update"
+fi
+ARCH=x86_64 VERSION="$version" appimagetool "$@" "$app" "$name"
 echo "$out/$name"

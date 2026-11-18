@@ -28,6 +28,18 @@ def press(role, text):
 
 
 time.sleep(1)
+# Before any picture is kept: the window must be the one on the made-up data. The test
+# server's port may belong to another test app, showing a real calendar.
+sys.path.insert(0, __file__.rsplit("/", 1)[0])
+from make_demo_cache import HOME, WORK  # noqa: E402
+
+shown = sorted(label(h)[len("Remove account "):] for h in find("Button")
+               if label(h).startswith("Remove account "))
+if shown != sorted([HOME, WORK]):
+    sys.exit(f"screenshots: the window does not show the made-up accounts alone ({len(shown)} accounts)")
+cached = sorted(r[0] for r in sqlite3.connect(f"file:{dbpath}?mode=ro", uri=True).execute("select email from accounts"))
+if cached != shown:
+    sys.exit("screenshots: the cache given is not the made-up one")
 key("w")
 shot("week")
 key("m")

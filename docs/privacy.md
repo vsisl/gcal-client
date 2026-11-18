@@ -45,7 +45,11 @@ including the Limited Use requirements.
 
 - **Remove account** in the app deletes that account's sign-in from the keyring and its
   copy of your calendars from the computer.
-- Deleting `~/.local/share/gcal-client` removes everything the app has kept.
+- Deleting `~/.local/share/gcal-client` afterwards removes what is left: the settings
+  and the cache's file. Remove the accounts first: the folder alone does not hold the
+  sign-ins (they are in the keyring), and without it the app no longer knows which
+  ones to delete.
+- Your own sign-in key, if you made one, is in `~/.config/gcal-client/client.toml`.
 - You can take back the app's access at any time in your Google Account, under
   "Third-party apps & services".
 
