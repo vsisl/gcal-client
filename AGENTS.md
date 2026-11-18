@@ -103,9 +103,9 @@ requests.
 | `crates/app/ui/app.slint` | The whole window |
 | `tools/e2e` | End-to-end scripts that drive the window against a test account |
 | `packaging` | The icon, the launcher's entry, the AppStream metadata, and the script that packs the AppImage |
-| `docs` | The homepage and the privacy policy (served by GitHub Pages), and the checklist for Google's review |
+| `docs` | The homepage and the privacy policy (everything here is served by GitHub Pages) |
 | `tools/demo` | Made-up data (two accounts, no real ones) and the script that takes the README's screenshots from it |
-| `plans` | Design and per-milestone plans |
+| `plans` | Design and per-milestone plans, and the owner's checklist for Google's review (kept off the website) |
 | `spikes` | Throwaway experiments from M0; not part of the workspace's product |
 
 ## How it hangs together

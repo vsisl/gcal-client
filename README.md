@@ -58,7 +58,7 @@ KWallet, where it keeps the accounts' sign-ins.
 Google does not allow an open-source project to publish its sign-in key, and this app has
 not been through Google's review yet. Until it has, everyone who runs it creates a key of
 their own, once. It is free and takes about ten minutes. (Getting the app reviewed, so
-that this step goes away, is under way: see [docs/google-review.md](docs/google-review.md).)
+that this step goes away, is under way: see [plans/google-review.md](plans/google-review.md).)
 
 1. Open the [Google Cloud Console](https://console.cloud.google.com/) and create a project.
 2. Under **APIs & Services → Library**, enable the **Google Calendar API** and, for

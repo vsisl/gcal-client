@@ -56,8 +56,8 @@ The app asks for four permissions, all of the kind Google calls **sensitive** (n
 
 Done in the repository:
 
-- [x] A privacy policy: [privacy.md](privacy.md).
-- [x] A homepage: [index.md](index.md) (to be served by GitHub Pages, below).
+- [x] A privacy policy: [docs/privacy.md](../docs/privacy.md).
+- [x] A homepage: [docs/index.md](../docs/index.md) (to be served by GitHub Pages, below).
 - [x] The app shows what each permission is for (Settings → Permissions…), and works
       without the optional ones.
 - [x] An icon of the app's own, without anything of Google's.

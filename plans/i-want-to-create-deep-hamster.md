@@ -143,7 +143,7 @@ clock, print.
 packaging and Flathub submission, release CI injecting the official key, accessibility pass.
 *Brought forward in part (2026-11-16): the AppImage and its release workflow, the README for
 the public, the privacy policy and homepage, and the checklist for Google's review
-(`docs/google-review.md`). Left: the name, the review itself, the official key in releases,
+(`plans/google-review.md`). Left: the name, the review itself, the official key in releases,
 the Flatpak, the accessibility pass.*
 
 **M9 — Windows and macOS** builds, keychains, installers.
