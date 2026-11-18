@@ -1314,6 +1314,10 @@ struct View {
     generation: Cell<i32>,
     /// The event the editor is open for.
     editing: RefCell<Option<Editing>>,
+    /// How long the event in the editor is (and whether all day), as it was opened or
+    /// as its end was last set: the end is moved to keep it when the start is changed.
+    /// See `editor::kept_length` for what may change it.
+    editor_length: Cell<Option<(bool, chrono::Duration)>>,
     /// The guests of the event in the editor, as the window lists them.
     editor_guests: Rc<VecModel<EditorGuest>>,
     /// Its own notifications, likewise.
@@ -2297,6 +2301,9 @@ impl View {
         self.editor_guests.set_vec(rows);
         self.clear_suggestions(ui);
         ui.set_editor(window);
+        // Of this event, not of the one the editor was open for before.
+        self.editor_length
+            .set(editor::length(&form).map(|length| (form.all_day, length)));
         self.editing.replace(Some(Editing {
             target,
             opened: form,
@@ -2445,6 +2452,35 @@ impl View {
         ui.set_guest_suggest_serial(ui.get_guest_suggest_serial().wrapping_add(1));
         ui.set_guest_suggestions(ModelRc::default());
         ui.set_guest_suggest_problem(SharedString::new());
+    }
+
+    /// The editor's form after its start was typed into: the end moves along, so that
+    /// the event stays as long as it was (as the web does). `before` is the form as it
+    /// was; while the new start cannot be read (half typed), the end stays.
+    fn start_edited(&self, before: EditorForm, date: &str, time: &str) -> EditorForm {
+        let mut form = before;
+        form.start_date = date.into();
+        form.start_time = time.into();
+        let now = from_window(&form);
+        if let Some((all_day, length)) = self.editor_length.get()
+            && all_day == now.all_day
+            && let Some((end_date, end_time)) = editor::end_for_length(&now, length)
+        {
+            form.end_date = end_date.into();
+            form.end_time = end_time.into();
+        }
+        form
+    }
+
+    /// The editor's end was typed into, or "all day" ticked or unticked: the length to
+    /// keep from now on.
+    fn length_edited(&self, form: &EditorForm) {
+        let form = from_window(form);
+        let kept = match self.editor_length.get() {
+            Some(kept) => Some(editor::kept_length(&form, kept)),
+            None => editor::length(&form).map(|length| (form.all_day, length)),
+        };
+        self.editor_length.set(kept);
     }
 
     /// The guests field was typed into: asks for people matching the word being
@@ -3021,6 +3057,7 @@ pub fn run() -> Result<()> {
         undo: RefCell::default(),
         asked: RefCell::default(),
         editing: RefCell::default(),
+        editor_length: Cell::default(),
         editor_guests: Rc::new(VecModel::default()),
         editor_notices: Rc::new(VecModel::default()),
         pending: RefCell::default(),
@@ -3248,6 +3285,14 @@ pub fn run() -> Result<()> {
                 ui.set_editor_usual_notices(true);
             }
         }
+    });
+    ui.on_editor_start_edited({
+        let view = view.clone();
+        move |before, date, time| view.start_edited(before, &date, &time)
+    });
+    ui.on_editor_length_edited({
+        let view = view.clone();
+        move |form| view.length_edited(&form)
     });
     ui.on_editor_guest_typed({
         let view = view.clone();
