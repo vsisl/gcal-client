@@ -294,6 +294,14 @@ component Field inherits Rectangle {
     public function clear() {
         input.text = "";
     }
+    // Typing cuts the text loose from `value`; a value changed from outside (the end
+    // of an event, moved along with its start) is put into the box all the same. What
+    // was typed into this box comes back as the same text and changes nothing.
+    changed value => {
+        if (input.text != root.value) {
+            input.text = root.value;
+        }
+    }
 
     // How tall a box of several lines is: the user can drag its lower edge.
     property <length> tall: 96px;
@@ -716,6 +724,9 @@ export component AppWindow inherits Window {
     // Returns whether the field's text was used up (and is to be emptied).
     callback editor-guest-pick(int) -> bool;
     callback editor-guest-optional(int);
+    // The start was typed into: the form as it was, the start's new date and time.
+    // Returns the form with them, and with the end moved to keep the event's length.
+    callback editor-start-edited(EditorForm, string, string) -> EditorForm;
     callback editor-requested(int);
     callback editor-from-draft(string, int);
     callback editor-save(EditorForm, int);
@@ -3029,7 +3040,7 @@ export component AppWindow inherits Window {
                             hint: "2026-11-17";
                             value: root.editor.start-date;
                             edited(text) => {
-                                root.editor.start-date = text;
+                                root.editor = root.editor-start-edited(root.editor, text, root.editor.start-time);
                             }
                         }
 
@@ -3038,7 +3049,7 @@ export component AppWindow inherits Window {
                             hint: "9:30";
                             value: root.editor.start-time;
                             edited(text) => {
-                                root.editor.start-time = text;
+                                root.editor = root.editor-start-edited(root.editor, root.editor.start-date, text);
                             }
                         }
                     }

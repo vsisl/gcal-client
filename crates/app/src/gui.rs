@@ -1314,6 +1314,10 @@ struct View {
     generation: Cell<i32>,
     /// The event the editor is open for.
     editing: RefCell<Option<Editing>>,
+    /// How long the event in the editor was when its start and end could last be read
+    /// (and whether it was all day then): the end is moved to keep it when the start
+    /// is changed.
+    editor_length: Cell<Option<(bool, chrono::Duration)>>,
     /// The guests of the event in the editor, as the window lists them.
     editor_guests: Rc<VecModel<EditorGuest>>,
     /// Its own notifications, likewise.
@@ -2447,6 +2451,30 @@ impl View {
         ui.set_guest_suggest_problem(SharedString::new());
     }
 
+    /// The editor's form after its start was typed into: the end moves along, so that
+    /// the event stays as long as it was (as the web does). `before` is the form as it
+    /// was; while the new start cannot be read (half typed), the end stays.
+    fn start_edited(&self, before: EditorForm, date: &str, time: &str) -> EditorForm {
+        let was = from_window(&before);
+        // The length is noted while the form can be read, and kept through the
+        // keystrokes during which it cannot.
+        if let Some(length) = editor::length(&was) {
+            self.editor_length.set(Some((was.all_day, length)));
+        }
+        let mut form = before;
+        form.start_date = date.into();
+        form.start_time = time.into();
+        let now = from_window(&form);
+        if let Some((all_day, length)) = self.editor_length.get()
+            && all_day == now.all_day
+            && let Some((end_date, end_time)) = editor::end_for_length(&now, length)
+        {
+            form.end_date = end_date.into();
+            form.end_time = end_time.into();
+        }
+        form
+    }
+
     /// The guests field was typed into: asks for people matching the word being
     /// typed, once it has two letters. `calendar` is the one chosen for a new event.
     fn suggest_guests(&self, text: &str, calendar: usize) {
@@ -3021,6 +3049,7 @@ pub fn run() -> Result<()> {
         undo: RefCell::default(),
         asked: RefCell::default(),
         editing: RefCell::default(),
+        editor_length: Cell::default(),
         editor_guests: Rc::new(VecModel::default()),
         editor_notices: Rc::new(VecModel::default()),
         pending: RefCell::default(),
@@ -3248,6 +3277,10 @@ pub fn run() -> Result<()> {
                 ui.set_editor_usual_notices(true);
             }
         }
+    });
+    ui.on_editor_start_edited({
+        let view = view.clone();
+        move |before, date, time| view.start_edited(before, &date, &time)
     });
     ui.on_editor_guest_typed({
         let view = view.clone();
