@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=gcal-client
+GenericName=Calendar
+Comment=Several Google accounts' calendars in one view
+Exec=gcal-client
+Icon=io.github.vsisl.gcal_client
+Terminal=false
+Categories=Office;Calendar;
+Keywords=calendar;events;schedule;agenda;
+StartupWMClass=io.github.vsisl.gcal_client

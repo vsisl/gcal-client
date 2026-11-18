@@ -1,0 +1,120 @@
+name: Release
+
+# A tag "v<version>" publishes that version: the AppImage and its .zsync file are
+# attached to a GitHub release. Every change that reaches main builds the same AppImage
+# and keeps it with the run, without publishing anything, so that a broken release is
+# found before the tag.
+#
+# Pull requests do not build it: the build takes about a quarter of an hour, and a pull
+# request is pushed to many times. To try a branch's AppImage before it is merged, as a
+# change to the packaging deserves, start the workflow by hand on that branch
+# (Actions → Release → Run workflow); that keeps the AppImage with the run too.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+# A newer push to the same branch makes the older build pointless. A tag's build is
+# never cancelled: it is a release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+# Building may only read the repository. Publishing is a job of its own, the only one
+# that may write, and it runs nothing from the repository.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Where published versions are found, written into each AppImage: the newest GitHub
+  # release of this repository. Gear Lever and other AppImage updaters read it.
+  UPDATE_INFORMATION: gh-releases-zsync|vsisl|gcal-client|latest|gcal-client-*-x86_64.AppImage.zsync
+  # The tool that packs the AppImage: a fixed version, checked against its checksum
+  # before it is run. To move to a newer one, change both.
+  APPIMAGETOOL_VERSION: 1.9.0
+  APPIMAGETOOL_SHA256: 46fdd785094c7f6e545b61afcfb0f3d98d8eab243f644b4b17698c01d06083d1
+  # The part of the AppImage that runs first on a user's computer. appimagetool
+  # would otherwise fetch the newest one at build time, unchecked.
+  APPIMAGE_RUNTIME_VERSION: "20251108"
+  APPIMAGE_RUNTIME_SHA256: 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+
+jobs:
+  appimage:
+    # The oldest image there is: the binary runs on this distribution's C library
+    # and every newer one.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          # The icon that goes into the AppImage is kept with Git LFS.
+          lfs: true
+      - name: Version
+        id: version
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # A release is named by its tag and built from Cargo.toml: the two must agree.
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "The tag $GITHUB_REF_NAME does not match the version $version in Cargo.toml." >&2
+            exit 1
+          fi
+      - name: Install system libraries and packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libfontconfig-dev libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev libdbus-1-dev zsync desktop-file-utils
+          curl -fsSL -o appimagetool "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage"
+          echo "$APPIMAGETOOL_SHA256  appimagetool" | sha256sum --check
+          chmod +x appimagetool
+          curl -fsSL -o appimage-runtime "https://github.com/AppImage/type2-runtime/releases/download/$APPIMAGE_RUNTIME_VERSION/runtime-x86_64"
+          echo "$APPIMAGE_RUNTIME_SHA256  appimage-runtime" | sha256sum --check
+          echo "APPIMAGE_RUNTIME=$PWD/appimage-runtime" >> "$GITHUB_ENV"
+          # The runner has no FUSE to mount an AppImage with: the tool unpacks itself.
+          printf '#!/bin/sh\nexec "%s/appimagetool" --appimage-extract-and-run "$@"\n' "$PWD" | sudo tee /usr/local/bin/appimagetool > /dev/null
+          sudo chmod +x /usr/local/bin/appimagetool
+      # The toolchain rust-toolchain.toml names, by the runner's own rustup, and no
+      # cache: what is published is built from a clean state, and by nothing but
+      # GitHub's own actions and the tool checked above.
+      - name: Install the Rust toolchain
+        run: rustup show
+      - run: cargo test --workspace
+      - run: cargo build --release -p gcal-client
+      - name: Pack the AppImage
+        env:
+          # Through the environment, not pasted into the script: it comes from a file
+          # anyone with a branch can change.
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          desktop-file-validate packaging/*.desktop
+          packaging/build-appimage.sh target/release/gcal-client "$VERSION" dist "$UPDATE_INFORMATION"
+          ls -l dist
+          # It must start, and be the version it is named after.
+          chmod +x dist/*.AppImage
+          dist/*.AppImage --appimage-extract-and-run --version | grep -F "gcal-client $VERSION"
+          test -f "dist/gcal-client-$VERSION-x86_64.AppImage.zsync"
+      - name: Keep the AppImage with this run
+        uses: actions/upload-artifact@v4
+        with:
+          name: gcal-client-appimage
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    # Only a pushed tag publishes. A run started by hand keeps its AppImage with the
+    # run, even when it is started on a tag.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: appimage
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: gcal-client-appimage
+          path: dist
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

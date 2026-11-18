@@ -23,7 +23,8 @@ const USAGE: &str = "usage: gcal-client [command]
   login            sign in to a Google account in your browser, then sync it
   sync             fetch changes for every signed-in account
   accounts         list signed-in accounts and their calendars
-  logout <email>   remove an account and its cached data";
+  logout <email>   remove an account and its cached data
+  --version        print the version";
 
 fn config_path() -> Result<PathBuf> {
     Ok(dirs::config_dir()
@@ -253,6 +254,10 @@ fn main() -> Result<()> {
         .build()?;
     runtime.block_on(async {
         match args.as_slice() {
+            ["--version"] => {
+                println!("gcal-client {}", env!("CARGO_PKG_VERSION"));
+                Ok(())
+            }
             ["login"] => login().await,
             ["sync"] => sync().await,
             ["accounts"] => accounts(),

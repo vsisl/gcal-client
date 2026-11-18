@@ -3035,8 +3035,18 @@ impl View {
     }
 }
 
+/// The app's name for the desktop: by it a window is matched with the launcher's
+/// entry and icon (`packaging/`, where the files carry the same name).
+const APP_ID: &str = "io.github.vsisl.gcal_client";
+
 pub fn run() -> Result<()> {
     let ui = AppWindow::new()?;
+    // After the first window is made (before it, Slint has no platform to tell and
+    // answers with an error) and before it is shown. A desktop that does not take the
+    // name is no reason to stop.
+    if let Err(error) = slint::set_xdg_app_id(APP_ID) {
+        eprintln!("The desktop was not told the app's name: {error}");
+    }
     let zone = local_zone();
     let commands = worker::spawn(ui.as_weak());
     let view = Rc::new(View {
@@ -3537,8 +3547,13 @@ pub fn run() -> Result<()> {
 
     view.reload();
     ui.invoke_scroll_to_hour(FIRST_VISIBLE_HOUR);
-    // Show what is cached at once, and fetch changes in the background.
-    let _ = commands.send(Command::SyncAll);
+    // Show what is cached at once, and fetch changes in the background. A test build
+    // can be told not to (GCAL_UITEST_NO_SYNC), for screenshots of made-up data
+    // (tools/demo), whose accounts are signed in nowhere: the window then opens without
+    // a complaint about that.
+    if !(cfg!(feature = "ui-testing") && std::env::var_os("GCAL_UITEST_NO_SYNC").is_some()) {
+        let _ = commands.send(Command::SyncAll);
+    }
 
     ui.run()?;
     Ok(())

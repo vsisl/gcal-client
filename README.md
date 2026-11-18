@@ -1,14 +1,29 @@
 # gcal-client
 
-Google Calendar native desktop client, behaves just like Google calendar web interface but supports multiple Google accounts 
-natively, just like the mobile Google Calendar app does.
+[![Sponsor on GitHub](https://img.shields.io/badge/Sponsor-GitHub-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/vsisl)
+[![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-ffdd00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/vsisl)
 
-Several accounts (for example personal and work) are shown in one view, with the web
-interface's keyboard shortcuts. It aims to be fast and light on memory.
+A native desktop client for Google Calendar that shows the calendars of several Google
+accounts in one view, the way the phone app does and the web interface does not.
+
+- **Several accounts at once**: for example a personal and a work account, side by side,
+  each calendar ticked on and off.
+- **Works like the web interface**: the same views, the same keyboard shortcuts.
+- **Native and light**: written in Rust, no browser inside.
+- **Private**: it talks to Google and to nothing else. No statistics, no crash reports,
+  no update checks.
+
+![The week view with the calendars of two accounts](docs/screenshots/week.png)
+
+<sub>Made-up data. More pictures: [month](docs/screenshots/month.png),
+[an event](docs/screenshots/details.png), [the editor](docs/screenshots/editor.png).</sub>
 
 Not affiliated with or endorsed by Google. Google Calendar is a trademark of Google LLC.
 
-**Status:** early development, Linux only so far. `gcal-client` is a working name.
+**Status:** early development. Linux only so far. `gcal-client` is a
+working name.
+
+## What it can do
 
 | Works | Not yet |
 |---|---|
@@ -17,31 +32,33 @@ Not affiliated with or endorsed by Google. Google Calendar is a trademark of Goo
 | Create, edit, move, resize and delete events, with undo (two exceptions, see below) | Date and time pickers (dates and times are typed), custom repeat rules |
 | Repeating events: "this / this and following / all"; guests (also optional ones, suggested from your contacts), answering invitations, Google Meet links, several notifications per event | Notifications shown on the desktop, tray icon, running in the background |
 | Settings: theme, first day of the week, 12/24-hour clock, zoom | Tasks, birthdays, out of office and other special entries |
-| Works offline for viewing; syncs every five minutes | Packaging (Flatpak), Windows and macOS |
+| Works offline for viewing; syncs every five minutes | A Flatpak, Windows and macOS |
 
-There is no installer yet: you build it yourself, and you need your own Google sign-in key
-(below).
+## Install
 
-## Building
+1. Download `gcal-client-<version>-x86_64.AppImage` from the
+   [latest release](https://github.com/vsisl/gcal-client/releases/latest).
+2. Either open it with [Gear Lever](https://flathub.org/apps/it.mijorus.gearlever), which
+   adds it to your applications and **keeps it up to date** (it finds new releases by
+   itself), or make it executable and start it:
 
-Requires the Rust toolchain ([rustup](https://rustup.rs); the current stable release, as
-`rust-toolchain.toml` says) and, on Debian/Ubuntu:
+   ```sh
+   chmod +x gcal-client-*-x86_64.AppImage
+   ./gcal-client-*-x86_64.AppImage
+   ```
 
-```sh
-sudo apt install pkg-config libfontconfig-dev libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev libdbus-1-dev
-```
+3. Create your own Google sign-in key, once (next section). Without it the app starts but
+   cannot sign in.
 
-Then:
-
-```sh
-cargo run --release -p gcal-client
-```
+It needs a 64-bit Linux desktop (Wayland or X11) with a keyring such as GNOME Keyring or
+KWallet, where it keeps the accounts' sign-ins.
 
 ## Your own Google sign-in key
 
 Google does not allow an open-source project to publish its sign-in key, and this app has
 not been through Google's review yet. Until it has, everyone who runs it creates a key of
-their own, once. It is free.
+their own, once. It is free and takes about ten minutes. (Getting the app reviewed, so
+that this step goes away, is under way: see [docs/google-review.md](docs/google-review.md).)
 
 1. Open the [Google Cloud Console](https://console.cloud.google.com/) and create a project.
 2. Under **APIs & Services → Library**, enable the **Google Calendar API** and, for
@@ -130,6 +147,27 @@ gcal-client accounts         list signed-in accounts and their calendars
 gcal-client logout <email>   remove an account and its cached data
 ```
 
+## Privacy
+
+The app talks to Google's servers and to nothing else. What it fetches stays on your
+computer; nothing is sent to the author or to anyone else. The details, including what
+each Google permission is used for, are in [docs/privacy.md](docs/privacy.md).
+
+## Building from source
+
+Requires the Rust toolchain ([rustup](https://rustup.rs); the current stable release, as
+`rust-toolchain.toml` says) and, on Debian/Ubuntu:
+
+```sh
+sudo apt install pkg-config libfontconfig-dev libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev libdbus-1-dev
+```
+
+Then:
+
+```sh
+cargo run --release -p gcal-client
+```
+
 ## For developers
 
 The design, the decisions behind it and the roadmap are in
@@ -158,6 +196,12 @@ cargo test --workspace
 tested end to end against a real test account with the scripts in [tools/e2e](tools/e2e);
 `AGENTS.md` says how to run them safely.
 
+## Supporting it
+
+The app is free and stays free. If it saves you time and you want to say thanks:
+[buy me a coffee](https://buymeacoffee.com/vsisl), or use the Sponsor button at the top of
+the repository.
+
 ## Licence
 
-GPL-3.0-or-later, see [LICENSE](LICENSE).
+[GPL-3.0-or-later](LICENSE).
