@@ -45,7 +45,14 @@ For the owner:
       be switched to `main` (Settings → Pages), or the site goes away with the branch.
 - [x] **The homepage is proved to be the owner's** in Google Search Console
       (2026-11-18): the address is a "URL prefix" property, verified by the file
-      `docs/google7d20fb683ac7b8d5.html`, which must stay.
+      `docs/google7d20fb683ac7b8d5.html`, which must stay. The whole site
+      `https://vsisl.github.io/` is verified too, by the same file in the repository
+      `vsisl.github.io`, because the authorised domain is the site and not the path.
+- [ ] **Verify the branding** (Branding → the summary panel → "Verify branding").
+      Tried on 2026-11-18 two hours after the proof of ownership: refused with "the
+      website of your home page URL is not registered to you … wait 24 hours". To be
+      tried again from 2026-11-19 afternoon. The scopes cannot be submitted before it
+      passes.
       If Google does not accept an address under `github.io` as the app's domain, a
       domain of your own is needed, pointed at the same pages.
 - [x] In the Cloud Console (project `gcal-client-dev`), under **Google Auth Platform →
