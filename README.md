@@ -193,6 +193,12 @@ cargo test --workspace
 tested end to end against a real test account with the scripts in [tools/e2e](tools/e2e);
 `AGENTS.md` says how to run them safely.
 
+## Supporting it
+
+The app is free and stays free. If it saves you time and you want to say thanks:
+[buy me a coffee](https://buymeacoffee.com/vsisl), or use the Sponsor button at the top of
+the repository.
+
 ## Licence
 
 [GPL-3.0-or-later](LICENSE).
