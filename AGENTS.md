@@ -76,6 +76,10 @@ requests.
   (`[workspace.package]`). The release workflow builds the AppImage, checks that it
   starts, and attaches it and its `.zsync` file to a GitHub release. Only the owner
   tags.
+- The AppImage is also built for every change that reaches `main` (kept with the run,
+  not published), not for pull requests: it takes a quarter of an hour. A pull request
+  that changes `packaging/` or the release workflow gets a build started by hand on
+  its branch (Actions → Release → Run workflow) before it is merged.
 - The file name `gcal-client-<version>-x86_64.AppImage` and the update information in
   the workflow belong together: Gear Lever finds new versions by them. Change neither
   without the other.
