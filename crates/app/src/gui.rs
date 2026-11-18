@@ -3004,9 +3004,13 @@ impl View {
 const APP_ID: &str = "io.github.vsisl.gcal_client";
 
 pub fn run() -> Result<()> {
-    // Before the window exists. A desktop that does not take it is no reason to stop.
-    let _ = slint::set_xdg_app_id(APP_ID);
     let ui = AppWindow::new()?;
+    // After the first window is made (before it, Slint has no platform to tell and
+    // answers with an error) and before it is shown. A desktop that does not take the
+    // name is no reason to stop.
+    if let Err(error) = slint::set_xdg_app_id(APP_ID) {
+        eprintln!("The desktop was not told the app's name: {error}");
+    }
     let zone = local_zone();
     let commands = worker::spawn(ui.as_weak());
     let view = Rc::new(View {
