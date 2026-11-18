@@ -33,14 +33,16 @@ Done in the repository:
 
 For the owner:
 
-- [ ] **Decide the app's name.** Google's branding rules do not allow a name that
-      contains a Google product name or could be taken for one; "gcal" may be judged too
-      close. The name is on the consent page, in the launcher and in the AppImage's
-      file name, so it is better changed before the first public release than after.
-- [ ] **Make the repository public** and switch on GitHub Pages for the `docs` folder
-      (Settings → Pages → Deploy from a branch → `main`, `/docs`). The homepage is then
-      `https://vsisl.github.io/gcal-client/` and the policy
-      `https://vsisl.github.io/gcal-client/privacy`.
+- [x] **The app's name**: `gcal-client` stays, decided by the owner on 2026-11-18,
+      unless Google refuses it. Google's branding rules do not allow a name that
+      contains a Google product name or could be taken for one, and "gcal" may be
+      judged too close; if so, the name changes then (it is on the consent page, in the
+      launcher and in the AppImage's file name) and the app is submitted again.
+- [x] **The repository is public** (2026-11-18) and GitHub Pages serves the `docs`
+      folder: the homepage is `https://vsisl.github.io/gcal-client/` and the policy
+      `https://vsisl.github.io/gcal-client/privacy`. Until the going-public pull request
+      is merged, Pages is set to the branch `release-appimage`; after the merge it must
+      be switched to `main` (Settings → Pages), or the site goes away with the branch.
 - [ ] **Prove the homepage is yours** in Google Search Console (add the address as a
       "URL prefix" property and place the file or tag it gives you in `docs/`).
       If Google does not accept an address under `github.io` as the app's domain, a
