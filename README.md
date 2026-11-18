@@ -10,6 +10,11 @@ accounts in one view, the way the phone app does and the web interface does not.
 - **Private**: it talks to Google and to nothing else. No statistics, no crash reports,
   no update checks.
 
+![The week view with the calendars of two accounts](docs/screenshots/week.png)
+
+<sub>Made-up data. More pictures: [month](docs/screenshots/month.png),
+[an event](docs/screenshots/details.png), [the editor](docs/screenshots/editor.png).</sub>
+
 Not affiliated with or endorsed by Google. Google Calendar is a trademark of Google LLC.
 
 **Status:** early development. Linux only so far. `gcal-client` is a

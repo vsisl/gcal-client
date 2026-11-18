@@ -97,6 +97,7 @@ requests.
 | `tools/e2e` | End-to-end scripts that drive the window against a test account |
 | `packaging` | The icon, the launcher's entry, the AppStream metadata, and the script that packs the AppImage |
 | `docs` | The homepage and the privacy policy (served by GitHub Pages), and the checklist for Google's review |
+| `tools/demo` | Made-up data (two accounts, no real ones) and the script that takes the README's screenshots from it |
 | `plans` | Design and per-milestone plans |
 | `spikes` | Throwaway experiments from M0; not part of the workspace's product |
 

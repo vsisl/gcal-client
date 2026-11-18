@@ -3502,8 +3502,13 @@ pub fn run() -> Result<()> {
 
     view.reload();
     ui.invoke_scroll_to_hour(FIRST_VISIBLE_HOUR);
-    // Show what is cached at once, and fetch changes in the background.
-    let _ = commands.send(Command::SyncAll);
+    // Show what is cached at once, and fetch changes in the background. A test build
+    // can be told not to (GCAL_UITEST_NO_SYNC), for screenshots of made-up data
+    // (tools/demo), whose accounts are signed in nowhere: the window then opens without
+    // a complaint about that.
+    if !(cfg!(feature = "ui-testing") && std::env::var_os("GCAL_UITEST_NO_SYNC").is_some()) {
+        let _ = commands.send(Command::SyncAll);
+    }
 
     ui.run()?;
     Ok(())
