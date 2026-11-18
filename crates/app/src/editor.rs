@@ -252,6 +252,68 @@ fn parse_time(text: &str, what: &str) -> Result<NaiveTime, String> {
         .map_err(|_| format!("The {what} time should look like 9:30."))
 }
 
+/// How long the form's event is: in whole days if it is all day (0 for one day), else
+/// by the clock. None while a date or time cannot be read, or if it ends before it
+/// starts.
+pub fn length(form: &Form) -> Option<Duration> {
+    let first = parse_date(&form.start_date, "start").ok()?;
+    let last = parse_date(&form.end_date, "end").ok()?;
+    let length = if form.all_day {
+        last - first
+    } else {
+        last.and_time(parse_time(&form.end_time, "end").ok()?)
+            - first.and_time(parse_time(&form.start_time, "start").ok()?)
+    };
+    (length >= Duration::zero()).then_some(length)
+}
+
+/// The length to keep for the form's event after its end was typed into or "all day"
+/// was ticked or unticked, given the length kept so far (`all_day`, how long).
+///
+/// Only these, and opening the editor, set the kept length. Typing into the start never
+/// does: a start half typed can read as a date of its own ("2026-11-1" on the way to
+/// "2026-11-18"), and a length taken from that would move the end somewhere absurd.
+///
+/// While the form cannot be read, or ends before it starts, the kept length stays; if
+/// "all day" changed meanwhile, it is turned into the other kind: whole days for an
+/// all-day event, and for a timed one those days and what the time boxes say (an hour
+/// if they say nothing usable).
+pub fn kept_length(form: &Form, kept: (bool, Duration)) -> (bool, Duration) {
+    if let Some(length) = length(form) {
+        return (form.all_day, length);
+    }
+    let (was_all_day, length) = kept;
+    if was_all_day == form.all_day {
+        return kept;
+    }
+    if form.all_day {
+        return (true, Duration::days(length.num_days()));
+    }
+    let by_the_clock = parse_time(&form.start_time, "start")
+        .ok()
+        .zip(parse_time(&form.end_time, "end").ok())
+        .map(|(from, to)| to - from)
+        .filter(|span| *span >= Duration::zero())
+        .unwrap_or_else(|| Duration::hours(1));
+    (false, length + by_the_clock)
+}
+
+/// The end (date, time) that makes the form's event `length` long from its start, for
+/// moving the end along when the start is changed, as the web does. Reckoned on the
+/// clock, so an event moved across a clock change keeps its times of day. None while
+/// the start cannot be read.
+pub fn end_for_length(form: &Form, length: Duration) -> Option<(String, String)> {
+    let first = parse_date(&form.start_date, "start").ok()?;
+    if form.all_day {
+        let last = first.checked_add_signed(length)?;
+        return Some((last.to_string(), form.end_time.clone()));
+    }
+    let end = first
+        .and_time(parse_time(&form.start_time, "start").ok()?)
+        .checked_add_signed(length)?;
+    Some((end.date().to_string(), end.format("%-H:%M").to_string()))
+}
+
 /// The day the form's event starts on.
 pub fn start_day(form: &Form) -> Result<NaiveDate, String> {
     parse_date(&form.start_date, "start")
@@ -698,6 +760,126 @@ pub fn following_series(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_half_typed_start_never_sets_the_length() {
+        // The end was typed to before the start: the event has no length of its own,
+        // and the one kept so far stays (found by review: it used to be taken from
+        // whatever the form held before each keystroke in the start).
+        let form = Form {
+            start_date: "2026-11-17".into(),
+            start_time: "9:00".into(),
+            end_date: "2026-11-17".into(),
+            end_time: "8:00".into(),
+            ..Form::default()
+        };
+        let hour = (false, Duration::hours(1));
+        assert_eq!(kept_length(&form, hour), hour);
+        // A readable end sets it.
+        let form = Form {
+            end_time: "11:30".into(),
+            ..form
+        };
+        assert_eq!(kept_length(&form, hour), (false, Duration::minutes(150)));
+    }
+
+    #[test]
+    fn all_day_ticked_while_the_start_is_empty_keeps_whole_days() {
+        // A one-hour event, its start date cleared, then "all day": the kept length
+        // becomes no extra days, so that the date typed next gives a one-day event
+        // (found by review: it gave seventeen days).
+        let mut form = Form {
+            all_day: true,
+            start_date: String::new(),
+            start_time: "9:00".into(),
+            end_date: "2026-11-17".into(),
+            end_time: "10:00".into(),
+            ..Form::default()
+        };
+        let kept = kept_length(&form, (false, Duration::hours(1)));
+        assert_eq!(kept, (true, Duration::zero()));
+        form.start_date = "2026-11-1".into();
+        assert_eq!(
+            end_for_length(&form, kept.1),
+            Some(("2026-11-01".into(), "10:00".into()))
+        );
+        form.start_date = "2026-11-18".into();
+        assert_eq!(
+            end_for_length(&form, kept.1),
+            Some(("2026-11-18".into(), "10:00".into()))
+        );
+        // And back, the start still unreadable: the days and the time boxes' hour.
+        form.all_day = false;
+        form.start_date = String::new();
+        assert_eq!(
+            kept_length(&form, (true, Duration::days(2))),
+            (false, Duration::days(2) + Duration::hours(1))
+        );
+    }
+
+    #[test]
+    fn the_end_follows_a_changed_start() {
+        let mut form = Form {
+            start_date: "2026-11-17".into(),
+            start_time: "9:00".into(),
+            end_date: "2026-11-17".into(),
+            end_time: "10:30".into(),
+            ..Form::default()
+        };
+        let kept = length(&form).unwrap();
+        assert_eq!(kept, Duration::minutes(90));
+        // Later the same day, and past midnight.
+        form.start_time = "14:15".into();
+        assert_eq!(
+            end_for_length(&form, kept),
+            Some(("2026-11-17".into(), "15:45".into()))
+        );
+        form.start_time = "23".into();
+        assert_eq!(
+            end_for_length(&form, kept),
+            Some(("2026-11-18".into(), "0:30".into()))
+        );
+        // Another day.
+        form.start_date = "2026-12-31".into();
+        assert_eq!(
+            end_for_length(&form, kept),
+            Some(("2027-01-01".into(), "0:30".into()))
+        );
+        // Half typed: nothing to go by.
+        form.start_time = "1x".into();
+        assert_eq!(end_for_length(&form, kept), None);
+        assert_eq!(length(&form), None);
+    }
+
+    #[test]
+    fn an_all_day_event_keeps_its_days() {
+        let mut form = Form {
+            all_day: true,
+            start_date: "2026-11-17".into(),
+            end_date: "2026-11-19".into(),
+            end_time: "10:00".into(),
+            ..Form::default()
+        };
+        let kept = length(&form).unwrap();
+        assert_eq!(kept, Duration::days(2));
+        form.start_date = "2026-11-30".into();
+        assert_eq!(
+            end_for_length(&form, kept),
+            Some(("2026-12-02".into(), "10:00".into()))
+        );
+    }
+
+    #[test]
+    fn an_event_that_ends_before_it_starts_has_no_length() {
+        let form = Form {
+            start_date: "2026-11-17".into(),
+            start_time: "9:00".into(),
+            end_date: "2026-11-17".into(),
+            end_time: "8:00".into(),
+            ..Form::default()
+        };
+        assert_eq!(length(&form), None);
+    }
 
     fn zone() -> Tz {
         "Europe/Prague".parse().unwrap()

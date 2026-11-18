@@ -294,8 +294,19 @@ component Field inherits Rectangle {
     public function clear() {
         input.text = "";
     }
+    // Typing cuts the text loose from `value`; a value changed from outside (the end
+    // of an event, moved along with its start) is put into the box all the same. What
+    // was typed into this box comes back as the same text and changes nothing.
+    changed value => {
+        if (input.text != root.value) {
+            input.text = root.value;
+        }
+    }
 
-    height: multiline ? 96px : 36px;
+    // How tall a box of several lines is: the user can drag its lower edge.
+    property <length> tall: 96px;
+
+    height: multiline ? tall : 36px;
     border-radius: 4px;
     background: Theme.hover;
     clip: true;
@@ -309,30 +320,82 @@ component Field inherits Rectangle {
         color: Theme.text-dim;
         vertical-alignment: center;
     }
-    input := TextInput {
+    // A text of several lines can be longer than its box: the wheel scrolls it, and it
+    // follows the cursor while typing. (Not dragged with the mouse: that selects text.)
+    scroller := Flickable {
         x: 10px;
         y: root.multiline ? 8px : 0px;
         width: parent.width - 20px;
-        height: parent.height - 2 * self.y;
-        text: root.value;
-        font-size: root.text-size;
-        color: Theme.text;
-        single-line: !root.multiline;
-        wrap: root.multiline ? word-wrap : no-wrap;
-        vertical-alignment: root.multiline ? top : center;
-        accessible-label: root.hint;
-        init => {
-            if (root.take-focus) {
-                self.focus();
-                // Typing goes on after what is there already.
-                self.set-selection-offsets(self.text.character-count, self.text.character-count);
+        // Above the edge that resizes the box.
+        height: parent.height - 2 * self.y - (root.multiline ? 4px : 0px);
+        interactive: false;
+        content-width: self.width;
+        content-height: Math.max(self.height, input.preferred-height);
+
+        input := TextInput {
+            width: scroller.width;
+            height: scroller.content-height;
+            text: root.value;
+            font-size: root.text-size;
+            color: Theme.text;
+            single-line: !root.multiline;
+            wrap: root.multiline ? word-wrap : no-wrap;
+            vertical-alignment: root.multiline ? top : center;
+            accessible-label: root.hint;
+            init => {
+                if (root.take-focus) {
+                    self.focus();
+                    // Typing goes on after what is there already.
+                    self.set-selection-offsets(self.text.character-count, self.text.character-count);
+                }
+            }
+            edited => {
+                root.edited(self.text);
+            }
+            accepted => {
+                root.accepted(self.text);
+            }
+            cursor-position-changed(position) => {
+                // The line with the cursor stays in sight.
+                if (root.multiline) {
+                    if (position.y < -scroller.content-y) {
+                        scroller.content-y = -position.y;
+                    } else if (position.y + root.text-size * 1.5 > scroller.height - scroller.content-y) {
+                        scroller.content-y = scroller.height - position.y - root.text-size * 1.5;
+                    }
+                }
             }
         }
-        edited => {
-            root.edited(self.text);
+    }
+
+    // The lower edge of a box of several lines: dragged, it makes the box taller or
+    // shorter.
+    if root.multiline: TouchArea {
+        y: parent.height - 10px;
+        height: 10px;
+        mouse-cursor: ns-resize;
+        // The pointer's place in the window and the box's height when the drag began:
+        // the edge moves under the pointer, so nothing is measured inside it.
+        property <length> pressed-at;
+        property <length> tall-then;
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                self.pressed-at = self.absolute-position.y + self.mouse-y;
+                self.tall-then = root.tall;
+            }
         }
-        accepted => {
-            root.accepted(self.text);
+        moved => {
+            if (self.pressed) {
+                root.tall = Math.clamp(self.tall-then + self.absolute-position.y + self.mouse-y - self.pressed-at, 60px, 480px);
+            }
+        }
+
+        Rectangle {
+            y: 3px;
+            width: 28px;
+            height: 3px;
+            border-radius: 1.5px;
+            background: parent.has-hover || parent.pressed ? Theme.text-dim : Theme.line;
         }
     }
 }
@@ -662,6 +725,11 @@ export component AppWindow inherits Window {
     // Returns whether the field's text was used up (and is to be emptied).
     callback editor-guest-pick(int) -> bool;
     callback editor-guest-optional(int);
+    // The start was typed into: the form as it was, the start's new date and time.
+    // Returns the form with them, and with the end moved to keep the event's length.
+    callback editor-start-edited(EditorForm, string, string) -> EditorForm;
+    // The end was typed into, or "all day" ticked or unticked: the form as it is now.
+    callback editor-length-edited(EditorForm);
     callback editor-requested(int);
     callback editor-from-draft(string, int);
     callback editor-save(EditorForm, int);
@@ -2975,7 +3043,7 @@ export component AppWindow inherits Window {
                             hint: "2026-11-17";
                             value: root.editor.start-date;
                             edited(text) => {
-                                root.editor.start-date = text;
+                                root.editor = root.editor-start-edited(root.editor, text, root.editor.start-time);
                             }
                         }
 
@@ -2984,7 +3052,7 @@ export component AppWindow inherits Window {
                             hint: "9:30";
                             value: root.editor.start-time;
                             edited(text) => {
-                                root.editor.start-time = text;
+                                root.editor = root.editor-start-edited(root.editor, root.editor.start-date, text);
                             }
                         }
                     }
@@ -2996,6 +3064,7 @@ export component AppWindow inherits Window {
                             value: root.editor.end-date;
                             edited(text) => {
                                 root.editor.end-date = text;
+                                root.editor-length-edited(root.editor);
                             }
                         }
 
@@ -3005,6 +3074,7 @@ export component AppWindow inherits Window {
                             value: root.editor.end-time;
                             edited(text) => {
                                 root.editor.end-time = text;
+                                root.editor-length-edited(root.editor);
                             }
                         }
                     }
@@ -3016,6 +3086,7 @@ export component AppWindow inherits Window {
                             checked: root.editor.all-day;
                             toggled => {
                                 root.editor.all-day = !root.editor.all-day;
+                                root.editor-length-edited(root.editor);
                             }
                         }
                     }
