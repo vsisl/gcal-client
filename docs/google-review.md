@@ -43,15 +43,16 @@ For the owner:
       `https://vsisl.github.io/gcal-client/privacy`. Until the going-public pull request
       is merged, Pages is set to the branch `release-appimage`; after the merge it must
       be switched to `main` (Settings → Pages), or the site goes away with the branch.
-- [ ] **Prove the homepage is yours** in Google Search Console (add the address as a
-      "URL prefix" property and place the file or tag it gives you in `docs/`).
+- [x] **The homepage is proved to be the owner's** in Google Search Console
+      (2026-11-18): the address is a "URL prefix" property, verified by the file
+      `docs/google7d20fb683ac7b8d5.html`, which must stay.
       If Google does not accept an address under `github.io` as the app's domain, a
       domain of your own is needed, pointed at the same pages.
-- [ ] In the Cloud Console, under **Google Auth Platform → Branding**: the app's name,
-      a support e-mail address, the icon (`packaging/io.github.vsisl.gcal_client.png`,
-      enlarged to what is asked for), the homepage, the privacy policy, and the
-      authorised domain.
-- [ ] Under **Data access**: the four scopes above, each with its reason.
+- [x] In the Cloud Console (project `gcal-client-dev`), under **Google Auth Platform →
+      Branding**: the app's name, the support e-mail address, the icon (120 px), the
+      homepage, the privacy policy, and the authorised domain `vsisl.github.io`.
+- [x] Under **Data access**: the four scopes above are registered. Their reasons are
+      asked for when the app is submitted.
 - [ ] Under **Audience**: publish the app ("In production"). This also ends the
       seven-day limit on sign-ins for the scopes that need no review.
 - [ ] **Record a short video** (Google asks for one for sensitive scopes): the sign-in
