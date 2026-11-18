@@ -37,6 +37,9 @@ Made by the owner; do not reopen them without being asked.
   step, each with a message that explains why.
 - Commit dead ends and their fixes too (what was tried, the error, what replaced it), so
   the history shows the path. Never squash.
+- Pictures and other binary files are kept with Git LFS (`.gitattributes`); run
+  `git lfs install` once in a new clone. Nothing under `docs/` that GitHub Pages must
+  serve may be one of them: Pages does not serve LFS files.
 - Ask before pushing. Pull requests are merged with a merge commit.
 - Everything reaches `main` through a pull request, and every pull request gets a Codex
   review before it is merged, however small it is:

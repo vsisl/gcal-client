@@ -37,6 +37,11 @@ install -Dm755 "$binary" "$app/usr/bin/gcal-client"
 install -Dm644 "$here/$id.desktop" "$app/usr/share/applications/$id.desktop"
 install -Dm644 "$here/$id.metainfo.xml" "$app/usr/share/metainfo/$id.metainfo.xml"
 install -Dm644 "$here/$id.svg" "$app/usr/share/icons/hicolor/scalable/apps/$id.svg"
+# The icon is kept with Git LFS: a checkout without it holds a line of text instead.
+if head -c 20 "$here/$id.png" | grep -q "git-lfs"; then
+    echo "$id.png is a Git LFS pointer, not the picture: run 'git lfs pull'." >&2
+    exit 1
+fi
 install -Dm644 "$here/$id.png" "$app/usr/share/icons/hicolor/256x256/apps/$id.png"
 # What the AppImage format wants at the top: the launcher's entry, its icon, and the
 # program to start.
