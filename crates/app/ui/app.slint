@@ -727,6 +727,8 @@ export component AppWindow inherits Window {
     // The start was typed into: the form as it was, the start's new date and time.
     // Returns the form with them, and with the end moved to keep the event's length.
     callback editor-start-edited(EditorForm, string, string) -> EditorForm;
+    // The end was typed into, or "all day" ticked or unticked: the form as it is now.
+    callback editor-length-edited(EditorForm);
     callback editor-requested(int);
     callback editor-from-draft(string, int);
     callback editor-save(EditorForm, int);
@@ -3061,6 +3063,7 @@ export component AppWindow inherits Window {
                             value: root.editor.end-date;
                             edited(text) => {
                                 root.editor.end-date = text;
+                                root.editor-length-edited(root.editor);
                             }
                         }
 
@@ -3070,6 +3073,7 @@ export component AppWindow inherits Window {
                             value: root.editor.end-time;
                             edited(text) => {
                                 root.editor.end-time = text;
+                                root.editor-length-edited(root.editor);
                             }
                         }
                     }
@@ -3081,6 +3085,7 @@ export component AppWindow inherits Window {
                             checked: root.editor.all-day;
                             toggled => {
                                 root.editor.all-day = !root.editor.all-day;
+                                root.editor-length-edited(root.editor);
                             }
                         }
                     }

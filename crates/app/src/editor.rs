@@ -267,6 +267,37 @@ pub fn length(form: &Form) -> Option<Duration> {
     (length >= Duration::zero()).then_some(length)
 }
 
+/// The length to keep for the form's event after its end was typed into or "all day"
+/// was ticked or unticked, given the length kept so far (`all_day`, how long).
+///
+/// Only these, and opening the editor, set the kept length. Typing into the start never
+/// does: a start half typed can read as a date of its own ("2026-11-1" on the way to
+/// "2026-11-18"), and a length taken from that would move the end somewhere absurd.
+///
+/// While the form cannot be read, or ends before it starts, the kept length stays; if
+/// "all day" changed meanwhile, it is turned into the other kind: whole days for an
+/// all-day event, and for a timed one those days and what the time boxes say (an hour
+/// if they say nothing usable).
+pub fn kept_length(form: &Form, kept: (bool, Duration)) -> (bool, Duration) {
+    if let Some(length) = length(form) {
+        return (form.all_day, length);
+    }
+    let (was_all_day, length) = kept;
+    if was_all_day == form.all_day {
+        return kept;
+    }
+    if form.all_day {
+        return (true, Duration::days(length.num_days()));
+    }
+    let by_the_clock = parse_time(&form.start_time, "start")
+        .ok()
+        .zip(parse_time(&form.end_time, "end").ok())
+        .map(|(from, to)| to - from)
+        .filter(|span| *span >= Duration::zero())
+        .unwrap_or_else(|| Duration::hours(1));
+    (false, length + by_the_clock)
+}
+
 /// The end (date, time) that makes the form's event `length` long from its start, for
 /// moving the end along when the start is changed, as the web does. Reckoned on the
 /// clock, so an event moved across a clock change keeps its times of day. None while
@@ -729,6 +760,62 @@ pub fn following_series(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_half_typed_start_never_sets_the_length() {
+        // The end was typed to before the start: the event has no length of its own,
+        // and the one kept so far stays (found by review: it used to be taken from
+        // whatever the form held before each keystroke in the start).
+        let form = Form {
+            start_date: "2026-11-17".into(),
+            start_time: "9:00".into(),
+            end_date: "2026-11-17".into(),
+            end_time: "8:00".into(),
+            ..Form::default()
+        };
+        let hour = (false, Duration::hours(1));
+        assert_eq!(kept_length(&form, hour), hour);
+        // A readable end sets it.
+        let form = Form {
+            end_time: "11:30".into(),
+            ..form
+        };
+        assert_eq!(kept_length(&form, hour), (false, Duration::minutes(150)));
+    }
+
+    #[test]
+    fn all_day_ticked_while_the_start_is_empty_keeps_whole_days() {
+        // A one-hour event, its start date cleared, then "all day": the kept length
+        // becomes no extra days, so that the date typed next gives a one-day event
+        // (found by review: it gave seventeen days).
+        let mut form = Form {
+            all_day: true,
+            start_date: String::new(),
+            start_time: "9:00".into(),
+            end_date: "2026-11-17".into(),
+            end_time: "10:00".into(),
+            ..Form::default()
+        };
+        let kept = kept_length(&form, (false, Duration::hours(1)));
+        assert_eq!(kept, (true, Duration::zero()));
+        form.start_date = "2026-11-1".into();
+        assert_eq!(
+            end_for_length(&form, kept.1),
+            Some(("2026-11-01".into(), "10:00".into()))
+        );
+        form.start_date = "2026-11-18".into();
+        assert_eq!(
+            end_for_length(&form, kept.1),
+            Some(("2026-11-18".into(), "10:00".into()))
+        );
+        // And back, the start still unreadable: the days and the time boxes' hour.
+        form.all_day = false;
+        form.start_date = String::new();
+        assert_eq!(
+            kept_length(&form, (true, Duration::days(2))),
+            (false, Duration::days(2) + Duration::hours(1))
+        );
+    }
 
     #[test]
     fn the_end_follows_a_changed_start() {
