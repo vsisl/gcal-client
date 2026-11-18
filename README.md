@@ -1,5 +1,8 @@
 # gcal-client
 
+[![Sponsor on GitHub](https://img.shields.io/badge/Sponsor-GitHub-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/vsisl)
+[![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-ffdd00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/vsisl)
+
 A native desktop client for Google Calendar that shows the calendars of several Google
 accounts in one view, the way the phone app does and the web interface does not.
 
