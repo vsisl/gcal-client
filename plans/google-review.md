@@ -9,7 +9,10 @@ This file is the owner's checklist. What is written here about Google's rules co
 Google's pages as read in November 2026; the Cloud Console says what is asked for at the
 time, and it has the last word.
 
-## Where it stands (2026-11-18, evening)
+## Where it stands (2026-11-19, evening)
+
+The second branding check (2026-11-19) was refused like the first; see "Verify the
+branding" below. Step 1 is therefore at its "wait another day once" stage.
 
 Everything is prepared; nothing has been sent to Google's reviewers yet. One automatic
 check stands in the way, and it has a waiting time.
@@ -82,8 +85,12 @@ For the owner:
 - [ ] **Verify the branding** (Branding → the summary panel → "Verify branding").
       Tried on 2026-11-18 two hours after the proof of ownership: refused with "the
       website of your home page URL is not registered to you … wait 24 hours". To be
-      tried again from 2026-11-19 afternoon. The scopes cannot be submitted before it
-      passes. See "Where it stands" above for what to do with either answer.
+      tried again from 2026-11-19 afternoon. Tried again on 2026-11-19 at 21:40, about
+      34 hours after the proof ("I have fixed the issues"): refused within seconds with
+      the same message. Checked then: the Search Console property
+      `https://vsisl.github.io/gcal-client/` is verified, and its owner is the same
+      Google account that owns the Cloud project, so neither the waiting time nor a
+      wrong account explains it. The scopes cannot be submitted before it passes. See "Where it stands" above for what to do with either answer.
 - [x] In the Cloud Console (project `gcal-client-dev`), under **Google Auth Platform →
       Branding**: the app's name, the support e-mail address, the icon (120 px), the
       homepage, the privacy policy, and the authorised domain `vsisl.github.io`.
