@@ -5,6 +5,7 @@
 
 mod editor;
 mod gui;
+mod pictures;
 mod vault;
 mod worker;
 

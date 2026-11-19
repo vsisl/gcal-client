@@ -1759,6 +1759,7 @@ dependencies = [
  "gcal-store",
  "gcal-sync",
  "iana-time-zone",
+ "image",
  "oo7",
  "open",
  "serde_json",

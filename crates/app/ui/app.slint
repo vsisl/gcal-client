@@ -75,6 +75,7 @@ export struct Attachment {
 // One guest of an event.
 export struct Guest {
     name: string,
+    email: string,
     // 0 has not answered, 1 yes, 2 no, 3 maybe.
     status: int,
     organizer: bool,
@@ -241,6 +242,45 @@ global Theme {
     out property <color> on-accent: dark ? #062e6f : #ffffff;
     out property <color> now: dark ? #f28b82 : #ea4335;
     out property <color> danger: dark ? #f28b82 : #d93025;
+}
+
+// Profile pictures, kept by Rust while the app runs. A lookup names `version`, which
+// Rust raises when a picture arrives, so that everything showing one draws again.
+export global Pictures {
+    in-out property <int> version;
+    pure callback picture(string, int) -> image;
+    pure callback has-picture(string, int) -> bool;
+    // The letter for someone without a picture, from their name and address.
+    pure callback initial(string, string) -> string;
+    pure callback tint(string) -> color;
+}
+
+// Someone's round picture, or their letter on a colour of their own, as Google shows
+// people.
+component Avatar inherits Rectangle {
+    in property <string> email;
+    in property <string> name;
+    in property <length> size: 24px;
+    property <bool> has: Pictures.has-picture(root.email, Pictures.version);
+    width: root.size;
+    height: root.size;
+    border-radius: root.size / 2;
+    background: root.has ? transparent : Pictures.tint(root.email);
+
+    if !root.has: Text {
+        text: Pictures.initial(root.name, root.email);
+        font-size: root.size * 0.5;
+        font-weight: 500;
+        color: white;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    if root.has: Image {
+        width: root.size;
+        height: root.size;
+        source: Pictures.picture(root.email, Pictures.version);
+        image-fit: contain;
+    }
 }
 
 component TextButton inherits Rectangle {
@@ -964,18 +1004,22 @@ export component AppWindow inherits Window {
         @tr("Contacts"),
         @tr("Other contacts"),
         @tr("Your organisation's directory"),
+        @tr("Your profile picture"),
     ];
     property <[string]> permission-purposes: [
         @tr("Needed. The app shows the account's calendars and events and saves your changes to them. With this it can see, change and delete every calendar and event the account can."),
-        @tr("Suggests guests from the account's address book while you type a name. Google's permission covers everything saved about your contacts. The app asks only for the names and e-mail addresses that match what you type, and keeps none of them."),
+        @tr("Suggests guests from the account's address book while you type a name, and shows your contacts' pictures by their names. Google's permission covers everything saved about your contacts. The app asks only for the names, e-mail addresses and pictures of the people it suggests or shows, and keeps none of them once it is closed."),
         @tr("Suggests people the account has exchanged e-mails with but never saved as contacts. Google's permission covers their names, e-mail addresses and phone numbers. The app asks only for the names and e-mail addresses that match what you type, and keeps none of them."),
-        @tr("Optional, and only of use for an account at a company or a school: suggests colleagues as guests. Google's permission lets the app read the profile of everyone in the organisation's directory: names, e-mail addresses, photos, phone numbers, job titles and whatever else the organisation shows there. The app asks only for the names and e-mail addresses that match what you type, and keeps none of them. The organisation's administrator can turn this off."),
+        @tr("Optional, and only of use for an account at a company or a school: suggests colleagues as guests. Google's permission lets the app read the profile of everyone in the organisation's directory: names, e-mail addresses, photos, phone numbers, job titles and whatever else the organisation shows there. The app asks only for the names, e-mail addresses and pictures of the people it suggests or shows, and keeps none of them once it is closed. The organisation's administrator can turn this off."),
+        @tr("Shows the account's own picture next to it, as Google's web app does. Google's permission covers the account's name and profile picture. The app asks only for the picture, and keeps it only while it runs."),
     ];
     // An account's address, and the permission's place in permission-names.
     callback grant-permission(string, int);
     callback sync-now();
     // Raised from the background worker when the cache changed.
     callback data-changed();
+    // A profile picture the worker fetched, for the address given.
+    callback picture-arrived(string, image);
 
     // The height of an hour in the day columns: the zoom. Changed with Ctrl and the
     // wheel, Ctrl and + or -, or in the settings; Rust remembers it.
@@ -1477,9 +1521,17 @@ export component AppWindow inherits Window {
                             }
 
                             if row.is-account: HorizontalLayout {
-                                padding-left: 16px;
+                                padding-left: 12px;
                                 padding-right: 8px;
-                                spacing: 4px;
+                                spacing: 8px;
+
+                                VerticalLayout {
+                                    alignment: center;
+                                    Avatar {
+                                        size: 28px;
+                                        email: row.email;
+                                    }
+                                }
 
                                 Text {
                                     text: row.text;
@@ -2663,31 +2715,50 @@ export component AppWindow inherits Window {
                     }
 
                     Flickable {
-                        height: Math.min(6, root.detail.guests.length) * 24px;
+                        height: Math.min(6, root.detail.guests.length) * 32px;
                         interactive: false;
-                        content-height: root.detail.guests.length * 24px;
+                        content-height: root.detail.guests.length * 32px;
 
                         for guest[i] in root.detail.guests: Rectangle {
-                            y: i * 24px;
-                            height: 24px;
+                            y: i * 32px;
+                            height: 32px;
                             accessible-role: list-item;
                             accessible-label: "\{guest.name}, \{guest.status == 1 ? @tr("yes") : guest.status == 2 ? @tr("no") : guest.status == 3 ? @tr("maybe") : @tr("no answer yet")}";
 
-                            // Green for yes, red for no, hollow while unanswered or unsure.
-                            Rectangle {
-                                x: 2px;
+                            Avatar {
+                                x: 0px;
                                 y: (parent.height - self.height) / 2;
-                                width: 10px;
-                                height: 10px;
-                                border-radius: 5px;
-                                border-width: 2px;
-                                border-color: guest.status == 1 ? #34a853 : guest.status == 2 ? Theme.danger : Theme.text-dim;
-                                background: guest.status == 1 ? #34a853 : guest.status == 2 ? Theme.danger : transparent;
+                                size: 26px;
+                                email: guest.email;
+                                name: guest.name;
+                            }
+
+                            // The answer, as a badge on the picture as on the web: a tick
+                            // for yes, a cross for no, a question mark for maybe; none
+                            // while unanswered.
+                            if guest.status != 0: Rectangle {
+                                x: 16px;
+                                y: parent.height / 2 + 3px;
+                                width: 13px;
+                                height: 13px;
+                                border-radius: 6.5px;
+                                border-width: 1.5px;
+                                border-color: Theme.card;
+                                background: guest.status == 1 ? #188038 : guest.status == 2 ? Theme.danger : Theme.text-dim;
+
+                                Text {
+                                    text: guest.status == 1 ? "✓" : guest.status == 2 ? "✕" : "?";
+                                    font-size: 8px;
+                                    font-weight: 700;
+                                    color: white;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
                             }
 
                             Text {
-                                x: 22px;
-                                width: parent.width - 22px;
+                                x: 36px;
+                                width: parent.width - 36px;
                                 height: parent.height;
                                 text: guest.organizer ? @tr("{} (organiser)", guest.name) : guest.optional ? @tr("{} (optional)", guest.name) : guest.status == 3 ? @tr("{} (maybe)", guest.name) : guest.name;
                                 font-size: 13px;
@@ -3149,9 +3220,17 @@ export component AppWindow inherits Window {
                                     }
                                 }
 
+                                Avatar {
+                                    x: 6px;
+                                    y: (parent.height - self.height) / 2;
+                                    size: 22px;
+                                    email: person.email;
+                                    name: person.name;
+                                }
+
                                 Text {
-                                    x: 10px;
-                                    width: parent.width - 20px;
+                                    x: 36px;
+                                    width: parent.width - 46px;
                                     height: parent.height;
                                     text: person.name != "" ? "\{person.name} · \{person.email}" : person.email;
                                     font-size: 13px;
@@ -3173,9 +3252,17 @@ export component AppWindow inherits Window {
                                 accessible-role: list-item;
                                 accessible-label: guest.optional ? "Guest: \{guest.email}, optional" : "Guest: \{guest.email}";
 
+                                Avatar {
+                                    x: 4px;
+                                    y: (parent.height - self.height) / 2;
+                                    size: 22px;
+                                    email: guest.email;
+                                    name: guest.name;
+                                }
+
                                 Text {
-                                    x: 10px;
-                                    width: parent.width - 150px;
+                                    x: 34px;
+                                    width: parent.width - 174px;
                                     height: parent.height;
                                     text: guest.name != "" && guest.name != guest.email ? "\{guest.name} · \{guest.email}" : guest.email;
                                     font-size: 13px;
@@ -3759,9 +3846,17 @@ export component AppWindow inherits Window {
                             }
                         }
 
+                        Avatar {
+                            x: 6px;
+                            y: (parent.height - self.height) / 2;
+                            size: 22px;
+                            email: person.email;
+                            name: person.name;
+                        }
+
                         Text {
-                            x: 10px;
-                            width: parent.width - 20px;
+                            x: 36px;
+                            width: parent.width - 46px;
                             height: parent.height;
                             text: person.name != "" ? "\{person.name} · \{person.email}" : person.email;
                             font-size: 13px;

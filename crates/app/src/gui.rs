@@ -1320,6 +1320,9 @@ struct View {
     editor_length: Cell<Option<(bool, chrono::Duration)>>,
     /// The guests of the event in the editor, as the window lists them.
     editor_guests: Rc<VecModel<EditorGuest>>,
+    /// Profile pictures fetched while the app runs, by address in small letters. Kept
+    /// in memory only.
+    pictures: RefCell<HashMap<String, slint::Image>>,
     /// Its own notifications, likewise.
     editor_notices: Rc<VecModel<EditorNotice>>,
     /// Hides the message about the last change after a while.
@@ -1499,6 +1502,9 @@ impl View {
             }
         }
         patch(&self.sidebar, sidebar);
+        for account in accounts {
+            self.want_pictures(account.id, vec![account.email.clone()]);
+        }
 
         let from = local_day_start(week_start, self.zone);
         // The year shows no events, so none are looked up for it.
@@ -1761,6 +1767,7 @@ impl View {
                             .iter()
                             .map(|guest| Guest {
                                 name: guest.name().into(),
+                                email: guest.email.as_deref().unwrap_or("").into(),
                                 status: answer_number(guest.response_status),
                                 organizer: guest.organizer,
                                 optional: guest.optional,
@@ -2246,6 +2253,31 @@ impl View {
         self.show_editor(&ui, form, Kept::default(), None, color);
     }
 
+    /// Asks the worker for the pictures of `people` as `account` knows them. The worker
+    /// looks each address up once; those it finds arrive through `picture_arrived`.
+    fn want_pictures(&self, account: AccountId, people: Vec<String>) {
+        let people: Vec<String> = people
+            .into_iter()
+            .filter(|email| {
+                !email.is_empty() && !self.pictures.borrow().contains_key(&email.to_lowercase())
+            })
+            .collect();
+        if !people.is_empty() {
+            let _ = self.commands.send(Command::Pictures { account, people });
+        }
+    }
+
+    /// Keeps a picture the worker fetched, and has everything showing it draw again.
+    fn picture_arrived(&self, email: &str, picture: slint::Image) {
+        self.pictures
+            .borrow_mut()
+            .insert(email.to_lowercase(), picture);
+        if let Some(ui) = self.ui.upgrade() {
+            let pictures = ui.global::<Pictures>();
+            pictures.set_version(pictures.get_version().wrapping_add(1));
+        }
+    }
+
     fn show_editor(
         &self,
         ui: &AppWindow,
@@ -2298,6 +2330,10 @@ impl View {
             }
             Err(_) => Vec::new(),
         };
+        if let Some(target) = &target {
+            let emails = rows.iter().map(|guest| guest.email.to_string()).collect();
+            self.want_pictures(target.account, emails);
+        }
         self.editor_guests.set_vec(rows);
         self.clear_suggestions(ui);
         ui.set_editor(window);
@@ -3069,6 +3105,7 @@ pub fn run() -> Result<()> {
         editing: RefCell::default(),
         editor_length: Cell::default(),
         editor_guests: Rc::new(VecModel::default()),
+        pictures: RefCell::default(),
         editor_notices: Rc::new(VecModel::default()),
         pending: RefCell::default(),
         generation: Cell::new(0),
@@ -3440,6 +3477,15 @@ pub fn run() -> Result<()> {
         move |instance| {
             let detail = view.details.borrow().get(instance as usize).cloned();
             if let (Some(detail), Some(ui)) = (detail, view.ui.upgrade()) {
+                let account = view
+                    .targets
+                    .borrow()
+                    .get(instance as usize)
+                    .map(|t| t.account);
+                if let Some(account) = account {
+                    let emails = detail.guests.iter().map(|g| g.email.to_string()).collect();
+                    view.want_pictures(account, emails);
+                }
                 ui.set_detail(detail);
                 ui.set_detail_visible(true);
             }
@@ -3455,6 +3501,24 @@ pub fn run() -> Result<()> {
         let view = view.clone();
         move || view.reload()
     });
+    ui.on_picture_arrived({
+        let view = view.clone();
+        move |email, picture| view.picture_arrived(&email, picture)
+    });
+    let pictures = ui.global::<Pictures>();
+    pictures.on_picture({
+        let view = view.clone();
+        move |email, _| {
+            let known = view.pictures.borrow().get(&email.to_lowercase()).cloned();
+            known.unwrap_or_default()
+        }
+    });
+    pictures.on_has_picture({
+        let view = view.clone();
+        move |email, _| view.pictures.borrow().contains_key(&email.to_lowercase())
+    });
+    pictures.on_initial(|name, email| crate::pictures::initial(&name, &email).into());
+    pictures.on_tint(|email| crate::pictures::tint(&email));
     ui.on_add_account({
         let commands = commands.clone();
         move || {

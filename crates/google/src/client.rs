@@ -105,7 +105,13 @@ async fn fetch_picture(
     })?;
     // Google's documented way to ask for a size.
     url.query_pairs_mut().append_pair("sz", &size.to_string());
-    let mut response = http.get(url).send().await?;
+    // Only the formats the app decodes; Google's servers can also send others.
+    let accept = "image/jpeg,image/png";
+    let mut response = http
+        .get(url)
+        .header(reqwest::header::ACCEPT, accept)
+        .send()
+        .await?;
     let status = response.status();
     if !status.is_success() {
         return Err(ApiError::Status {

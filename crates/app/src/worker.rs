@@ -5,6 +5,7 @@
 //! window's event loop.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -21,6 +22,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::{Mutex, watch};
 
 use crate::gui::{AppWindow, StatusKind};
+use crate::pictures::{PICTURE_SIZE, round_picture};
 use crate::vault::Vault;
 use crate::{load_config, open_store};
 
@@ -32,6 +34,11 @@ const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const SETTLE_TIME: Duration = Duration::from_secs(3);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// How many people are suggested under a guests field.
+const SHOWN_SUGGESTIONS: usize = 8;
+/// The most pictures looked up for one request: an event can have hundreds of guests,
+/// and each lookup is a request or two to Google. Those after it show their letter.
+const MAX_PICTURES_AT_ONCE: usize = 40;
 
 #[derive(Debug)]
 pub enum Command {
@@ -61,6 +68,13 @@ pub enum Command {
         account: AccountId,
         query: String,
         serial: i32,
+    },
+    /// Fetches the profile pictures of people the window shows, as known to `account`
+    /// (its contacts, its organisation's directory, or its own profile), where a
+    /// picture's address is not known yet. Each that is found goes to the window.
+    Pictures {
+        account: AccountId,
+        people: Vec<String>,
     },
     /// Deletes an event, or part of a series, at Google and then from the cache. With
     /// `notify`, Google tells the guests.
@@ -229,6 +243,9 @@ struct Worker {
     /// a suggestion is asked for with every few letters typed, and a new connection
     /// would fetch a new access token each time.
     suggesting: Rc<RefCell<Option<Suggesting>>>,
+    /// The addresses whose pictures were asked for already (in small letters), found or
+    /// not. Each is looked up once while the app runs.
+    pictures: Rc<RefCell<HashSet<String>>>,
 }
 
 /// Counts one activity for as long as it lives, also when its task is cancelled.
@@ -270,6 +287,7 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
         notify: Rc::default(),
         cache: Rc::default(),
         suggesting: Rc::default(),
+        pictures: Rc::default(),
     };
     while let Some(command) = commands.recv().await {
         // Each command runs as its own task: a sign-in waiting on the browser must not
@@ -278,7 +296,10 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
         tokio::task::spawn_local(async move {
             // A sync tells the window itself, and only when it changed something: every
             // reload closes an open details card and forgets the series' occurrences.
-            let reload = !matches!(command, Command::SyncAll | Command::SuggestGuests { .. });
+            let reload = !matches!(
+                command,
+                Command::SyncAll | Command::SuggestGuests { .. } | Command::Pictures { .. }
+            );
             // A change the user asked for and did not get is said in a dialog, not in
             // the status line, where it is easily missed.
             let failure = match command {
@@ -300,7 +321,8 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
                 | Command::SyncAll
                 | Command::RemoveAccount(_)
                 | Command::Grant { .. }
-                | Command::SuggestGuests { .. } => None,
+                | Command::SuggestGuests { .. }
+                | Command::Pictures { .. } => None,
                 _ => Some(worker.cache.lock().await),
             };
             let result = match command {
@@ -322,6 +344,11 @@ async fn run(ui: Weak<AppWindow>, mut commands: UnboundedReceiver<Command>) {
                     serial,
                 } => {
                     worker.suggest_guests(account, &query, serial).await;
+                    Ok(())
+                }
+                Command::Pictures { account, people } => {
+                    let wanted = people.into_iter().map(|email| (email, None)).collect();
+                    worker.fetch_pictures(account, wanted).await;
                     Ok(())
                 }
                 Command::DeleteEvent {
@@ -497,29 +524,27 @@ impl Worker {
     /// as an error: the event can be saved without suggestions.
     async fn suggest_guests(&self, account: AccountId, query: &str, serial: i32) {
         let found = async {
-            let known = self.suggesting.borrow().clone();
-            let (client, sources) = match known {
-                Some((of, client, sources)) if of == account => (client, sources),
-                _ => {
-                    let store = open_store()?;
-                    let client = Rc::new(self.account_client(&store, account).await?);
-                    let allowed = store
-                        .accounts()?
-                        .into_iter()
-                        .find(|a| a.id == account)
-                        .and_then(|a| a.scopes);
-                    let sources = people_sources(allowed.as_deref());
-                    self.suggesting
-                        .replace(Some((account, client.clone(), sources.clone())));
-                    (client, sources)
-                }
-            };
+            let (client, sources) = self.people_client(account).await?;
             if sources.is_empty() {
                 return Ok(None);
             }
             Ok::<_, anyhow::Error>(Some(client.search_people(query, &sources).await?))
         }
         .await;
+        // The suggestions' pictures follow them; their addresses came with the search.
+        if let Ok(Some(people)) = &found {
+            let wanted: Vec<(String, Option<String>)> = people
+                .iter()
+                .take(SHOWN_SUGGESTIONS)
+                .filter_map(|person| Some((person.email.clone(), Some(person.photo.clone()?))))
+                .collect();
+            if !wanted.is_empty() {
+                let worker = self.clone();
+                tokio::task::spawn_local(async move {
+                    worker.fetch_pictures(account, wanted).await;
+                });
+            }
+        }
         let (people, problem) = match found {
             Ok(Some(people)) => (people, String::new()),
             Ok(None) => (Vec::new(), NO_PEOPLE_PERMISSION.to_owned()),
@@ -531,7 +556,7 @@ impl Worker {
             }
             let rows: Vec<crate::gui::Suggestion> = people
                 .into_iter()
-                .take(8)
+                .take(SHOWN_SUGGESTIONS)
                 .map(|person| crate::gui::Suggestion {
                     // A name is one line of text, whatever was put into it.
                     name: person
@@ -546,6 +571,101 @@ impl Worker {
             ui.set_guest_suggestions(slint::ModelRc::from(Rc::new(slint::VecModel::from(rows))));
             ui.set_guest_suggest_problem(problem.into());
         });
+    }
+
+    /// The connection to Google of `account` for looking up people, and where it lets
+    /// the app look. Kept for the next lookup: suggestions are asked for with every few
+    /// letters typed, and a new connection would fetch a new access token each time.
+    async fn people_client(
+        &self,
+        account: AccountId,
+    ) -> Result<(Rc<GoogleClient>, Vec<Permission>)> {
+        let known = self.suggesting.borrow().clone();
+        if let Some((of, client, sources)) = known
+            && of == account
+        {
+            return Ok((client, sources));
+        }
+        let store = open_store()?;
+        let client = Rc::new(self.account_client(&store, account).await?);
+        let allowed = store
+            .accounts()?
+            .into_iter()
+            .find(|a| a.id == account)
+            .and_then(|a| a.scopes);
+        let sources = people_sources(allowed.as_deref());
+        self.suggesting
+            .replace(Some((account, client.clone(), sources.clone())));
+        Ok((client, sources))
+    }
+
+    /// Fetches the pictures of `people` (an address each, with the picture's address
+    /// where it is known already) and hands each one found to the window. Each address
+    /// is tried once while the app runs, unless Google could not be reached. People
+    /// without a picture are left to the window, which shows their letter.
+    async fn fetch_pictures(&self, account: AccountId, people: Vec<(String, Option<String>)>) {
+        let wanted: Vec<(String, Option<String>)> = {
+            let mut asked = self.pictures.borrow_mut();
+            people
+                .into_iter()
+                .filter(|(email, _)| asked.insert(email.to_lowercase()))
+                .take(MAX_PICTURES_AT_ONCE)
+                .collect()
+        };
+        if wanted.is_empty() {
+            return;
+        }
+        let Ok(own) = open_store().and_then(|store| {
+            Ok(store
+                .accounts()?
+                .into_iter()
+                .find(|a| a.id == account)
+                .map(|a| a.email))
+        }) else {
+            self.forget_pictures(&wanted);
+            return;
+        };
+        let Some(own) = own else { return };
+        let Ok((client, sources)) = self.people_client(account).await else {
+            self.forget_pictures(&wanted);
+            return;
+        };
+        for (email, known) in wanted {
+            let address = match known {
+                Some(address) => Ok(Some(address)),
+                None if email.eq_ignore_ascii_case(&own) => client.own_photo().await,
+                None => client.find_photo(&email, &sources).await,
+            };
+            let bytes = match address {
+                Ok(Some(address)) => {
+                    gcal_google::download_picture(&self.http, &address, PICTURE_SIZE).await
+                }
+                Ok(None) => continue,
+                Err(error) => Err(error),
+            };
+            let picture = match bytes {
+                Ok(bytes) => round_picture(&bytes),
+                // Not reachable now: tried again the next time it is shown.
+                Err(ApiError::Http(_) | ApiError::Auth(AuthError::Http(_))) => {
+                    self.pictures.borrow_mut().remove(&email.to_lowercase());
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            if let Some(picture) = picture {
+                let _ = self.ui.upgrade_in_event_loop(move |ui| {
+                    ui.invoke_picture_arrived(email.into(), slint::Image::from_rgba8(picture));
+                });
+            }
+        }
+    }
+
+    /// Lets the pictures of `people` be asked for again.
+    fn forget_pictures(&self, people: &[(String, Option<String>)]) {
+        let mut asked = self.pictures.borrow_mut();
+        for (email, _) in people {
+            asked.remove(&email.to_lowercase());
+        }
     }
 
     async fn add_account(&self) -> Result<()> {
@@ -586,8 +706,10 @@ impl Worker {
         if let Some(scopes) = &tokens.scopes {
             store.set_account_scopes(account, scopes)?;
         }
-        // An account signed in again may allow something else than before.
+        // An account signed in again may allow something else than before, its own
+        // picture among it.
         self.suggesting.replace(None);
+        self.pictures.borrow_mut().remove(&email.to_lowercase());
         self.data_changed();
         let result = self.sync_account(&client, &mut store, account).await;
         if let Some(problem) = sync_problem(&email, &result) {
@@ -646,6 +768,8 @@ impl Worker {
             .context("the account is no longer signed in")?;
         vault.save(email, &refresh_token).await?;
         self.suggesting.replace(None);
+        // Its own picture may be allowed now.
+        self.pictures.borrow_mut().remove(&email.to_lowercase());
         if let Some(scopes) = &tokens.scopes {
             store.set_account_scopes(account.id, scopes)?;
             if !permission.is_in(scopes) {

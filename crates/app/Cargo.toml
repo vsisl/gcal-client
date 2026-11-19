@@ -23,6 +23,8 @@ gcal-google = { version = "0.1.0", path = "../google" }
 gcal-store = { version = "0.1.0", path = "../store" }
 gcal-sync = { version = "0.1.0", path = "../sync" }
 iana-time-zone = "0.1.65"
+# Already built for Slint; only the formats Google serves profile pictures in.
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 oo7 = "0.7.1"
 open = "5.4.5"
 serde_json = "1.0.154"
