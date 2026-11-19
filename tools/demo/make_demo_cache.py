@@ -39,6 +39,22 @@ PRAGMA user_version = 4;
 """
 
 HOME, WORK = "anna.rossi@example.com", "anna@studio.example.org"
+# Made-up guests, for the details card: the organiser, one of each answer, and one
+# who has not answered.
+GUESTS = {
+    "Design review: onboarding": [
+        {"email": WORK, "displayName": "Anna Rossi", "organizer": True, "self": True,
+         "responseStatus": "accepted"},
+        {"email": "marco.bianchi@studio.example.org", "displayName": "Marco Bianchi",
+         "responseStatus": "accepted"},
+        {"email": "giulia.verdi@studio.example.org", "displayName": "Giulia Verdi",
+         "responseStatus": "tentative"},
+        {"email": "luca.ferri@studio.example.org", "displayName": "Luca Ferri",
+         "responseStatus": "declined"},
+        {"email": "sofia.conti@example.net", "responseStatus": "needsAction",
+         "optional": True},
+    ],
+}
 # (account, calendar id, name, colour, the account's own calendar)
 CALENDARS = [
     (HOME, HOME, "Anna Rossi", "#039be5", True),
@@ -126,6 +142,10 @@ def main():
                      "summary": title, "etag": f'"{count}"'}
             if place:
                 event["location"] = place
+            if title in GUESTS:
+                event["attendees"] = GUESTS[title]
+                # As Google has it for an event with guests: who organised it.
+                event["organizer"] = {"email": WORK, "self": True}
             if clock is None:
                 last = day + timedelta(days=length)
                 event["start"], event["end"] = {"date": str(day)}, {"date": str(last)}
