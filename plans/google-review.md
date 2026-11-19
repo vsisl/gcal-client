@@ -65,6 +65,28 @@ The app asks for four permissions, all of the kind Google calls **sensitive** (n
 | `https://www.googleapis.com/auth/contacts.other.readonly` | The same suggestions for people the user has corresponded with but not saved as contacts, as Google Calendar's own guests field offers. Nothing is stored. |
 | `https://www.googleapis.com/auth/directory.readonly` | The same suggestions for colleagues in a Workspace organisation's directory. Asked for only when the user chooses it in the settings. Nothing is stored. |
 
+## After the review: profile pictures
+
+The app now also shows profile pictures (branch `profile-pictures`), which changes what
+was submitted. By the owner's decision, nothing of this goes to Google while the review
+runs, so as not to delay it. Once Google has approved:
+
+1. **Data Access**: add `https://www.googleapis.com/auth/userinfo.profile` (the
+   account's own picture). It is not sensitive, so it needs no reason and no review of
+   its own.
+2. **Data Access → reasons**: the contacts now also give pictures. Replace the
+   `contacts.readonly` part of the submitted text with: "When the user types a name in
+   an event's guests field, the app suggests matching contacts (name, e-mail and
+   picture), and shows the pictures of an event's guests who are among the contacts.
+   Nothing is stored; pictures are kept in memory while the app runs." The
+   `directory.readonly` part likewise: "the same suggestions and pictures for
+   colleagues …".
+3. Merge the branch, so that the privacy policy that says this goes online with it
+   (GitHub Pages serves `docs/`).
+
+If Google asks again about the scopes after that, the video does not show pictures yet:
+a new clip may be wanted.
+
 ## Checklist
 
 Done in the repository:

@@ -7,8 +7,10 @@ opens the browser, where only the owner can answer.
 import sqlite3, sys, time
 from common import *
 
-NAMES = ["Calendars and events", "Contacts", "Other contacts", "Your organisation's directory"]
-SCOPES = ["calendar", "contacts.readonly", "contacts.other.readonly", "directory.readonly"]
+NAMES = ["Calendars and events", "Contacts", "Other contacts", "Your organisation's directory",
+         "Your profile picture"]
+SCOPES = ["calendar", "contacts.readonly", "contacts.other.readonly", "directory.readonly",
+          "userinfo.profile"]
 
 
 def account():
