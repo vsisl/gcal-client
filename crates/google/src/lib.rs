@@ -6,7 +6,9 @@ pub mod config;
 mod pkce;
 
 pub use auth::{AuthError, PendingLogin, TokenSet, begin_login};
-pub use client::{ApiError, GoogleClient, Listing, Person};
+pub use client::{
+    ApiError, GoogleClient, Listing, Person, download_picture, picture_address_allowed,
+};
 pub use config::{ClientConfig, ConfigError, Endpoints};
 /// The HTTP client type the API client is built on, re-exported so callers share one.
 pub use reqwest::Client as HttpClient;
@@ -26,20 +28,25 @@ pub enum Permission {
     /// as guests. Only asked for when the user says so in the settings: it covers every
     /// profile in the organisation, and an ordinary account has no directory.
     Directory,
+    /// The account's own name and profile picture, to show the picture by the account
+    /// as Google's web app does. Google counts it as basic, not sensitive.
+    Profile,
 }
 
 impl Permission {
-    pub const ALL: [Permission; 4] = [
+    pub const ALL: [Permission; 5] = [
         Permission::Calendar,
         Permission::Contacts,
         Permission::OtherContacts,
         Permission::Directory,
+        Permission::Profile,
     ];
     /// What a sign-in asks for.
-    pub const AT_SIGN_IN: [Permission; 3] = [
+    pub const AT_SIGN_IN: [Permission; 4] = [
         Permission::Calendar,
         Permission::Contacts,
         Permission::OtherContacts,
+        Permission::Profile,
     ];
 
     /// Google's name for the permission.
@@ -49,6 +56,7 @@ impl Permission {
             Permission::Contacts => "https://www.googleapis.com/auth/contacts.readonly",
             Permission::OtherContacts => "https://www.googleapis.com/auth/contacts.other.readonly",
             Permission::Directory => "https://www.googleapis.com/auth/directory.readonly",
+            Permission::Profile => "https://www.googleapis.com/auth/userinfo.profile",
         }
     }
 

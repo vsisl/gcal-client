@@ -3620,10 +3620,10 @@ mod tests {
         let states = |row: &AccountPermissions| row.states.iter().collect::<Vec<i32>>();
         assert_eq!(rows[0].email, "old@example.com");
         // Signed in before the app kept this: not known until the next sync.
-        assert_eq!(states(&rows[0]), [0, 0, 0, 0]);
+        assert_eq!(states(&rows[0]), [0, 0, 0, 0, 0]);
         // In the order of the settings' list: calendars, contacts, other contacts,
-        // the directory.
-        assert_eq!(states(&rows[1]), [1, 2, 1, 2]);
+        // the directory, the profile picture.
+        assert_eq!(states(&rows[1]), [1, 2, 1, 2, 2]);
     }
 
     #[test]

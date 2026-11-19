@@ -42,6 +42,88 @@ pub struct Person {
     /// The person's name, or empty if Google has none.
     pub name: String,
     pub email: String,
+    /// Where their own profile picture is, if they have one. Google's drawn letter for
+    /// people without one is left out: the app draws its own.
+    pub photo: Option<String>,
+}
+
+/// The address of a person's own picture in a People API answer, if they have one.
+fn photo_in(person: &Value) -> Option<String> {
+    let photos = person["photos"].as_array()?;
+    let own = |photo: &&Value| photo["default"].as_bool() != Some(true);
+    // The primary one first, as Google shows it.
+    let primary = photos
+        .iter()
+        .filter(own)
+        .find(|photo| photo["metadata"]["primary"].as_bool() == Some(true));
+    let photo = primary.or_else(|| photos.iter().find(own))?;
+    photo["url"].as_str().map(str::to_owned)
+}
+
+/// The largest picture the app downloads. A profile picture of the size asked for is a
+/// few kilobytes; the address comes from other people's profiles, so it is not trusted.
+const MAX_PICTURE_BYTES: usize = 1 << 20;
+
+/// Whether a picture's address is one of Google's picture servers. The app talks to
+/// Google only, and the address comes from data other people control.
+pub fn picture_address_allowed(address: &str) -> bool {
+    let Ok(url) = Url::parse(address) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url
+            .host_str()
+            .is_some_and(|host| host.ends_with(".googleusercontent.com"))
+}
+
+/// Downloads a profile picture, asking for it at `size` pixels. Pictures are public at
+/// their address, so no sign-in goes with the request. Anything but one of Google's
+/// picture servers is refused (see `picture_address_allowed`), and so is an answer
+/// larger than a picture can be.
+pub async fn download_picture(
+    http: &reqwest::Client,
+    address: &str,
+    size: u32,
+) -> Result<Vec<u8>, ApiError> {
+    if !picture_address_allowed(address) {
+        return Err(ApiError::Status {
+            status: 0,
+            body: "not an address of Google's picture servers".into(),
+        });
+    }
+    fetch_picture(http, address, size).await
+}
+
+async fn fetch_picture(
+    http: &reqwest::Client,
+    address: &str,
+    size: u32,
+) -> Result<Vec<u8>, ApiError> {
+    let mut url = Url::parse(address).map_err(|_| ApiError::Status {
+        status: 0,
+        body: "not a valid address".into(),
+    })?;
+    // Google's documented way to ask for a size.
+    url.query_pairs_mut().append_pair("sz", &size.to_string());
+    let mut response = http.get(url).send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(ApiError::Status {
+            status: status.as_u16(),
+            body: String::new(),
+        });
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len() + chunk.len() > MAX_PICTURE_BYTES {
+            return Err(ApiError::Status {
+                status: status.as_u16(),
+                body: "the picture is too large".into(),
+            });
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 /// The people in one answer of the People API's searches.
@@ -61,6 +143,7 @@ fn people_in(answer: &Value) -> Vec<Person> {
                 people.push(Person {
                     name: name.to_owned(),
                     email: email.to_owned(),
+                    photo: photo_in(person),
                 });
             }
         }
@@ -357,21 +440,27 @@ impl GoogleClient {
         query: &str,
         sources: &[Permission],
     ) -> Result<Vec<Person>, ApiError> {
-        let common = [
+        let contacts = [
+            ("query", query),
+            ("readMask", "names,emailAddresses,photos"),
+            ("pageSize", "10"),
+        ];
+        // The search of other contacts takes no pictures: asking for them is refused.
+        let other = [
             ("query", query),
             ("readMask", "names,emailAddresses"),
             ("pageSize", "10"),
         ];
         let directory = [
             ("query", query),
-            ("readMask", "names,emailAddresses"),
+            ("readMask", "names,emailAddresses,photos"),
             ("pageSize", "10"),
             ("sources", "DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE"),
         ];
         type Parameters<'a> = &'a [(&'a str, &'a str)];
         let searches: [(Permission, &str, Parameters); 3] = [
-            (Permission::Contacts, "people:searchContacts", &common),
-            (Permission::OtherContacts, "otherContacts:search", &common),
+            (Permission::Contacts, "people:searchContacts", &contacts),
+            (Permission::OtherContacts, "otherContacts:search", &other),
             (
                 Permission::Directory,
                 "people:searchDirectoryPeople",
@@ -415,6 +504,50 @@ impl GoogleClient {
             Some(error) if !answered => Err(error),
             _ => Ok(people),
         }
+    }
+
+    /// The address of the picture of the person with the e-mail address `email`, if
+    /// the account knows them with one: from its contacts or its organisation's
+    /// directory, as far as `sources` allows. Other contacts have no pictures in the
+    /// People API. A source that cannot be asked is passed over.
+    pub async fn find_photo(
+        &self,
+        email: &str,
+        sources: &[Permission],
+    ) -> Result<Option<String>, ApiError> {
+        for source in [Permission::Contacts, Permission::Directory] {
+            if !sources.contains(&source) {
+                continue;
+            }
+            let Ok(people) = self.search_people(email, &[source]).await else {
+                continue;
+            };
+            let photo = people
+                .into_iter()
+                .find(|person| person.email.eq_ignore_ascii_case(email) && person.photo.is_some())
+                .and_then(|person| person.photo);
+            if photo.is_some() {
+                return Ok(photo);
+            }
+        }
+        Ok(None)
+    }
+
+    /// The address of the signed-in account's own picture, if it has one. Needs the
+    /// `Profile` permission.
+    pub async fn own_photo(&self) -> Result<Option<String>, ApiError> {
+        let api = &self.endpoints.people_api;
+        let response = self
+            .send_to(
+                api,
+                Method::GET,
+                &["people", "me"],
+                &[("personFields", "photos")],
+                None,
+                None,
+            )
+            .await?;
+        Ok(photo_in(&response.json::<Value>().await?))
     }
 
     async fn get<T: serde::de::DeserializeOwned>(
@@ -630,7 +763,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/people-api/people:searchContacts"))
             .and(query_param("query", "an"))
-            .and(query_param("readMask", "names,emailAddresses"))
+            .and(query_param("readMask", "names,emailAddresses,photos"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "results": [{"person": person("Ann Lee", &["ann@x.org", "ann@home.example"])}]
             })))
@@ -639,6 +772,8 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/people-api/otherContacts:search"))
             .and(query_param("query", "an"))
+            // Google refuses this search when pictures are asked for.
+            .and(query_param("readMask", "names,emailAddresses"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "results": [
                     {"person": person("A. Lee", &["ANN@x.org"])},
@@ -675,6 +810,152 @@ mod tests {
                 ("Ann Lee", "ann@home.example"),
                 ("", "andy@y.org")
             ]
+        );
+    }
+
+    #[test]
+    fn a_picture_is_the_persons_own_and_the_primary_one_first() {
+        let person = json!({"photos": [
+            {"url": "https://lh3.googleusercontent.com/drawn-letter", "default": true,
+             "metadata": {"primary": true}},
+            {"url": "https://lh3.googleusercontent.com/other"},
+            {"url": "https://lh3.googleusercontent.com/primary", "metadata": {"primary": true}}
+        ]});
+        assert_eq!(
+            photo_in(&person).as_deref(),
+            Some("https://lh3.googleusercontent.com/primary")
+        );
+        // Google's drawn letter only: no picture of their own.
+        let lettered =
+            json!({"photos": [{"url": "https://lh3.googleusercontent.com/a", "default": true}]});
+        assert_eq!(photo_in(&lettered), None);
+        assert_eq!(photo_in(&json!({})), None);
+    }
+
+    #[test]
+    fn pictures_come_only_from_googles_picture_servers() {
+        assert!(picture_address_allowed(
+            "https://lh3.googleusercontent.com/a/ACg8oc=s100"
+        ));
+        assert!(picture_address_allowed(
+            "https://lh6.googleusercontent.com/x"
+        ));
+        for refused in [
+            "http://lh3.googleusercontent.com/a",
+            "https://googleusercontent.com.example.org/a",
+            "https://example.org/lh3.googleusercontent.com/a",
+            "https://evilgoogleusercontent.com/a",
+            "file:///etc/passwd",
+            "not an address",
+        ] {
+            assert!(!picture_address_allowed(refused), "{refused}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_picture_is_downloaded_at_the_size_asked_and_not_beyond_a_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/small"))
+            .and(query_param("sz", "96"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![7u8; 100]))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/huge"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(vec![0u8; MAX_PICTURE_BYTES + 1]),
+            )
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::new();
+        let small = fetch_picture(&http, &format!("{}/small", server.uri()), 96).await;
+        assert_eq!(small.unwrap(), vec![7u8; 100]);
+        let huge = fetch_picture(&http, &format!("{}/huge", server.uri()), 96).await;
+        assert!(huge.is_err());
+        // The public function refuses anything but Google's servers before asking.
+        let refused = download_picture(&http, &format!("{}/small", server.uri()), 96).await;
+        assert!(refused.is_err());
+        let asked = server.received_requests().await.unwrap();
+        assert_eq!(asked.len(), 2);
+        // Pictures are public: the account's sign-in does not go with the request.
+        assert!(
+            asked
+                .iter()
+                .all(|r| !r.headers.contains_key("authorization"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_guests_picture_is_found_by_their_exact_address() {
+        let server = MockServer::start().await;
+        let found = |email: &str, photo: &str| {
+            json!({"results": [{"person": {
+                "names": [{"displayName": "Someone"}],
+                "emailAddresses": [{"value": email}],
+                "photos": [{"url": photo}]
+            }}]})
+        };
+        // The contacts know only someone whose address starts the same way.
+        Mock::given(method("GET"))
+            .and(path("/people-api/people:searchContacts"))
+            .and(query_param("query", "ann@x.org"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(found(
+                "ann@x.org.example",
+                "https://lh3.googleusercontent.com/wrong",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/people-api/people:searchDirectoryPeople"))
+            .and(query_param("query", "ann@x.org"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"people": [{
+                "emailAddresses": [{"value": "Ann@X.org"}],
+                "photos": [{"url": "https://lh3.googleusercontent.com/ann"}]
+            }]})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        let all = [
+            Permission::Contacts,
+            Permission::OtherContacts,
+            Permission::Directory,
+        ];
+        let photo = client.find_photo("ann@x.org", &all).await.unwrap();
+        assert_eq!(
+            photo.as_deref(),
+            Some("https://lh3.googleusercontent.com/ann")
+        );
+        // Without the directory there is none.
+        let photo = client
+            .find_photo("ann@x.org", &[Permission::Contacts])
+            .await
+            .unwrap();
+        assert_eq!(photo, None);
+    }
+
+    #[tokio::test]
+    async fn the_accounts_own_picture_is_read_from_its_profile() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/people-api/people/me"))
+            .and(query_param("personFields", "photos"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "resourceName": "people/1",
+                "photos": [{"url": "https://lh3.googleusercontent.com/me",
+                            "metadata": {"primary": true}}]
+            })))
+            .mount(&server)
+            .await;
+        let photo = client(&server).await.own_photo().await.unwrap();
+        assert_eq!(
+            photo.as_deref(),
+            Some("https://lh3.googleusercontent.com/me")
         );
     }
 
