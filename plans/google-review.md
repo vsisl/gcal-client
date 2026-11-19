@@ -11,8 +11,18 @@ time, and it has the last word.
 
 ## Where it stands (2026-11-19, evening)
 
-The second branding check (2026-11-19) was refused like the first; see "Verify the
-branding" below. Step 1 is therefore at its "wait another day once" stage.
+**Submitted on 2026-11-19 at about 21:47**: the branding and the four scopes are with
+Google's reviewers ("Your branding and data access are currently under review" in the
+Verification Center). The second automatic branding check had been refused like the
+first, so the branding went in as an appeal ("The finding is incorrect"), with the
+explanation that both Search Console properties are verified by the account that owns
+the project and that a Domain property is impossible for `github.io`. The appeal and the
+scope review are one submission: Google's form does not take the appeal alone. Sent with
+it: the scope reasons below (in one text, as the form has one box for all sensitive
+scopes), the demo video, and "No" to the questionnaire (not personal, not internal, not
+only for testing, not a WordPress plugin). Google says 2–3 business days for the branding
+review; the scopes commonly take longer. What is left: answer Google's e-mails; then
+steps 1–3 below are history.
 
 Everything is prepared; nothing has been sent to Google's reviewers yet. One automatic
 check stands in the way, and it has a waiting time.
